@@ -1,5 +1,4 @@
 # Description
-This is the evaluation metrics for the bioDCASE 2025 task 2.
 
 
 ### Long-term data 
