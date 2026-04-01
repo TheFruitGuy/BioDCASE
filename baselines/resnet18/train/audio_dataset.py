@@ -34,7 +34,7 @@ class AudioDataset(Dataset):
             else:
 
                 final_df = pd.DataFrame()
-                for file in [f for f in os.listdir(self.annot_path) if f.endswith('_bin_labels7.csv')]:
+                for file in [f for f in os.listdir(self.annot_path) if f.endswith('_bin.csv')]:
                     df_tmp = pd.read_csv(os.path.join(self.annot_path, file))
                     final_df = pd.concat([final_df, df_tmp], ignore_index=True)
                 self.annotations = final_df
@@ -45,7 +45,7 @@ class AudioDataset(Dataset):
                 self.annotations = pd.read_csv(self.annot_path)
             else:
                 final_df = pd.DataFrame()
-                for file in [f for f in os.listdir(self.annot_path) if f.endswith('_bin_labels7.csv')]:
+                for file in [f for f in os.listdir(self.annot_path) if f.endswith('_bin.csv')]:
                     df_tmp = pd.read_csv(os.path.join(self.annot_path, file))
                     final_df = pd.concat([final_df, df_tmp], ignore_index=True)
                 self.annotations = final_df
