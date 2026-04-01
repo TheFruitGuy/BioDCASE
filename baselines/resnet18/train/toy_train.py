@@ -2,7 +2,7 @@ import os
 import torch
 from datetime import datetime
 
-torch.backends.cudnn.enabled = False
+# torch.backends.cudnn.enabled = False
 
 from args import args
 from loaders import load_data, init_resnet18
@@ -15,7 +15,14 @@ next(iter(val_loader))
 print('[INFO]: Data loaded successfully')
 
 model = init_resnet18(args)
-device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+# --- MULTI-GPU WRAPPER ---
+if torch.cuda.device_count() > 1:
+    print(f"[INFO]: Splitting the batch across {torch.cuda.device_count()} GPUs!")
+    model = torch.nn.DataParallel(model)
+# ----------------------------------
+
 model = model.to(device)
 
 optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)

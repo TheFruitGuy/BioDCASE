@@ -12,8 +12,19 @@ def load_data(args, load_info=False, val_only=False):
     train_set = AudioDataset(args, mode='train', load_info=load_info)
     val_set = AudioDataset(args, mode='validation', load_info=load_info)
 
-    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=True)
+    # --- DYNAMIC CPU WORKER CALCULATION ---
+    # Get total system threads
+    total_threads = os.cpu_count() or 4
+
+    # Use half the threads to be safe, but cap it at 16 to prevent RAM/IO thrashing
+    optimal_workers = min(total_threads // 2, 24)
+    print(f'[INFO]: Detected {total_threads} CPU threads. Using {optimal_workers} workers for DataLoaders.')
+    # --------------------------------------
+
+    train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, num_workers=optimal_workers,
+                              pin_memory=True)
+    val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=True, num_workers=optimal_workers,
+                            pin_memory=True)
 
     if val_only:
         return val_loader
