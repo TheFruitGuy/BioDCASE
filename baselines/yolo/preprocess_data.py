@@ -170,9 +170,11 @@ class YOLODataset:
             selections['y'] = 1 - (selections['high_frequency'] / f_bandwidth)
 
             # Deal with datetime
-            selections['start_datetime_wav'] = pd.to_datetime(selections['filename'].apply(lambda y: y.split('.')[0]),
-                                                              format='%Y-%m-%dT%H-%M-%S_%f')
-            selections['start_datetime_wav'] = selections['start_datetime_wav'].dt.tz_localize('UTC')
+            # Force both columns to UTC and then strip the timezone info (make them naive)
+            selections['start_datetime'] = pd.to_datetime(selections['start_datetime'], utc=True).dt.tz_localize(None)
+            selections['start_datetime_wav'] = pd.to_datetime(selections['start_datetime_wav'],
+                                                              utc=True).dt.tz_localize(None)
+
             selections['start_seconds'] = (selections.start_datetime - selections.start_datetime_wav).dt.total_seconds()
             selections['end_seconds'] = (selections.end_datetime - selections.start_datetime_wav).dt.total_seconds()
 
