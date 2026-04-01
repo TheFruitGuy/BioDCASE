@@ -8,7 +8,7 @@ from args import args
 
 args.audio_path = os.path.join(args.data_root, args.mode, 'audio')
 args.annot_path = os.path.join(args.data_root, args.mode, 'annotations')
-
+args.new_annot_path = 'annotations'
 cols = ['dataset', 'filename', 'start_offset', 'end_offset']
 args.labels = ['bma', 'bmb', 'bmz', 'bmd', 'bpd', 'bp20', 'bp20plus']
 
