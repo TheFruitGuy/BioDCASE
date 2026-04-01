@@ -1,7 +1,7 @@
-path:  '/mnt/fscompute_shared/roi/datasets/biodcase'
-train: '/mnt/fscompute_shared/roi/datasets/biodcase/biodcase_development_set/train'
-test: '/mnt/fscompute_shared/roi/datasets/biodcase/biodcase_evaluation_set'
-val: '/mnt/fscompute_shared/roi/datasets/biodcase/biodcase_development_set/validation'
+path: '/home/matthias-nagl/BioDCASE/baselines/yolo/yolo_dataset'
+train: '/home/matthias-nagl/BioDCASE/baselines/yolo/yolo_dataset/train'
+val: '/home/matthias-nagl/BioDCASE/baselines/yolo/yolo_dataset/validation'
+test: '/home/matthias-nagl/BioDCASE/baselines/yolo/yolo_dataset/validation'
 
 #classes names
 nc: 7
