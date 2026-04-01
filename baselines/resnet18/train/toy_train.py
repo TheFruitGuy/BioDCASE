@@ -2,7 +2,8 @@ import os
 import torch
 from datetime import datetime
 
-torch.backends.cudnn.enabled = False
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
 
 from args import args
 from loaders import load_data, init_resnet18
