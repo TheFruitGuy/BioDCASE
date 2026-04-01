@@ -13,8 +13,12 @@ def main():
     train_loader, val_loader = load_data(args)
     model = init_resnet18(args)
 
-    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f'[INFO]: device is {device}')
+
+    if torch.cuda.device_count() > 1:
+        print(f"[INFO]: Splitting the batch across {torch.cuda.device_count()} GPUs!")
+        model = torch.nn.DataParallel(model)
 
     model = model.to(device)
 
