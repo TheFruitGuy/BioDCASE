@@ -2,6 +2,9 @@ import os
 import torch
 from datetime import datetime
 
+torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.deterministic = True
+
 from args import args
 from loaders import load_data, init_resnet18
 from train_utils import train_one_epoch, validate_one_epoch_f1
