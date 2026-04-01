@@ -40,7 +40,7 @@ class YOLODataset:
 
         # Path to dataset
         self.path_to_dataset = pathlib.Path(path_to_dataset)
-        self.wavs_folder = self.path_to_dataset.joinpath('raw')
+        self.wavs_folder = self.path_to_dataset.joinpath('audio')
         self.annotations_folder = self.path_to_dataset.joinpath('annotations')
         self.images_folder = self.path_to_dataset.joinpath('images')
         self.labels_folder = self.path_to_dataset.joinpath('labels')
