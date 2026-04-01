@@ -62,11 +62,9 @@ def gen_annotations_dict(annot_file):
     annotations_dict = {f: df for f, df in annotations_source.groupby("filename")}
 
     for df in annotations_dict.values():
-        try:
-            df['start_datetime'] = pd.to_datetime(df['start_datetime'], format='%Y-%m-%dT%H:%M:%S.%f%z').dt.tz_localize(None)
-            df['end_datetime'] = pd.to_datetime(df['end_datetime'], format='%Y-%m-%dT%H:%M:%S.%f%z').dt.tz_localize(None)
-        except:
-            pass
+        # Let pandas infer the format automatically and strip the timezone
+        df['start_datetime'] = pd.to_datetime(df['start_datetime'], utc=True).dt.tz_localize(None)
+        df['end_datetime'] = pd.to_datetime(df['end_datetime'], utc=True).dt.tz_localize(None)
 
     return annotations_dict
 
