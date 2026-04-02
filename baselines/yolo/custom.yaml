@@ -1,7 +1,7 @@
 path: '/home/matthias-nagl/BioDCASE/baselines/yolo/yolo_dataset'
-train: '/home/matthias-nagl/BioDCASE/baselines/yolo/yolo_dataset/train'
-val: '/home/matthias-nagl/BioDCASE/baselines/yolo/yolo_dataset/validation'
-test: '/home/matthias-nagl/BioDCASE/baselines/yolo/yolo_dataset/validation'
+train: '/home/matthias-nagl/BioDCASE/baselines/yolo/yolo_dataset/train/images'
+val: '/home/matthias-nagl/BioDCASE/baselines/yolo/yolo_dataset/validation/images'
+test: '/home/matthias-nagl/BioDCASE/baselines/yolo/yolo_dataset/validation/images'
 
 #classes names
 nc: 7
