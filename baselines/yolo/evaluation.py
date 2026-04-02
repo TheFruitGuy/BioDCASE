@@ -85,6 +85,7 @@ def run(predictions_path, ground_truth_path, iou_threshold=0.3):
         predictions_path = pathlib.Path(predictions_path)
     if type(ground_truth_path) is str:
         ground_truth_path = pathlib.Path(ground_truth_path)
+
     ground_truth = join_annotations_if_dir(ground_truth_path)
     predictions = join_annotations_if_dir(predictions_path)
 
@@ -94,20 +95,29 @@ def run(predictions_path, ground_truth_path, iou_threshold=0.3):
     predictions['correct'] = 0
 
     for (dataset_name, wav_path_name), wav_predictions in tqdm(predictions.groupby(['dataset', 'filename']),
-                                               total=len(predictions.filename.unique())):
-        ground_truth_wav = ground_truth.loc[ground_truth['filename'] == wav_path_name]
+                                                               total=len(predictions.filename.unique())):
         for class_id, class_predictions in wav_predictions.groupby('annotation'):
-            ground_truth_wav_class = ground_truth_wav.loc[ground_truth_wav['annotation'] == class_id]
-            ground_truth_not_detected = ground_truth_wav_class.loc[ground_truth_wav_class.detected == 0]
-            if ground_truth_not_detected.empty:
-                continue
+
             for i, row in class_predictions.iterrows():
+                # Dynamically fetch undetected ground truths for this specific file and class inside the loop
+                mask = (ground_truth['filename'] == wav_path_name) & \
+                       (ground_truth['annotation'] == class_id) & \
+                       (ground_truth['detected'] == 0)
+
+                ground_truth_not_detected = ground_truth.loc[mask]
+
+                # Safely skip math if there is no ground truth available to check against
+                if ground_truth_not_detected.empty:
+                    continue
+
                 # For each row, compute the minimum end and maximum start with all the ground truths
                 min_end = np.minimum(row['end_datetime'], ground_truth_not_detected['end_datetime'])
                 max_start = np.maximum(row['start_datetime'], ground_truth_not_detected['start_datetime'])
+
                 inter = (min_end - max_start).dt.total_seconds().clip(0)
                 union = (row['end_datetime'] - row['start_datetime']).total_seconds() + (
-                    (ground_truth_not_detected['end_datetime'] - ground_truth_not_detected['start_datetime']).dt.total_seconds()) - inter
+                    (ground_truth_not_detected['end_datetime'] - ground_truth_not_detected[
+                        'start_datetime']).dt.total_seconds()) - inter
                 iou = inter / union
 
                 # Save the maximum iou for that prediction
@@ -117,16 +127,17 @@ def run(predictions_path, ground_truth_path, iou_threshold=0.3):
                     ground_truth.loc[ground_truth_index, 'detected'] = 1
 
     all_classes = ground_truth.annotation.unique()
-    for dataset_name, conf_matrix_dataset in compute_confusion_matrix_per_dataset(ground_truth, predictions, all_classes):
-        print(f'Results dataset {dataset_name}')
+    for dataset_name, conf_matrix_dataset in compute_confusion_matrix_per_dataset(ground_truth, predictions,
+                                                                                  all_classes):
+        print(f'\nResults dataset {dataset_name}')
         print(conf_matrix_dataset)
 
     conf_matrix = compute_confusion_matrix(ground_truth, predictions, all_classes)
-    print('Final results')
+    print('\nFinal results')
     print(conf_matrix)
 
 
 if __name__ == '__main__':
-    predictions_csv_path = pathlib.Path(input('Where are the predictions in csv format?'))
-    ground_truth_csv_path = pathlib.Path(input('Where are the ground truth in csv format?'))
+    predictions_csv_path = pathlib.Path(input('Where are the predictions in csv format?\n> '))
+    ground_truth_csv_path = pathlib.Path(input('Where are the ground truth in csv format?\n> '))
     run(predictions_csv_path, ground_truth_csv_path)
