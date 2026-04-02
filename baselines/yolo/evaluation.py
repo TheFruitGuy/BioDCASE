@@ -111,10 +111,10 @@ def run(predictions_path, ground_truth_path, iou_threshold=0.3):
                     continue
 
                 # For each row, compute the minimum end and maximum start with all the ground truths
-                min_end = np.minimum(row['end_datetime'], ground_truth_not_detected['end_datetime'])
-                max_start = np.maximum(row['start_datetime'], ground_truth_not_detected['start_datetime'])
+                min_end = ground_truth_not_detected['end_datetime'].clip(upper=row['end_datetime'])
+                max_start = ground_truth_not_detected['start_datetime'].clip(lower=row['start_datetime'])
 
-                inter = (min_end - max_start).dt.total_seconds().clip(0)
+                inter = (min_end - max_start).dt.total_seconds().clip(lower=0)
                 union = (row['end_datetime'] - row['start_datetime']).total_seconds() + (
                     (ground_truth_not_detected['end_datetime'] - ground_truth_not_detected[
                         'start_datetime']).dt.total_seconds()) - inter
