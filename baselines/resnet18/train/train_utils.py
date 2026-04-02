@@ -10,11 +10,12 @@ def train_one_epoch(model, loader, loss_fn, optimizer, device):
     train_loss = 0.
 
     model.train()
-
+    print("\n[DEBUG]: Requesting the first batch from CPU workers...")
     for i, (X, y) in tqdm(enumerate(loader)):
+        print(f"\n[DEBUG]: Batch {i} successfully loaded into RAM!")
         X, y = X.to(device), y.to(device)
         optimizer.zero_grad()
-
+        print(f"[DEBUG]: Batch {i} moved to GPUs. Starting forward pass...")
         y_hat = model(X)
         loss = loss_fn(y_hat, y)
         train_loss += loss.item()
