@@ -28,10 +28,10 @@ parser.add_argument('--n_classes', default=7, type=int, choices={3, 7, 10})
 # 7 -> ['bma', 'bmb', 'bmz', 'bmd', 'bpd', 'bp20', 'bp20plus']
 # 10 -> ['bma','bmb', 'bmz', 'bmd', 'bpd', 'bp20', 'bp20plus', 'abz', 'd, 'bp']
 
-parser.add_argument('--batch_size', default=1024, type=int)
+parser.add_argument('--batch_size', default=32, type=int)
 parser.add_argument('--n_epochs', default=20, type=int)
 parser.add_argument('--patience', default=10, type=int) # early stopping
-parser.add_argument('--lr', default=1e-3, type=float)
+parser.add_argument('--lr', default=1e-4, type=float)
 parser.add_argument('--pretrained', default=True, type=bool)
 parser.add_argument('--fine_tune', default=True, type=bool)
 

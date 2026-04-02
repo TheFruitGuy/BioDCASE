@@ -57,6 +57,8 @@ def main():
                    'mean_val_f1': best_metrics['mean_best_f1']}
         #wandb.log(to_log)
 
+        print(f"--> Epoch {epoch} Metrics | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val F1: {best_metrics['mean_best_f1']:.4f}")
+
         if best_metrics['mean_best_f1'] > best_f1:
             best_f1 = best_metrics['mean_best_f1']
             patience_counter_f1 = 0
