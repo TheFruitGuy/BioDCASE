@@ -67,6 +67,11 @@ def join_annotations_if_dir(path_to_annotations):
     else:
         total_annotations = pd.read_csv(path_to_annotations, parse_dates=['start_datetime', 'end_datetime'])
 
+        total_annotations['start_datetime'] = pd.to_datetime(total_annotations['start_datetime'],
+                                                             utc=True).dt.tz_localize(None)
+        total_annotations['end_datetime'] = pd.to_datetime(total_annotations['end_datetime'], utc=True).dt.tz_localize(
+            None)
+
     return total_annotations
 
 
