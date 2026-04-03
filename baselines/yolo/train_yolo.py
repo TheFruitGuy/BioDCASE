@@ -9,7 +9,7 @@ import os
 
 
 def run():
-    YAML_FILE = './custom_joined.yaml'
+    YAML_FILE = './custom.yaml'
     run_name = 'biodcase_baseline' # Change to the name of your run
 
     # Check if CUDA is available

@@ -33,7 +33,7 @@ if __name__ == '__main__':
     f = open(config_path)
     config = json.load(f)
 
-    with open('./custom_joined.yaml', 'r') as file:
+    with open('./custom.yaml', 'r') as file:
         yolo_config = yaml.safe_load(file)
 
     yolo_ds = preprocess_data.YOLODataset(config, path_to_dataset)
