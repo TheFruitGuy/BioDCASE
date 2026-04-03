@@ -5,7 +5,7 @@ import yaml
 import preprocess_data
 
 
-def predict(ds, conf=0.5):
+def predict(ds, conf=0.1):
     predictions_folder = ds.path_to_dataset.joinpath('predictions')
     if not predictions_folder.exists():
         model_path = input('Folder still not predicted. Where is the path to the model to predict?')
