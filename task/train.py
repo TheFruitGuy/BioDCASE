@@ -17,7 +17,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from tqdm import tqdm
 
 import config as cfg
@@ -89,7 +89,8 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
         optimizer.zero_grad()
 
         # 2. Wrap the forward pass in autocast for 16-bit speed
-        with autocast():
+        # To this (leveraging your Ampere hardware!):
+        with autocast('cuda', dtype=torch.bfloat16):
             logits = model(audio)
             targets, mask = _align_lengths(logits, targets, mask, device)
             loss = criterion(logits, targets, mask)
@@ -192,7 +193,7 @@ def main():
                              milestones=[cfg.WARMUP_EPOCHS])
 
     # Initialize the AMP GradScaler
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
 
     # --- training loop ---
     best_f1 = 0.0
