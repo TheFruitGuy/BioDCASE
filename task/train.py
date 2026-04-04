@@ -3,7 +3,11 @@ Training script for Whale-Conformer.
 
     python train.py
 
-All hyperparameters live in config.py — edit there, then just run this.
+FIXES from previous version:
+  1. pos_weight computed from actual frame-level positive rate (was [1,1,1])
+  2. Validation uses annotated segments (was all-zeros → F1 always 0)
+  3. Diagnostic prints to catch problems early
+  4. focal_alpha=0.75 upweights positives (was 0.25 = downweighting them)
 """
 
 import json
@@ -40,19 +44,53 @@ def set_seed(seed: int = cfg.SEED):
         torch.cuda.manual_seed_all(seed)
 
 
-def compute_class_weights() -> torch.Tensor:
-    """N / P_c per class, normalised so mean = 1."""
+def compute_pos_weight() -> torch.Tensor:
+    """
+    Compute pos_weight per class from frame-level positive rates in training data.
+
+    pos_weight_c = (# negative frames for class c) / (# positive frames for class c)
+
+    With ~5% overall positive rate this gives pos_weight ≈ 19.
+    The old version used total_files / n_annotations which gave ~1.0.
+    """
     annotations = load_annotations(cfg.TRAIN_DATASETS)
     label_col = "label_3class" if cfg.USE_3CLASS else "annotation"
-    counts = annotations[label_col].value_counts()
-    total_files = len(annotations["filename"].unique())
+    class_names = cfg.class_names()
 
-    weights = []
-    for c in cfg.class_names():
-        n_pos = counts.get(c, 1)
-        weights.append(max(total_files / n_pos, 1.0))
-    weights = torch.tensor(weights, dtype=torch.float32)
-    return weights / weights.mean()
+    # Estimate total annotated duration per class (in seconds)
+    # and total recording duration
+    from dataset import get_file_manifest
+    manifest = get_file_manifest(cfg.TRAIN_DATASETS)
+    total_duration_s = manifest["duration_s"].sum()
+    total_frames = total_duration_s / cfg.FRAME_STRIDE_S
+
+    pos_weights = []
+    for c_name in class_names:
+        # Sum up annotation durations for this class
+        if cfg.USE_3CLASS:
+            # Find all 7-class labels that map to this 3-class label
+            orig_labels = [k for k, v in cfg.COLLAPSE_MAP.items() if v == c_name]
+            class_annots = annotations[annotations["annotation"].isin(orig_labels)]
+        else:
+            class_annots = annotations[annotations["annotation"] == c_name]
+
+        if len(class_annots) == 0:
+            pos_weights.append(20.0)  # safe default for missing class
+            continue
+
+        # Duration of positive frames
+        durations = (class_annots["end_datetime"] - class_annots["start_datetime"])
+        pos_duration_s = durations.dt.total_seconds().sum()
+        pos_frames = pos_duration_s / cfg.FRAME_STRIDE_S
+        neg_frames = total_frames - pos_frames
+
+        pw = neg_frames / max(pos_frames, 1.0)
+        # Cap at reasonable range to avoid instability
+        pw = min(pw, 50.0)
+        pos_weights.append(pw)
+
+    result = torch.tensor(pos_weights, dtype=torch.float32)
+    return result
 
 
 def _align_lengths(logits, targets, padding_mask, device):
@@ -70,6 +108,24 @@ def _align_lengths(logits, targets, padding_mask, device):
     return targets, padding_mask
 
 
+def _print_prediction_stats(probs, targets, mask, epoch, split="val"):
+    """Print diagnostic stats to verify the model is actually predicting positives."""
+    m = mask.view(-1).bool()
+    for c in range(probs.size(-1)):
+        p = probs[..., c].reshape(-1)[m]
+        t = targets[..., c].reshape(-1)[m]
+        n_pos_targ = t.sum().item()
+        n_pos_pred_03 = (p > 0.3).sum().item()
+        n_pos_pred_05 = (p > 0.5).sum().item()
+        mean_p = p.mean().item()
+        mean_p_on_pos = p[t > 0].mean().item() if n_pos_targ > 0 else 0.0
+        mean_p_on_neg = p[t == 0].mean().item()
+        print(f"  [{split}] class {c}: "
+              f"target_pos={int(n_pos_targ):,} | "
+              f"pred>0.3={int(n_pos_pred_03):,} pred>0.5={int(n_pos_pred_05):,} | "
+              f"mean_prob={mean_p:.4f} on_pos={mean_p_on_pos:.4f} on_neg={mean_p_on_neg:.4f}")
+
+
 # ---------------------------------------------------------------------------
 # Train / validate
 # ---------------------------------------------------------------------------
@@ -81,25 +137,20 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
     pbar = tqdm(loader, desc=f"Epoch {epoch}/{cfg.EPOCHS}", leave=False)
 
     for i, (audio, targets, mask, _) in enumerate(pbar):
-        # 1. non_blocking=True speeds up the CPU -> GPU transfer
         audio = audio.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
         optimizer.zero_grad()
 
-        # 2. Wrap the forward pass in autocast for 16-bit speed
-        # To this (leveraging your Ampere hardware!):
-        with autocast('cuda', dtype=torch.bfloat16):
+        with autocast("cuda", dtype=torch.bfloat16):
             logits = model(audio)
             targets, mask = _align_lengths(logits, targets, mask, device)
             loss = criterion(logits, targets, mask)
 
-        # 3. Use the scaler for the backward pass
         scaler.scale(loss).backward()
 
         if cfg.GRAD_CLIP > 0:
-            # Unscale before clipping gradients
             scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
 
@@ -115,7 +166,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
 
 
 @torch.no_grad()
-def validate(model, loader, criterion, device, thresholds):
+def validate(model, loader, criterion, device, thresholds, epoch=0):
     model.eval()
     total_loss, n = 0.0, 0
     all_probs, all_targ, all_mask = [], [], []
@@ -134,6 +185,9 @@ def validate(model, loader, criterion, device, thresholds):
     all_targ = torch.cat(all_targ)
     all_mask = torch.cat(all_mask)
 
+    # Diagnostic: print prediction statistics
+    _print_prediction_stats(all_probs, all_targ, all_mask, epoch)
+
     class_f1s = []
     for c in range(cfg.n_classes()):
         m = all_mask.view(-1).bool()
@@ -144,7 +198,11 @@ def validate(model, loader, criterion, device, thresholds):
         fn = ((1 - preds) * targs).sum().item()
         prec = tp / (tp + fp + 1e-8)
         rec = tp / (tp + fn + 1e-8)
-        class_f1s.append(2 * prec * rec / (prec + rec + 1e-8))
+        f1 = 2 * prec * rec / (prec + rec + 1e-8)
+        class_f1s.append(f1)
+        print(f"  class {c} ({cfg.class_names()[c]}): "
+              f"TP={int(tp)} FP={int(fp)} FN={int(fn)} "
+              f"P={prec:.3f} R={rec:.3f} F1={f1:.3f}")
 
     return {"loss": total_loss / max(n, 1), "class_f1": class_f1s,
             "mean_f1": float(np.mean(class_f1s))}
@@ -180,13 +238,22 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params:,}")
 
+    # --- pos_weight (CRITICAL FIX) ---
+    if cfg.POS_WEIGHT is None:
+        pos_weight = compute_pos_weight().to(device)
+    else:
+        pos_weight = torch.tensor(
+            [cfg.POS_WEIGHT] * cfg.n_classes(), dtype=torch.float32, device=device
+        )
+    print(f"pos_weight per class: {pos_weight}")
+    # Expect values around 15-30, NOT 1.0
 
     # --- loss ---
-    class_weights = compute_class_weights().to(device)
-    print(f"Class weights: {class_weights}")
     criterion = WeightedBCEWithFocal(
-        class_weights=class_weights, focal_alpha=cfg.FOCAL_ALPHA,
-        focal_gamma=cfg.FOCAL_GAMMA, focal_weight=cfg.FOCAL_WEIGHT,
+        pos_weight=pos_weight,
+        focal_alpha=cfg.FOCAL_ALPHA,
+        focal_gamma=cfg.FOCAL_GAMMA,
+        focal_weight=cfg.FOCAL_WEIGHT,
     ).to(device)
 
     # --- optimiser + scheduler ---
@@ -198,8 +265,7 @@ def main():
     scheduler = SequentialLR(optimizer, [warmup, cosine],
                              milestones=[cfg.WARMUP_EPOCHS])
 
-    # Initialize the AMP GradScaler
-    scaler = GradScaler('cuda')
+    scaler = GradScaler("cuda")
 
     # --- training loop ---
     best_f1 = 0.0
@@ -214,18 +280,16 @@ def main():
             num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
         )
 
-        # Pass the scaler here!
         train_loss = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler, device, epoch, scaler
         )
-        val = validate(model, val_loader, criterion, device, thresholds)
+        val = validate(model, val_loader, criterion, device, thresholds, epoch)
 
         print(f"\nTrain loss: {train_loss:.4f}   Val loss: {val['loss']:.4f}")
-        for i, name in enumerate(cfg.class_names()):
-            print(f"  {name}: F1={val['class_f1'][i]:.3f}")
         print(f"  Mean F1: {val['mean_f1']:.3f}")
 
-        model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+        model_state = (model.module.state_dict() if isinstance(model, nn.DataParallel)
+                       else model.state_dict())
 
         ckpt = {"epoch": epoch, "model_state_dict": model_state,
                 "optimizer_state_dict": optimizer.state_dict(),
@@ -241,13 +305,17 @@ def main():
 
     # --- final threshold tuning ---
     print(f"\n{'='*60}\nTuning thresholds on validation set\n{'='*60}")
-    model.load_state_dict(
-        torch.load(run_dir / "best_model.pt", map_location=device)["model_state_dict"]
-    )
+    best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device)
+    if isinstance(model, nn.DataParallel):
+        model.module.load_state_dict(best_ckpt["model_state_dict"])
+    else:
+        model.load_state_dict(best_ckpt["model_state_dict"])
     best_thresholds = tune_thresholds(model, val_loader, device, cfg.n_classes())
     print(f"Tuned thresholds: {best_thresholds.tolist()}")
 
-    torch.save({"model_state_dict": model.state_dict(),
+    final_state = (model.module.state_dict() if isinstance(model, nn.DataParallel)
+                   else model.state_dict())
+    torch.save({"model_state_dict": final_state,
                 "thresholds": best_thresholds}, run_dir / "final_model.pt")
     print(f"\nDone — best F1: {best_f1:.3f}  →  {run_dir}")
 

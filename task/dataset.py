@@ -1,15 +1,9 @@
 """
 Dataset and data loading for BioDCASE 2026 Task 2.
 
-Handles:
-  - Loading ATBFL audio files (250 Hz WAV)
-  - Parsing annotation CSVs
-  - Segment extraction with random collars (training) / fixed windows (eval)
-  - Per-frame binary multi-label target construction at 20 ms resolution
-  - Stochastic negative mini-batch undersampling
-  - Collation with zero-padding + padding masks
-
-All constants come from config.py.
+CRITICAL FIX from previous version:
+  build_eval_segments() creates segments with NO annotations → val F1 always 0.
+  Added build_val_segments_with_annotations() for proper validation.
 """
 
 import random
@@ -36,36 +30,33 @@ def load_annotations(dataset_names: list[str]) -> pd.DataFrame:
     Searches in both train/annotations/ and validation/annotations/.
     """
     frames = []
-    # Look in both split directories
     search_dirs = [
         cfg.DATA_ROOT / "train" / "annotations",
-        cfg.DATA_ROOT / "validation" / "annotations"
+        cfg.DATA_ROOT / "validation" / "annotations",
     ]
 
     for ds in dataset_names:
         found = False
         for s_dir in search_dirs:
             csv_path = s_dir / f"{ds}.csv"
-
             if csv_path.exists():
                 df = pd.read_csv(csv_path)
-                # Ensure the dataset column exists
-                if 'dataset' not in df.columns:
+                if "dataset" not in df.columns:
                     df["dataset"] = ds
                 frames.append(df)
                 found = True
-                break  # Stop searching once we find the file
-
+                break
         if not found:
             print(f"Warning: no annotation file found for {ds}")
 
     if not frames:
-        raise FileNotFoundError(f"No annotation files found in train/ or validation/ folders under {cfg.DATA_ROOT}")
+        raise FileNotFoundError(
+            f"No annotation files found in train/ or validation/ under {cfg.DATA_ROOT}"
+        )
 
     annotations = pd.concat(frames, ignore_index=True)
     for col in ["start_datetime", "end_datetime"]:
-        # Added format='mixed' to handle the inconsistent space vs 'T' datetime strings
-        annotations[col] = pd.to_datetime(annotations[col], format='mixed', utc=True)
+        annotations[col] = pd.to_datetime(annotations[col], format="mixed", utc=True)
     annotations["label_3class"] = annotations["annotation"].map(cfg.COLLAPSE_MAP)
     return annotations
 
@@ -73,17 +64,15 @@ def load_annotations(dataset_names: list[str]) -> pd.DataFrame:
 def get_file_manifest(dataset_names: list[str]) -> pd.DataFrame:
     """Build a manifest of all WAV files with their durations."""
     records = []
-    # Look in both split directories
     search_dirs = [
         cfg.DATA_ROOT / "train" / "audio",
-        cfg.DATA_ROOT / "validation" / "audio"
+        cfg.DATA_ROOT / "validation" / "audio",
     ]
 
     for ds in dataset_names:
         found = False
         for s_dir in search_dirs:
             ds_dir = s_dir / ds
-
             if ds_dir.exists():
                 found = True
                 for wf in sorted(ds_dir.glob("*.wav")):
@@ -95,8 +84,7 @@ def get_file_manifest(dataset_names: list[str]) -> pd.DataFrame:
                         "duration_s": info.duration,
                         "sample_rate": info.samplerate,
                     })
-                break  # Stop searching once we find the audio directory
-
+                break
         if not found:
             print(f"Warning: Audio directory not found for {ds}")
 
@@ -104,7 +92,7 @@ def get_file_manifest(dataset_names: list[str]) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Segment extraction
+# Segment dataclass
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -125,6 +113,10 @@ def _parse_file_start_dt(filename: str) -> datetime | None:
     except ValueError:
         return None
 
+
+# ---------------------------------------------------------------------------
+# Training segments (collared around annotations + negatives)
+# ---------------------------------------------------------------------------
 
 def build_training_segments(
     annotations: pd.DataFrame,
@@ -148,7 +140,7 @@ def build_training_segments(
             (annotations["dataset"] == ds) & (annotations["filename"] == fname)
         ]
 
-        # --- fully negative file → extract fixed-length negatives ---
+        # --- fully negative file ---
         if len(file_annots) == 0:
             seg_len = int(cfg.EVAL_SEGMENT_S * sr)
             for start in range(0, file_dur_samples - seg_len, seg_len):
@@ -185,7 +177,8 @@ def build_training_segments(
                 a2_end = (a2["end_datetime"] - file_start_dt).total_seconds()
                 if a2_end > seg_start_s and a2_start < seg_end_s:
                     rel_start = max(0, int((a2_start - seg_start_s) * sr))
-                    rel_end = min(seg_end_samp - seg_start_samp, int((a2_end - seg_start_s) * sr))
+                    rel_end = min(seg_end_samp - seg_start_samp,
+                                  int((a2_end - seg_start_s) * sr))
                     cls_idx = class_map.get(a2[label_col], -1)
                     if cls_idx >= 0:
                         seg_annots.append((rel_start, rel_end, cls_idx))
@@ -212,13 +205,13 @@ def build_training_segments(
         seg_len_s = cfg.EVAL_SEGMENT_S
         prev_end = 0.0
         for s, e in merged:
-            gap = s - prev_end
-            if gap >= seg_len_s:
+            if s - prev_end >= seg_len_s:
                 pos = prev_end
                 while pos + seg_len_s <= s:
                     negative_segments.append(Segment(
                         filepath=fpath, dataset=ds, filename=fname,
-                        start_sample=int(pos * sr), end_sample=int((pos + seg_len_s) * sr),
+                        start_sample=int(pos * sr),
+                        end_sample=int((pos + seg_len_s) * sr),
                         annotations=[], is_positive=False,
                     ))
                     pos += seg_len_s
@@ -227,8 +220,99 @@ def build_training_segments(
     return positive_segments, negative_segments
 
 
+# ---------------------------------------------------------------------------
+# Validation segments — fixed windows WITH annotations
+# ---------------------------------------------------------------------------
+
+def build_val_segments_with_annotations(
+    annotations: pd.DataFrame,
+    file_manifest: pd.DataFrame,
+) -> list[Segment]:
+    """
+    Build fixed-length overlapping segments for validation,
+    WITH annotations loaded so we can compute proper F1.
+
+    CRITICAL FIX: the old build_eval_segments() had annotations=[]
+    which meant all val targets were zero → F1 always 0.
+    """
+    sr = cfg.SAMPLE_RATE
+    seg_len = int(cfg.EVAL_SEGMENT_S * sr)
+    hop = int((cfg.EVAL_SEGMENT_S - cfg.EVAL_OVERLAP_S) * sr)
+    class_map = cfg.class_to_idx()
+    label_col = "label_3class" if cfg.USE_3CLASS else "annotation"
+    segments = []
+
+    for _, row in file_manifest.iterrows():
+        ds = row["dataset"]
+        fname = row["filename"]
+        fpath = row["filepath"]
+        file_dur_samples = int(row["duration_s"] * sr)
+
+        file_start_dt = _parse_file_start_dt(fname)
+        if file_start_dt is None:
+            continue
+
+        # Get all annotations for this file
+        file_annots = annotations[
+            (annotations["dataset"] == ds) & (annotations["filename"] == fname)
+        ]
+
+        # Pre-compute annotation times relative to file start (in seconds)
+        ann_times = []
+        for _, ann in file_annots.iterrows():
+            a_start = (ann["start_datetime"] - file_start_dt).total_seconds()
+            a_end = (ann["end_datetime"] - file_start_dt).total_seconds()
+            cls_idx = class_map.get(ann[label_col], -1)
+            if cls_idx >= 0:
+                ann_times.append((a_start, a_end, cls_idx))
+
+        # Build fixed segments
+        start = 0
+        while start + seg_len <= file_dur_samples:
+            seg_start_s = start / sr
+            seg_end_s = (start + seg_len) / sr
+
+            # Find overlapping annotations
+            seg_annots = []
+            for a_start, a_end, cls_idx in ann_times:
+                if a_end > seg_start_s and a_start < seg_end_s:
+                    rel_start = max(0, int((a_start - seg_start_s) * sr))
+                    rel_end = min(seg_len, int((a_end - seg_start_s) * sr))
+                    seg_annots.append((rel_start, rel_end, cls_idx))
+
+            segments.append(Segment(
+                filepath=fpath, dataset=ds, filename=fname,
+                start_sample=start, end_sample=start + seg_len,
+                annotations=seg_annots,
+                is_positive=len(seg_annots) > 0,
+            ))
+            start += hop
+
+        # Last partial
+        if start < file_dur_samples and file_dur_samples >= seg_len:
+            last_start = file_dur_samples - seg_len
+            seg_start_s = last_start / sr
+            seg_end_s = file_dur_samples / sr
+
+            seg_annots = []
+            for a_start, a_end, cls_idx in ann_times:
+                if a_end > seg_start_s and a_start < seg_end_s:
+                    rel_start = max(0, int((a_start - seg_start_s) * sr))
+                    rel_end = min(seg_len, int((a_end - seg_start_s) * sr))
+                    seg_annots.append((rel_start, rel_end, cls_idx))
+
+            segments.append(Segment(
+                filepath=fpath, dataset=ds, filename=fname,
+                start_sample=last_start, end_sample=file_dur_samples,
+                annotations=seg_annots,
+                is_positive=len(seg_annots) > 0,
+            ))
+
+    return segments
+
+
 def build_eval_segments(file_manifest: pd.DataFrame) -> list[Segment]:
-    """Build fixed-length overlapping segments for evaluation / inference."""
+    """Build fixed-length overlapping segments for INFERENCE (no annotations)."""
     sr = cfg.SAMPLE_RATE
     seg_len = int(cfg.EVAL_SEGMENT_S * sr)
     hop = int((cfg.EVAL_SEGMENT_S - cfg.EVAL_OVERLAP_S) * sr)
@@ -245,7 +329,7 @@ def build_eval_segments(file_manifest: pd.DataFrame) -> list[Segment]:
                 annotations=[], is_positive=False,
             ))
             start += hop
-        if start < file_dur_samples:
+        if start < file_dur_samples and file_dur_samples >= seg_len:
             segments.append(Segment(
                 filepath=row["filepath"], dataset=row["dataset"],
                 filename=row["filename"],
@@ -319,9 +403,6 @@ def collate_fn(batch):
 # ---------------------------------------------------------------------------
 
 class NegativeUndersamplingDataset(Dataset):
-    """
-    Wraps positive + negative segments.  Call resample_negatives() each epoch.
-    """
     def __init__(self, positive: list[Segment], negative: list[Segment]):
         self.positive = positive
         self.all_negatives = negative
@@ -355,16 +436,21 @@ def build_dataloaders(
     all_datasets = cfg.TRAIN_DATASETS + cfg.VAL_DATASETS
     annotations = load_annotations(all_datasets)
     train_annots = annotations[annotations["dataset"].isin(cfg.TRAIN_DATASETS)]
+    val_annots = annotations[annotations["dataset"].isin(cfg.VAL_DATASETS)]
 
     train_manifest = get_file_manifest(cfg.TRAIN_DATASETS)
     val_manifest = get_file_manifest(cfg.VAL_DATASETS)
 
+    # Training: collared segments + negatives
     pos, neg = build_training_segments(train_annots, train_manifest)
     print(f"Training: {len(pos)} positive, {len(neg)} negative segments")
     train_ds = NegativeUndersamplingDataset(pos, neg)
 
-    val_segs = build_eval_segments(val_manifest)
-    print(f"Validation: {len(val_segs)} segments")
+    # Validation: fixed windows WITH annotations (critical fix!)
+    val_segs = build_val_segments_with_annotations(val_annots, val_manifest)
+    n_pos_val = sum(1 for s in val_segs if s.is_positive)
+    print(f"Validation: {len(val_segs)} segments ({n_pos_val} with calls, "
+          f"{len(val_segs) - n_pos_val} empty)")
     val_ds = WhaleCallDataset(val_segs, is_train=False)
 
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,

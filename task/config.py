@@ -12,9 +12,9 @@ from pathlib import Path
 # Paths
 # ──────────────────────────────────────────────────────────────────────────────
 
-DATA_ROOT       = Path("/home/matthias-nagl/BioDCASE/task/2026_BioDCASE_development_set/")           # site-year folders with .wav + annotation.csv
-OUTPUT_DIR      = Path("./runs")                # training checkpoints & logs
-SUBMISSION_PATH = Path("./submission.csv")       # inference output
+DATA_ROOT       = Path("/home/matthias-nagl/BioDCASE/task/2026_BioDCASE_development_set/")
+OUTPUT_DIR      = Path("./runs")
+SUBMISSION_PATH = Path("./submission.csv")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -38,7 +38,6 @@ VAL_DATASETS = [
     "kerguelen2015",
 ]
 
-# Evaluation set — released June 1 2026
 EVAL_DATASETS = [
     "kerguelen2020",
     "ddu2021",
@@ -49,11 +48,11 @@ EVAL_DATASETS = [
 # Audio & labels
 # ──────────────────────────────────────────────────────────────────────────────
 
-SAMPLE_RATE     = 250       # Hz — fixed by ATBFL
+SAMPLE_RATE     = 250
 FRAME_STRIDE_S  = 0.02      # 20 ms classification resolution
-N_FFT           = 256       # → 129 frequency bins
-WIN_LENGTH      = 250       # ~1 s window (matches low-freq whale calls)
-HOP_LENGTH      = 5         # samples between frames → 20 ms at 250 Hz
+N_FFT           = 256
+WIN_LENGTH      = 250       # ~1 s window
+HOP_LENGTH      = 5         # 20 ms at 250 Hz
 
 CALL_TYPES_7 = ["bma", "bmb", "bmz", "bmd", "bpd", "bp20", "bp20plus"]
 CALL_TYPES_3 = ["bmabz", "d", "bp"]
@@ -63,7 +62,6 @@ COLLAPSE_MAP = {
     "bpd": "bp", "bp20": "bp", "bp20plus": "bp",
 }
 
-# Train on 3-class collapsed problem (recommended — +15 % F1 in Whale-VAD)
 USE_3CLASS = True
 
 
@@ -71,24 +69,24 @@ USE_3CLASS = True
 # Segment extraction
 # ──────────────────────────────────────────────────────────────────────────────
 
-COLLAR_MIN_S        = 1.0       # min random collar around each annotation
-COLLAR_MAX_S        = 5.0       # max random collar
-EVAL_SEGMENT_S      = 30.0      # fixed segment length at inference
-EVAL_OVERLAP_S      = 2.0       # overlap between inference segments
+COLLAR_MIN_S        = 1.0
+COLLAR_MAX_S        = 5.0
+EVAL_SEGMENT_S      = 30.0
+EVAL_OVERLAP_S      = 2.0
 MIN_CALL_DURATION_S = 0.5
 MAX_CALL_DURATION_S = 30.0
-NEG_RATIO           = 1.0       # neg-to-pos segments per training epoch
+NEG_RATIO           = 1.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Model — Conformer
 # ──────────────────────────────────────────────────────────────────────────────
 
-D_MODEL     = 256       # embedding dimension
-N_HEADS     = 4         # attention heads
-D_FF        = 1024      # feed-forward inner dim
-N_LAYERS    = 4         # Conformer blocks  (try 4–8)
-CONV_KERNEL = 15        # depthwise conv kernel (try 15–31)
+D_MODEL     = 256
+N_HEADS     = 4
+D_FF        = 1024
+N_LAYERS    = 4
+CONV_KERNEL = 15
 DROPOUT     = 0.1
 
 
@@ -103,9 +101,18 @@ WEIGHT_DECAY  = 0.001
 WARMUP_EPOCHS = 5
 GRAD_CLIP     = 1.0
 
-FOCAL_ALPHA   = 0.25
+# Loss — CRITICAL FIXES from previous version:
+#
+# 1) pos_weight: upweights the positive (call-present) term in BCE.
+#    With ~5% positive frames, pos_weight ≈ 19 balances the classes.
+#    Set to None to auto-compute from actual training data.
+POS_WEIGHT    = None        # auto-computed from training data
+
+# 2) focal_alpha > 0.5 upweights positives (minority class).
+#    NOTE: alpha=0.25 DOWNWEIGHTS positives — was backwards before!
+FOCAL_ALPHA   = 0.75        # was 0.25 — that killed positive predictions
 FOCAL_GAMMA   = 2.0
-FOCAL_WEIGHT  = 1.0        # weight of focal term relative to BCE
+FOCAL_WEIGHT  = 1.0
 
 NUM_WORKERS   = 24
 SEED          = 42
@@ -115,12 +122,13 @@ SEED          = 42
 # Postprocessing
 # ──────────────────────────────────────────────────────────────────────────────
 
-SMOOTH_KERNEL_MS = 500      # median filter kernel
-MERGE_GAP_S      = 0.5      # merge detections closer than this
-POST_MIN_DUR_S   = 0.5      # discard shorter
-POST_MAX_DUR_S   = 30.0     # discard longer
+SMOOTH_KERNEL_MS = 500
+MERGE_GAP_S      = 0.5
+POST_MIN_DUR_S   = 0.5
+POST_MAX_DUR_S   = 30.0
 
-DEFAULT_THRESHOLDS = [0.5, 0.5, 0.5]
+# Lower default — the model's probabilities are low early in training
+DEFAULT_THRESHOLDS = [0.3, 0.3, 0.3]
 
 
 # ──────────────────────────────────────────────────────────────────────────────

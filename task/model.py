@@ -375,39 +375,32 @@ class WhaleConformer(nn.Module):
 # Loss functions
 # ---------------------------------------------------------------------------
 
-class FocalLoss(nn.Module):
-    """Binary focal loss for multi-label classification."""
-    def __init__(self, alpha: float = 0.25, gamma: float = 2.0, reduction: str = "mean"):
-        super().__init__()
-        self.alpha = alpha
-        self.gamma = gamma
-        self.reduction = reduction
-
-    def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        probs = torch.sigmoid(logits)
-        ce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-        p_t = probs * targets + (1 - probs) * (1 - targets)
-        alpha_t = self.alpha * targets + (1 - self.alpha) * (1 - targets)
-        loss = alpha_t * (1 - p_t) ** self.gamma * ce
-        if self.reduction == "mean":
-            return loss.mean()
-        elif self.reduction == "sum":
-            return loss.sum()
-        return loss
-
-
 class WeightedBCEWithFocal(nn.Module):
-    """Combined weighted BCE + focal loss, with per-class weights."""
+    """
+    BCE + focal loss with proper positive-class weighting.
+
+    CRITICAL FIX: uses pos_weight to upweight the positive (call-present)
+    term in the BCE. With ~5% positive frames, pos_weight ≈ 19 makes
+    missing a call as costly as 19 false alarms — this prevents the model
+    from collapsing to "predict all zeros".
+
+    focal_alpha > 0.5 further upweights positives in the focal term.
+    """
     def __init__(
         self,
-        class_weights: torch.Tensor | None = None,
-        focal_alpha: float = 0.25,
+        pos_weight: torch.Tensor | None = None,
+        focal_alpha: float = 0.75,
         focal_gamma: float = 2.0,
         focal_weight: float = 1.0,
     ):
         super().__init__()
-        self.register_buffer("class_weights", class_weights)
-        self.focal = FocalLoss(alpha=focal_alpha, gamma=focal_gamma, reduction="none")
+        # pos_weight: (C,) — one weight per class
+        if pos_weight is not None:
+            self.register_buffer("pos_weight", pos_weight)
+        else:
+            self.pos_weight = None
+        self.focal_alpha = focal_alpha
+        self.focal_gamma = focal_gamma
         self.focal_weight = focal_weight
 
     def forward(
@@ -420,13 +413,25 @@ class WeightedBCEWithFocal(nn.Module):
             targets:      (B, T, C) binary
             padding_mask: (B, T) — True where valid, False where padded
         """
-        bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
-        if self.class_weights is not None:
-            bce = bce * self.class_weights.view(1, 1, -1)
+        # --- Weighted BCE ---
+        # pos_weight scales ONLY the positive term: -w * y * log(p) - (1-y) * log(1-p)
+        pw = self.pos_weight.view(1, 1, -1) if self.pos_weight is not None else None
+        bce = F.binary_cross_entropy_with_logits(
+            logits, targets, pos_weight=pw, reduction="none"
+        )
 
-        focal = self.focal(logits, targets)
-        loss = bce + self.focal_weight * focal  # (B, T, C)
+        # --- Focal modulation ---
+        if self.focal_weight > 0:
+            probs = torch.sigmoid(logits)
+            p_t = probs * targets + (1 - probs) * (1 - targets)
+            # alpha > 0.5 upweights positives (minority)
+            alpha_t = self.focal_alpha * targets + (1 - self.focal_alpha) * (1 - targets)
+            focal_mod = alpha_t * (1 - p_t) ** self.focal_gamma
+            loss = bce + self.focal_weight * focal_mod * bce
+        else:
+            loss = bce
 
+        # --- Mask out padding ---
         if padding_mask is not None:
             loss = loss * padding_mask.unsqueeze(-1).float()
             return loss.sum() / (padding_mask.sum() * logits.size(-1) + 1e-8)
