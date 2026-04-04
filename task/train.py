@@ -172,8 +172,14 @@ def main():
         dropout=cfg.DROPOUT, n_fft=cfg.N_FFT, hop_length=cfg.HOP_LENGTH,
         win_length=cfg.WIN_LENGTH, sample_rate=cfg.SAMPLE_RATE,
     ).to(device)
+
+    if torch.cuda.device_count() > 1:
+        print(f"Training across {torch.cuda.device_count()} GPUs!")
+        model = nn.DataParallel(model)
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params:,}")
+
 
     # --- loss ---
     class_weights = compute_class_weights().to(device)
@@ -219,7 +225,9 @@ def main():
             print(f"  {name}: F1={val['class_f1'][i]:.3f}")
         print(f"  Mean F1: {val['mean_f1']:.3f}")
 
-        ckpt = {"epoch": epoch, "model_state_dict": model.state_dict(),
+        model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+
+        ckpt = {"epoch": epoch, "model_state_dict": model_state,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "best_f1": best_f1, "thresholds": thresholds.cpu()}
 
