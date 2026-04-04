@@ -8,79 +8,39 @@ Handles:
   - Per-frame binary multi-label target construction at 20 ms resolution
   - Stochastic negative mini-batch undersampling
   - Collation with zero-padding + padding masks
+
+All constants come from config.py.
 """
 
-import os
 import random
-from pathlib import Path
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import soundfile as sf
 import torch
-from torch.utils.data import Dataset, DataLoader, Sampler
+from torch.utils.data import Dataset, DataLoader
 
-# The 7 original call types and the 3 collapsed evaluation classes
-CALL_TYPES_7 = ["bma", "bmb", "bmz", "bmd", "bpd", "bp20", "bp20plus"]
-CALL_TYPES_3 = ["bmabz", "d", "bp"]
-
-# Mapping from 7-class to 3-class
-COLLAPSE_MAP = {
-    "bma": "bmabz", "bmb": "bmabz", "bmz": "bmabz",
-    "bmd": "d",
-    "bpd": "bp", "bp20": "bp", "bp20plus": "bp",
-}
-
-CLASS_TO_IDX_7 = {c: i for i, c in enumerate(CALL_TYPES_7)}
-CLASS_TO_IDX_3 = {c: i for i, c in enumerate(CALL_TYPES_3)}
-
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-@dataclass
-class DataConfig:
-    data_root: str = "./data"               # root containing site-year folders
-    sample_rate: int = 250
-    frame_stride_s: float = 0.02            # 20 ms classification resolution
-    use_3class: bool = True                 # collapse to 3-class problem
-    collar_min_s: float = 1.0               # min collar around annotation
-    collar_max_s: float = 5.0               # max collar around annotation
-    eval_segment_s: float = 30.0            # fixed segment length at eval time
-    eval_overlap_s: float = 2.0             # overlap between eval segments
-    neg_ratio: float = 1.0                  # ratio of neg-to-pos segments per epoch
-    min_call_duration_s: float = 0.5
-    max_call_duration_s: float = 30.0
-
-    train_datasets: list[str] = field(default_factory=lambda: [
-        "ballenyisland2015", "casey2014", "elephantisland2013",
-        "elephantisland2014", "greenwich2015", "kerguelen2005",
-        "maudrise2014", "rosssea2014",
-    ])
-    val_datasets: list[str] = field(default_factory=lambda: [
-        "casey2017", "kerguelen2014", "kerguelen2015",
-    ])
+import config as cfg
 
 
 # ---------------------------------------------------------------------------
 # Annotation parsing
 # ---------------------------------------------------------------------------
 
-def load_annotations(data_root: str, dataset_names: list[str]) -> pd.DataFrame:
+def load_annotations(dataset_names: list[str]) -> pd.DataFrame:
     """
     Load and merge annotation CSVs for the given site-year datasets.
-    Expects one CSV per dataset at: {data_root}/{dataset}/annotation.csv
+    Expects one CSV per dataset at: {DATA_ROOT}/{dataset}/annotation.csv
     """
     frames = []
     for ds in dataset_names:
-        csv_path = Path(data_root) / ds / "annotation.csv"
+        csv_path = cfg.DATA_ROOT / ds / "annotation.csv"
         if not csv_path.exists():
-            # Try alternate naming conventions
             for alt in ["annotations.csv", f"{ds}.csv"]:
-                alt_path = Path(data_root) / ds / alt
+                alt_path = cfg.DATA_ROOT / ds / alt
                 if alt_path.exists():
                     csv_path = alt_path
                     break
@@ -90,27 +50,23 @@ def load_annotations(data_root: str, dataset_names: list[str]) -> pd.DataFrame:
             frames.append(df)
         else:
             print(f"Warning: no annotation file found for {ds}")
-    if not frames:
-        raise FileNotFoundError(f"No annotation files found in {data_root}")
-    annotations = pd.concat(frames, ignore_index=True)
 
-    # Parse datetimes
+    if not frames:
+        raise FileNotFoundError(f"No annotation files found in {cfg.DATA_ROOT}")
+
+    annotations = pd.concat(frames, ignore_index=True)
     for col in ["start_datetime", "end_datetime"]:
         annotations[col] = pd.to_datetime(annotations[col], utc=True)
-
-    # Add collapsed class
-    annotations["label_3class"] = annotations["annotation"].map(COLLAPSE_MAP)
-
+    annotations["label_3class"] = annotations["annotation"].map(cfg.COLLAPSE_MAP)
     return annotations
 
 
-def get_file_manifest(data_root: str, dataset_names: list[str]) -> pd.DataFrame:
+def get_file_manifest(dataset_names: list[str]) -> pd.DataFrame:
     """Build a manifest of all WAV files with their durations."""
     records = []
     for ds in dataset_names:
-        ds_dir = Path(data_root) / ds
-        wav_files = sorted(ds_dir.glob("*.wav"))
-        for wf in wav_files:
+        ds_dir = cfg.DATA_ROOT / ds
+        for wf in sorted(ds_dir.glob("*.wav")):
             info = sf.info(str(wf))
             records.append({
                 "dataset": ds,
@@ -128,29 +84,31 @@ def get_file_manifest(data_root: str, dataset_names: list[str]) -> pd.DataFrame:
 
 @dataclass
 class Segment:
-    """A training/eval segment with metadata."""
     filepath: str
     dataset: str
     filename: str
     start_sample: int
     end_sample: int
-    annotations: list  # list of (start_sample_rel, end_sample_rel, class_idx)
+    annotations: list       # list of (start_sample_rel, end_sample_rel, class_idx)
     is_positive: bool
+
+
+def _parse_file_start_dt(filename: str) -> datetime | None:
+    try:
+        base = filename.replace(".wav", "").split("_")[0]
+        return datetime.strptime(base, "%Y-%m-%dT%H-%M-%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
 def build_training_segments(
     annotations: pd.DataFrame,
     file_manifest: pd.DataFrame,
-    config: DataConfig,
 ) -> tuple[list[Segment], list[Segment]]:
-    """
-    Build positive segments (centered on annotations with random collars)
-    and negative segments (from unannotated regions).
-    """
-    sr = config.sample_rate
-    n_classes = 3 if config.use_3class else 7
-    class_map = CLASS_TO_IDX_3 if config.use_3class else CLASS_TO_IDX_7
-    label_col = "label_3class" if config.use_3class else "annotation"
+    """Build positive segments (with random collars) and negative segments."""
+    sr = cfg.SAMPLE_RATE
+    class_map = cfg.class_to_idx()
+    label_col = "label_3class" if cfg.USE_3CLASS else "annotation"
 
     positive_segments = []
     negative_segments = []
@@ -161,14 +119,13 @@ def build_training_segments(
         fpath = file_row["filepath"]
         file_dur_samples = int(file_row["duration_s"] * sr)
 
-        # Get annotations for this file
         file_annots = annotations[
             (annotations["dataset"] == ds) & (annotations["filename"] == fname)
         ]
 
+        # --- fully negative file → extract fixed-length negatives ---
         if len(file_annots) == 0:
-            # Entire file is negative — extract fixed-length negative segments
-            seg_len = int(config.eval_segment_s * sr)
+            seg_len = int(cfg.EVAL_SEGMENT_S * sr)
             for start in range(0, file_dur_samples - seg_len, seg_len):
                 negative_segments.append(Segment(
                     filepath=fpath, dataset=ds, filename=fname,
@@ -177,35 +134,26 @@ def build_training_segments(
                 ))
             continue
 
-        # Parse file start time from filename (format: YYYY-MM-DDTHH-MM-SS_000.wav)
-        try:
-            base = fname.replace(".wav", "").split("_")[0]
-            file_start_dt = datetime.strptime(base, "%Y-%m-%dT%H-%M-%S").replace(
-                tzinfo=timezone.utc
-            )
-        except ValueError:
+        file_start_dt = _parse_file_start_dt(fname)
+        if file_start_dt is None:
             continue
 
-        # Build positive segments per annotation
+        # --- positive segments per annotation ---
         for _, ann in file_annots.iterrows():
             ann_start = (ann["start_datetime"] - file_start_dt).total_seconds()
             ann_end = (ann["end_datetime"] - file_start_dt).total_seconds()
             call_dur = ann_end - ann_start
-
-            if call_dur < config.min_call_duration_s or call_dur > config.max_call_duration_s:
+            if call_dur < cfg.MIN_CALL_DURATION_S or call_dur > cfg.MAX_CALL_DURATION_S:
                 continue
 
-            # Random collar
-            collar_before = random.uniform(config.collar_min_s, config.collar_max_s)
-            collar_after = random.uniform(config.collar_min_s, config.collar_max_s)
-
+            collar_before = random.uniform(cfg.COLLAR_MIN_S, cfg.COLLAR_MAX_S)
+            collar_after = random.uniform(cfg.COLLAR_MIN_S, cfg.COLLAR_MAX_S)
             seg_start_s = max(0, ann_start - collar_before)
             seg_end_s = min(file_row["duration_s"], ann_end + collar_after)
-
             seg_start_samp = int(seg_start_s * sr)
             seg_end_samp = int(seg_end_s * sr)
 
-            # Find ALL annotations overlapping with this segment
+            # collect ALL annotations overlapping this segment
             seg_annots = []
             for _, a2 in file_annots.iterrows():
                 a2_start = (a2["start_datetime"] - file_start_dt).total_seconds()
@@ -223,49 +171,42 @@ def build_training_segments(
                 annotations=seg_annots, is_positive=True,
             ))
 
-        # Also extract negative regions from this file
-        annotated_intervals = []
-        for _, ann in file_annots.iterrows():
-            s = (ann["start_datetime"] - file_start_dt).total_seconds()
-            e = (ann["end_datetime"] - file_start_dt).total_seconds()
-            annotated_intervals.append((s, e))
-        annotated_intervals.sort()
-
-        # Merge overlapping intervals
-        merged = [annotated_intervals[0]]
-        for s, e in annotated_intervals[1:]:
+        # --- negative segments from gaps ---
+        intervals = sorted(
+            ((ann["start_datetime"] - file_start_dt).total_seconds(),
+             (ann["end_datetime"] - file_start_dt).total_seconds())
+            for _, ann in file_annots.iterrows()
+        )
+        merged = [intervals[0]]
+        for s, e in intervals[1:]:
             if s <= merged[-1][1]:
                 merged[-1] = (merged[-1][0], max(merged[-1][1], e))
             else:
                 merged.append((s, e))
 
-        # Extract gaps as negative segments
-        seg_len_s = config.eval_segment_s
+        seg_len_s = cfg.EVAL_SEGMENT_S
         prev_end = 0.0
         for s, e in merged:
             gap = s - prev_end
             if gap >= seg_len_s:
-                start_s = prev_end
-                while start_s + seg_len_s <= s:
+                pos = prev_end
+                while pos + seg_len_s <= s:
                     negative_segments.append(Segment(
                         filepath=fpath, dataset=ds, filename=fname,
-                        start_sample=int(start_s * sr),
-                        end_sample=int((start_s + seg_len_s) * sr),
+                        start_sample=int(pos * sr), end_sample=int((pos + seg_len_s) * sr),
                         annotations=[], is_positive=False,
                     ))
-                    start_s += seg_len_s
+                    pos += seg_len_s
             prev_end = e
 
     return positive_segments, negative_segments
 
 
-def build_eval_segments(
-    file_manifest: pd.DataFrame, config: DataConfig
-) -> list[Segment]:
-    """Build fixed-length overlapping segments for evaluation."""
-    sr = config.sample_rate
-    seg_len = int(config.eval_segment_s * sr)
-    hop = int((config.eval_segment_s - config.eval_overlap_s) * sr)
+def build_eval_segments(file_manifest: pd.DataFrame) -> list[Segment]:
+    """Build fixed-length overlapping segments for evaluation / inference."""
+    sr = cfg.SAMPLE_RATE
+    seg_len = int(cfg.EVAL_SEGMENT_S * sr)
+    hop = int((cfg.EVAL_SEGMENT_S - cfg.EVAL_OVERLAP_S) * sr)
     segments = []
 
     for _, row in file_manifest.iterrows():
@@ -279,7 +220,6 @@ def build_eval_segments(
                 annotations=[], is_positive=False,
             ))
             start += hop
-        # Handle last partial segment
         if start < file_dur_samples:
             segments.append(Segment(
                 filepath=row["filepath"], dataset=row["dataset"],
@@ -296,168 +236,116 @@ def build_eval_segments(
 # ---------------------------------------------------------------------------
 
 class WhaleCallDataset(Dataset):
-    """
-    Returns (audio_tensor, target_tensor, padding_mask, metadata_dict).
+    """Returns (audio, target, metadata).  target: (T_frames, C) binary."""
 
-    target_tensor: (T_frames, n_classes) binary labels at 20 ms resolution
-    """
-    def __init__(
-        self,
-        segments: list[Segment],
-        config: DataConfig,
-        is_train: bool = True,
-    ):
+    def __init__(self, segments: list[Segment], is_train: bool = True):
         self.segments = segments
-        self.config = config
         self.is_train = is_train
-        self.n_classes = 3 if config.use_3class else 7
-        self.frame_stride_samples = int(config.frame_stride_s * config.sample_rate)
+        self.n_classes = cfg.n_classes()
+        self.frame_stride_samples = int(cfg.FRAME_STRIDE_S * cfg.SAMPLE_RATE)
 
     def __len__(self) -> int:
         return len(self.segments)
 
     def __getitem__(self, idx: int):
         seg = self.segments[idx]
-
-        # Load audio
-        audio, sr = sf.read(
-            seg.filepath,
-            start=seg.start_sample,
-            stop=seg.end_sample,
-            dtype="float32",
-        )
-        assert sr == self.config.sample_rate, f"Expected {self.config.sample_rate} Hz, got {sr}"
-
-        # Mean subtraction (per-segment, as in Whale-VAD)
+        audio, sr = sf.read(seg.filepath, start=seg.start_sample,
+                            stop=seg.end_sample, dtype="float32")
+        assert sr == cfg.SAMPLE_RATE
         audio = audio - audio.mean()
 
-        n_samples = len(audio)
-        n_frames = n_samples // self.frame_stride_samples
-
-        # Build target: (n_frames, n_classes)
+        n_frames = len(audio) // self.frame_stride_samples
         target = np.zeros((n_frames, self.n_classes), dtype=np.float32)
         for rel_start, rel_end, cls_idx in seg.annotations:
-            frame_start = rel_start // self.frame_stride_samples
-            frame_end = rel_end // self.frame_stride_samples
-            frame_start = max(0, min(frame_start, n_frames - 1))
-            frame_end = max(0, min(frame_end, n_frames))
-            target[frame_start:frame_end, cls_idx] = 1.0
+            fs = max(0, min(rel_start // self.frame_stride_samples, n_frames - 1))
+            fe = max(0, min(rel_end // self.frame_stride_samples, n_frames))
+            target[fs:fe, cls_idx] = 1.0
 
-        metadata = {
-            "dataset": seg.dataset,
-            "filename": seg.filename,
-            "start_sample": seg.start_sample,
-            "end_sample": seg.end_sample,
-        }
-
-        return (
-            torch.from_numpy(audio),
-            torch.from_numpy(target),
-            metadata,
-        )
+        meta = {"dataset": seg.dataset, "filename": seg.filename,
+                "start_sample": seg.start_sample, "end_sample": seg.end_sample}
+        return torch.from_numpy(audio), torch.from_numpy(target), meta
 
 
 # ---------------------------------------------------------------------------
-# Collation & negative undersampling
+# Collation
 # ---------------------------------------------------------------------------
 
 def collate_fn(batch):
-    """
-    Zero-pad variable-length segments to batch max and create padding masks.
-    """
     audios, targets, metas = zip(*batch)
 
-    # Pad audio
-    max_audio_len = max(a.size(0) for a in audios)
-    padded_audio = torch.zeros(len(audios), max_audio_len)
+    max_audio = max(a.size(0) for a in audios)
+    padded_audio = torch.zeros(len(audios), max_audio)
     for i, a in enumerate(audios):
-        padded_audio[i, : a.size(0)] = a
+        padded_audio[i, :a.size(0)] = a
 
-    # Pad targets — need to know frame counts
     max_frames = max(t.size(0) for t in targets)
-    n_classes = targets[0].size(1)
-    padded_targets = torch.zeros(len(targets), max_frames, n_classes)
+    nc = targets[0].size(1)
+    padded_targets = torch.zeros(len(targets), max_frames, nc)
     padding_mask = torch.zeros(len(targets), max_frames, dtype=torch.bool)
     for i, t in enumerate(targets):
-        padded_targets[i, : t.size(0)] = t
-        padding_mask[i, : t.size(0)] = True
+        padded_targets[i, :t.size(0)] = t
+        padding_mask[i, :t.size(0)] = True
 
     return padded_audio, padded_targets, padding_mask, list(metas)
 
 
+# ---------------------------------------------------------------------------
+# Negative undersampling wrapper
+# ---------------------------------------------------------------------------
+
 class NegativeUndersamplingDataset(Dataset):
     """
-    Wraps positive + negative segments with epoch-level resampling of negatives.
-    Call resample_negatives() at the start of each epoch.
+    Wraps positive + negative segments.  Call resample_negatives() each epoch.
     """
-    def __init__(
-        self,
-        positive_segments: list[Segment],
-        negative_segments: list[Segment],
-        config: DataConfig,
-    ):
-        self.positive_segments = positive_segments
-        self.all_negatives = negative_segments
-        self.config = config
-        self.inner_dataset: WhaleCallDataset | None = None
+    def __init__(self, positive: list[Segment], negative: list[Segment]):
+        self.positive = positive
+        self.all_negatives = negative
+        self.inner: WhaleCallDataset | None = None
         self.resample_negatives()
 
     def resample_negatives(self):
-        """Sample a new subset of negatives for this epoch."""
-        n_neg = int(len(self.positive_segments) * self.config.neg_ratio)
+        n_neg = int(len(self.positive) * cfg.NEG_RATIO)
         n_neg = min(n_neg, len(self.all_negatives))
-        sampled_neg = random.sample(self.all_negatives, n_neg)
-        all_segments = self.positive_segments + sampled_neg
-        random.shuffle(all_segments)
-        self.inner_dataset = WhaleCallDataset(
-            all_segments, self.config, is_train=True
-        )
+        sampled = random.sample(self.all_negatives, n_neg)
+        combined = self.positive + sampled
+        random.shuffle(combined)
+        self.inner = WhaleCallDataset(combined, is_train=True)
 
-    def __len__(self) -> int:
-        return len(self.inner_dataset)
+    def __len__(self):
+        return len(self.inner)
 
-    def __getitem__(self, idx: int):
-        return self.inner_dataset[idx]
+    def __getitem__(self, idx):
+        return self.inner[idx]
 
 
 # ---------------------------------------------------------------------------
-# Convenience builder
+# Build loaders
 # ---------------------------------------------------------------------------
 
 def build_dataloaders(
-    config: DataConfig, batch_size: int = 16, num_workers: int = 4,
+    batch_size: int = cfg.BATCH_SIZE,
+    num_workers: int = cfg.NUM_WORKERS,
 ) -> tuple[NegativeUndersamplingDataset, DataLoader, DataLoader]:
-    """
-    Build training dataset (with undersampling) and validation dataloader.
-    Returns (train_dataset, train_loader, val_loader).
-    """
-    # Load annotations
-    all_datasets = config.train_datasets + config.val_datasets
-    annotations = load_annotations(config.data_root, all_datasets)
-    train_annots = annotations[annotations["dataset"].isin(config.train_datasets)]
+    """Returns (train_dataset, train_loader, val_loader)."""
+    all_datasets = cfg.TRAIN_DATASETS + cfg.VAL_DATASETS
+    annotations = load_annotations(all_datasets)
+    train_annots = annotations[annotations["dataset"].isin(cfg.TRAIN_DATASETS)]
 
-    # File manifests
-    train_manifest = get_file_manifest(config.data_root, config.train_datasets)
-    val_manifest = get_file_manifest(config.data_root, config.val_datasets)
+    train_manifest = get_file_manifest(cfg.TRAIN_DATASETS)
+    val_manifest = get_file_manifest(cfg.VAL_DATASETS)
 
-    # Training segments
-    pos_segs, neg_segs = build_training_segments(train_annots, train_manifest, config)
-    print(f"Training: {len(pos_segs)} positive, {len(neg_segs)} negative segments")
+    pos, neg = build_training_segments(train_annots, train_manifest)
+    print(f"Training: {len(pos)} positive, {len(neg)} negative segments")
+    train_ds = NegativeUndersamplingDataset(pos, neg)
 
-    train_ds = NegativeUndersamplingDataset(pos_segs, neg_segs, config)
-
-    # Validation segments (fixed windows, no undersampling)
-    val_segs = build_eval_segments(val_manifest, config)
+    val_segs = build_eval_segments(val_manifest)
     print(f"Validation: {len(val_segs)} segments")
-    val_ds = WhaleCallDataset(val_segs, config, is_train=False)
+    val_ds = WhaleCallDataset(val_segs, is_train=False)
 
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, collate_fn=collate_fn, pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_ds, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, collate_fn=collate_fn, pin_memory=True,
-    )
-
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, collate_fn=collate_fn,
+                              pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False,
+                            num_workers=num_workers, collate_fn=collate_fn,
+                            pin_memory=True)
     return train_ds, train_loader, val_loader

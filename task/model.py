@@ -342,6 +342,26 @@ class WhaleConformer(nn.Module):
         logits = self.classifier(x)    # (B, T, n_classes)
         return logits
 
+    @classmethod
+    def from_config(cls, cfg=None) -> "WhaleConformer":
+        """Build model from the central Config object."""
+        if cfg is None:
+            from config import CFG
+            cfg = CFG
+        return cls(
+            n_classes=cfg.model.n_classes,
+            d_model=cfg.model.d_model,
+            n_heads=cfg.model.n_heads,
+            d_ff=cfg.model.d_ff,
+            n_layers=cfg.model.n_layers,
+            conv_kernel_size=cfg.model.conv_kernel_size,
+            dropout=cfg.model.dropout,
+            n_fft=cfg.audio.n_fft,
+            hop_length=cfg.audio.hop_length,
+            win_length=cfg.audio.win_length,
+            sample_rate=cfg.audio.sample_rate,
+        )
+
     def predict(self, audio: torch.Tensor, thresholds: torch.Tensor | None = None) -> torch.Tensor:
         """Convenience method: returns binary predictions after sigmoid + threshold."""
         logits = self.forward(audio)
@@ -418,14 +438,19 @@ class WeightedBCEWithFocal(nn.Module):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    import config as cfg
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = WhaleConformer(
-        n_classes=3, d_model=256, n_heads=4, d_ff=1024,
-        n_layers=4, conv_kernel_size=15, dropout=0.1,
+        n_classes=cfg.n_classes(),
+        d_model=cfg.D_MODEL, n_heads=cfg.N_HEADS, d_ff=cfg.D_FF,
+        n_layers=cfg.N_LAYERS, conv_kernel_size=cfg.CONV_KERNEL, dropout=cfg.DROPOUT,
+        n_fft=cfg.N_FFT, hop_length=cfg.HOP_LENGTH, win_length=cfg.WIN_LENGTH,
+        sample_rate=cfg.SAMPLE_RATE,
     ).to(device)
 
-    # Simulate a 30s clip at 250 Hz
-    batch = torch.randn(2, 250 * 30, device=device)
+    # Simulate a 30s clip
+    batch = torch.randn(2, cfg.SAMPLE_RATE * 30, device=device)
     logits = model(batch)
     print(f"Input:  {batch.shape}")
     print(f"Output: {logits.shape}  (B, T_frames, n_classes)")

@@ -1,32 +1,28 @@
 """
 Postprocessing and evaluation for BioDCASE 2026 Task 2.
 
-Postprocessing pipeline (matching Whale-VAD):
-  1. Median filter smoothing (500 ms kernel)
-  2. Per-class thresholding
-  3. Merge overlapping detections of the same class
-  4. Join detections separated by < 500 ms
-  5. Discard detections < 500 ms or > 30 s
-  6. Export to challenge CSV format
-
-Evaluation:
-  - 1D temporal IoU matching
-  - Per-class precision, recall, F1
+Pipeline:
+  1. Stitch overlapping segment predictions (averaging in overlaps)
+  2. Median filter smoothing
+  3. Per-class thresholding
+  4. Merge nearby detections, discard outlier durations
+  5. Export to challenge CSV
 """
 
 import csv
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 from scipy.ndimage import median_filter
 
+import config as cfg
+
 
 # ---------------------------------------------------------------------------
-# Data structures
+# Detection dataclass
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -34,7 +30,7 @@ class Detection:
     dataset: str
     filename: str
     label: str
-    start_s: float        # relative to file start
+    start_s: float
     end_s: float
     confidence: float = 1.0
 
@@ -43,350 +39,206 @@ class Detection:
 # Smoothing & thresholding
 # ---------------------------------------------------------------------------
 
-def smooth_probabilities(
-    probs: np.ndarray, kernel_size_ms: int = 500, frame_stride_ms: int = 20
-) -> np.ndarray:
-    """
-    Apply median filter to per-frame probabilities.
-
-    Args:
-        probs: (T, C) array of probabilities
-        kernel_size_ms: kernel size in milliseconds
-        frame_stride_ms: stride between frames in milliseconds
-    Returns:
-        smoothed: (T, C) array
-    """
-    kernel_frames = max(1, kernel_size_ms // frame_stride_ms)
-    if kernel_frames % 2 == 0:
-        kernel_frames += 1  # median filter needs odd kernel
-
-    smoothed = np.zeros_like(probs)
+def smooth_probabilities(probs: np.ndarray, kernel_ms: int = cfg.SMOOTH_KERNEL_MS) -> np.ndarray:
+    """Median filter per class.  probs: (T, C)."""
+    stride_ms = int(cfg.FRAME_STRIDE_S * 1000)
+    k = max(1, kernel_ms // stride_ms)
+    if k % 2 == 0:
+        k += 1
+    out = np.zeros_like(probs)
     for c in range(probs.shape[1]):
-        smoothed[:, c] = median_filter(probs[:, c], size=kernel_frames)
-    return smoothed
+        out[:, c] = median_filter(probs[:, c], size=k)
+    return out
 
 
 def threshold_to_detections(
-    probs: np.ndarray,
-    thresholds: np.ndarray,
-    frame_stride_s: float,
-    dataset: str,
-    filename: str,
-    class_names: list[str],
-    file_start_sample: int = 0,
-    sample_rate: int = 250,
+    probs: np.ndarray, thresholds: np.ndarray,
+    dataset: str, filename: str, offset_sample: int = 0,
 ) -> list[Detection]:
-    """
-    Convert per-frame probabilities to Detection objects.
-
-    Args:
-        probs: (T, C) smoothed probabilities
-        thresholds: (C,) per-class thresholds
-        frame_stride_s: seconds between frames
-    """
-    detections = []
+    """Convert per-frame probabilities → Detection objects."""
+    names = cfg.class_names()
+    dets = []
     T, C = probs.shape
+    offset_s = offset_sample / cfg.SAMPLE_RATE
 
     for c in range(C):
         active = probs[:, c] > thresholds[c]
-        # Find contiguous regions
         diffs = np.diff(active.astype(int), prepend=0, append=0)
         starts = np.where(diffs == 1)[0]
         ends = np.where(diffs == -1)[0]
-
-        offset_s = file_start_sample / sample_rate
-
         for s, e in zip(starts, ends):
-            start_s = s * frame_stride_s + offset_s
-            end_s = e * frame_stride_s + offset_s
-            conf = float(probs[s:e, c].mean())
-            detections.append(Detection(
-                dataset=dataset,
-                filename=filename,
-                label=class_names[c],
-                start_s=start_s,
-                end_s=end_s,
-                confidence=conf,
+            dets.append(Detection(
+                dataset=dataset, filename=filename, label=names[c],
+                start_s=s * cfg.FRAME_STRIDE_S + offset_s,
+                end_s=e * cfg.FRAME_STRIDE_S + offset_s,
+                confidence=float(probs[s:e, c].mean()),
             ))
-
-    return detections
+    return dets
 
 
 # ---------------------------------------------------------------------------
 # Merging & filtering
 # ---------------------------------------------------------------------------
 
-def merge_detections(
-    detections: list[Detection],
-    merge_gap_s: float = 0.5,
-    min_duration_s: float = 0.5,
-    max_duration_s: float = 30.0,
-) -> list[Detection]:
-    """
-    Merge nearby detections of the same class in the same file,
-    then filter by duration.
-    """
-    # Group by (dataset, filename, label)
+def merge_detections(detections: list[Detection]) -> list[Detection]:
+    """Merge nearby same-class detections, filter by duration."""
     groups: dict[tuple, list[Detection]] = {}
     for d in detections:
-        key = (d.dataset, d.filename, d.label)
-        groups.setdefault(key, []).append(d)
+        groups.setdefault((d.dataset, d.filename, d.label), []).append(d)
 
     merged = []
-    for key, dets in groups.items():
+    for dets in groups.values():
         dets.sort(key=lambda x: x.start_s)
-        current = dets[0]
+        cur = dets[0]
         for d in dets[1:]:
-            if d.start_s - current.end_s < merge_gap_s:
-                # Merge
-                current = Detection(
-                    dataset=current.dataset,
-                    filename=current.filename,
-                    label=current.label,
-                    start_s=current.start_s,
-                    end_s=max(current.end_s, d.end_s),
-                    confidence=max(current.confidence, d.confidence),
-                )
+            if d.start_s - cur.end_s < cfg.MERGE_GAP_S:
+                cur = Detection(cur.dataset, cur.filename, cur.label,
+                                cur.start_s, max(cur.end_s, d.end_s),
+                                max(cur.confidence, d.confidence))
             else:
-                merged.append(current)
-                current = d
-        merged.append(current)
+                merged.append(cur)
+                cur = d
+        merged.append(cur)
 
-    # Filter by duration
-    filtered = [
-        d for d in merged
-        if min_duration_s <= (d.end_s - d.start_s) <= max_duration_s
-    ]
-    return filtered
+    return [d for d in merged
+            if cfg.POST_MIN_DUR_S <= (d.end_s - d.start_s) <= cfg.POST_MAX_DUR_S]
 
 
 # ---------------------------------------------------------------------------
-# Full postprocessing pipeline
+# Stitch overlapping segments
+# ---------------------------------------------------------------------------
+
+def _stitch_segments(
+    all_probs: dict[tuple[str, str, int], np.ndarray],
+) -> dict[tuple[str, str], np.ndarray]:
+    """Merge overlapping segment probs by averaging.  Returns per-file arrays."""
+    stride_samp = int(cfg.FRAME_STRIDE_S * cfg.SAMPLE_RATE)
+    file_segs: dict[tuple[str, str], list[tuple[int, np.ndarray]]] = {}
+    for (ds, fn, start_samp), probs in all_probs.items():
+        file_segs.setdefault((ds, fn), []).append((start_samp, probs))
+
+    result = {}
+    for key, segs in file_segs.items():
+        segs.sort(key=lambda x: x[0])
+        max_end = max(s + p.shape[0] * stride_samp for s, p in segs)
+        total_frames = max_end // stride_samp + 1
+        nc = segs[0][1].shape[1]
+        accum = np.zeros((total_frames, nc), dtype=np.float64)
+        counts = np.zeros(total_frames, dtype=np.float64)
+        for start_samp, probs in segs:
+            f0 = start_samp // stride_samp
+            T = min(probs.shape[0], total_frames - f0)
+            accum[f0:f0 + T] += probs[:T]
+            counts[f0:f0 + T] += 1
+        counts = np.maximum(counts, 1)
+        result[key] = (accum / counts[:, None]).astype(np.float32)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Full pipeline
 # ---------------------------------------------------------------------------
 
 def postprocess_predictions(
     all_probs: dict[tuple[str, str, int], np.ndarray],
     thresholds: np.ndarray,
-    class_names: list[str],
-    frame_stride_s: float = 0.02,
-    sample_rate: int = 250,
-    smooth_kernel_ms: int = 500,
-    merge_gap_s: float = 0.5,
-    min_duration_s: float = 0.5,
-    max_duration_s: float = 30.0,
 ) -> list[Detection]:
-    """
-    Full pipeline from raw probabilities to final detections.
-
-    Args:
-        all_probs: dict mapping (dataset, filename, start_sample) → (T, C) probs
-    """
-    # First, stitch overlapping segments per file
-    file_probs = _stitch_segments(all_probs, frame_stride_s, sample_rate)
-
-    all_detections = []
-    for (dataset, filename), (probs, _) in file_probs.items():
-        probs = smooth_probabilities(probs, smooth_kernel_ms)
-        dets = threshold_to_detections(
-            probs, thresholds, frame_stride_s,
-            dataset, filename, class_names,
-            file_start_sample=0, sample_rate=sample_rate,
-        )
-        all_detections.extend(dets)
-
-    all_detections = merge_detections(
-        all_detections, merge_gap_s, min_duration_s, max_duration_s
-    )
-    return all_detections
-
-
-def _stitch_segments(
-    all_probs: dict[tuple[str, str, int], np.ndarray],
-    frame_stride_s: float,
-    sample_rate: int,
-) -> dict[tuple[str, str], tuple[np.ndarray, int]]:
-    """
-    Merge overlapping segment predictions by averaging in overlap regions.
-    Returns dict mapping (dataset, filename) → (full_probs, total_frames).
-    """
-    # Group by file
-    file_segments: dict[tuple[str, str], list[tuple[int, np.ndarray]]] = {}
-    for (ds, fn, start_sample), probs in all_probs.items():
-        key = (ds, fn)
-        file_segments.setdefault(key, []).append((start_sample, probs))
-
-    result = {}
-    for key, segments in file_segments.items():
-        segments.sort(key=lambda x: x[0])
-
-        # Determine total length
-        max_end_sample = max(
-            start + probs.shape[0] * int(frame_stride_s * sample_rate)
-            for start, probs in segments
-        )
-        total_frames = max_end_sample // int(frame_stride_s * sample_rate) + 1
-        n_classes = segments[0][1].shape[1]
-
-        accumulated = np.zeros((total_frames, n_classes), dtype=np.float64)
-        counts = np.zeros(total_frames, dtype=np.float64)
-
-        stride_samples = int(frame_stride_s * sample_rate)
-        for start_sample, probs in segments:
-            frame_offset = start_sample // stride_samples
-            T = probs.shape[0]
-            end_frame = min(frame_offset + T, total_frames)
-            actual_T = end_frame - frame_offset
-            accumulated[frame_offset:end_frame] += probs[:actual_T]
-            counts[frame_offset:end_frame] += 1
-
-        counts = np.maximum(counts, 1)
-        avg_probs = (accumulated / counts[:, None]).astype(np.float32)
-        result[key] = (avg_probs, total_frames)
-
-    return result
+    """Raw segment probs → merged, filtered Detection list."""
+    file_probs = _stitch_segments(all_probs)
+    all_dets = []
+    for (ds, fn), probs in file_probs.items():
+        probs = smooth_probabilities(probs)
+        dets = threshold_to_detections(probs, thresholds, ds, fn)
+        all_dets.extend(dets)
+    return merge_detections(all_dets)
 
 
 # ---------------------------------------------------------------------------
 # Challenge CSV export
 # ---------------------------------------------------------------------------
 
-def export_challenge_csv(
-    detections: list[Detection],
-    output_path: str,
-    sample_rate: int = 250,
-):
-    """
-    Export detections to the BioDCASE 2026 Task 2 CSV format.
-
-    Expected format:
-        dataset,filename,annotation,start_datetime,end_datetime
-    """
+def export_challenge_csv(detections: list[Detection], output_path: str):
+    """Write detections in the official BioDCASE 2026 Task 2 format."""
     rows = []
     for d in detections:
-        # Parse file start datetime from filename
         try:
             base = d.filename.replace(".wav", "").split("_")[0]
             file_start = datetime.strptime(base, "%Y-%m-%dT%H-%M-%S").replace(
-                tzinfo=timezone.utc
-            )
+                tzinfo=timezone.utc)
         except ValueError:
             continue
-
-        start_dt = file_start + timedelta(seconds=d.start_s)
-        end_dt = file_start + timedelta(seconds=d.end_s)
-
         rows.append({
             "dataset": d.dataset,
             "filename": d.filename,
             "annotation": d.label,
-            "start_datetime": start_dt.isoformat(),
-            "end_datetime": end_dt.isoformat(),
+            "start_datetime": (file_start + timedelta(seconds=d.start_s)).isoformat(),
+            "end_datetime": (file_start + timedelta(seconds=d.end_s)).isoformat(),
         })
-
-    # Sort by dataset, filename, start time
     rows.sort(key=lambda r: (r["dataset"], r["filename"], r["start_datetime"]))
 
     with open(output_path, "w", newline="") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["dataset", "filename", "annotation", "start_datetime", "end_datetime"]
-        )
-        writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"Exported {len(rows)} detections to {output_path}")
+        w = csv.DictWriter(f, fieldnames=[
+            "dataset", "filename", "annotation", "start_datetime", "end_datetime"])
+        w.writeheader()
+        w.writerows(rows)
+    print(f"Exported {len(rows)} detections → {output_path}")
 
 
 # ---------------------------------------------------------------------------
-# Evaluation metrics (1D IoU based)
+# Evaluation (1D IoU)
 # ---------------------------------------------------------------------------
 
-def compute_iou_1d(pred_start: float, pred_end: float, gt_start: float, gt_end: float) -> float:
-    """Compute 1D temporal IoU."""
-    intersection = max(0, min(pred_end, gt_end) - max(pred_start, gt_start))
-    union = max(pred_end, gt_end) - min(pred_start, gt_start)
-    return intersection / union if union > 0 else 0.0
+def compute_iou_1d(ps, pe, gs, ge) -> float:
+    inter = max(0, min(pe, ge) - max(ps, gs))
+    union = max(pe, ge) - min(ps, gs)
+    return inter / union if union > 0 else 0.0
 
 
 def compute_metrics(
     predictions: list[Detection],
     ground_truth: list[Detection],
     iou_threshold: float = 0.3,
-    class_names: list[str] | None = None,
 ) -> dict:
-    """
-    Compute per-class and overall precision, recall, F1 using 1D IoU matching.
-    Implements the challenge rule: each GT can only be matched to one prediction.
-    """
-    if class_names is None:
-        class_names = list(set(d.label for d in predictions + ground_truth))
-
+    """Per-class + overall precision / recall / F1 with 1D IoU matching."""
+    classes = list(set(d.label for d in predictions + ground_truth))
     results = {}
-    total_tp, total_fp, total_fn = 0, 0, 0
+    tot_tp = tot_fp = tot_fn = 0
 
-    for cls in class_names:
-        cls_preds = [d for d in predictions if d.label == cls]
-        cls_gts = [d for d in ground_truth if d.label == cls]
-
-        # Group by file
-        file_keys = set(
-            (d.dataset, d.filename) for d in cls_preds + cls_gts
-        )
-
-        tp, fp, fn = 0, 0, 0
-        for fkey in file_keys:
-            f_preds = sorted(
-                [d for d in cls_preds if (d.dataset, d.filename) == fkey],
-                key=lambda x: x.start_s,
-            )
-            f_gts = sorted(
-                [d for d in cls_gts if (d.dataset, d.filename) == fkey],
-                key=lambda x: x.start_s,
-            )
-
-            matched_gts = set()
-            matched_preds = set()
-
-            # For each GT, find best matching prediction
-            for gi, gt in enumerate(f_gts):
-                best_iou = 0.0
-                best_pi = -1
-                for pi, pred in enumerate(f_preds):
-                    if pi in matched_preds:
+    for cls in classes:
+        cp = [d for d in predictions if d.label == cls]
+        cg = [d for d in ground_truth if d.label == cls]
+        files = set((d.dataset, d.filename) for d in cp + cg)
+        tp = fp = fn = 0
+        for fk in files:
+            fp_ = sorted([d for d in cp if (d.dataset, d.filename) == fk],
+                         key=lambda x: x.start_s)
+            fg_ = sorted([d for d in cg if (d.dataset, d.filename) == fk],
+                         key=lambda x: x.start_s)
+            matched = set()
+            for gt in fg_:
+                best_iou, best_i = 0.0, -1
+                for i, pr in enumerate(fp_):
+                    if i in matched:
                         continue
-                    iou = compute_iou_1d(pred.start_s, pred.end_s, gt.start_s, gt.end_s)
+                    iou = compute_iou_1d(pr.start_s, pr.end_s, gt.start_s, gt.end_s)
                     if iou > best_iou:
-                        best_iou = iou
-                        best_pi = pi
-                if best_iou >= iou_threshold and best_pi >= 0:
-                    tp += 1
-                    matched_gts.add(gi)
-                    matched_preds.add(best_pi)
+                        best_iou, best_i = iou, i
+                if best_iou >= iou_threshold and best_i >= 0:
+                    tp += 1; matched.add(best_i)
                 else:
                     fn += 1
+            fp += len(fp_) - len(matched)
 
-            fp += len(f_preds) - len(matched_preds)
+        p = tp / (tp + fp + 1e-8)
+        r = tp / (tp + fn + 1e-8)
+        results[cls] = {"precision": p, "recall": r,
+                        "f1": 2*p*r / (p + r + 1e-8), "tp": tp, "fp": fp, "fn": fn}
+        tot_tp += tp; tot_fp += fp; tot_fn += fn
 
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
-
-        results[cls] = {"precision": prec, "recall": rec, "f1": f1, "tp": tp, "fp": fp, "fn": fn}
-        total_tp += tp
-        total_fp += fp
-        total_fn += fn
-
-    # Overall
-    overall_prec = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
-    overall_rec = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
-    overall_f1 = (
-        2 * overall_prec * overall_rec / (overall_prec + overall_rec)
-        if (overall_prec + overall_rec) > 0 else 0.0
-    )
-    results["overall"] = {
-        "precision": overall_prec, "recall": overall_rec, "f1": overall_f1,
-        "tp": total_tp, "fp": total_fp, "fn": total_fn,
-    }
-
+    op = tot_tp / (tot_tp + tot_fp + 1e-8)
+    or_ = tot_tp / (tot_tp + tot_fn + 1e-8)
+    results["overall"] = {"precision": op, "recall": or_,
+                          "f1": 2*op*or_ / (op + or_ + 1e-8)}
     return results
 
 
@@ -395,68 +247,40 @@ def compute_metrics(
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def tune_thresholds(
-    model: nn.Module,
-    val_loader,
-    device: torch.device,
-    n_classes: int,
-    threshold_range: tuple[float, float] = (0.1, 0.9),
-    n_steps: int = 17,
-) -> torch.Tensor:
-    """
-    Grid search for per-class thresholds that maximise frame-level F1
-    on the validation set.
-    """
+def tune_thresholds(model: nn.Module, val_loader, device, n_classes,
+                    lo=0.1, hi=0.9, steps=17) -> torch.Tensor:
+    """Grid-search per-class thresholds maximising frame-level F1."""
     model.eval()
-    all_probs = []
-    all_targets = []
-    all_masks = []
+    all_p, all_t, all_m = [], [], []
+    for audio, targets, mask, _ in val_loader:
+        logits = model(audio.to(device))
+        Tm = logits.size(1); Tt = targets.size(1)
+        if Tm < Tt:
+            targets = targets[:, :Tm]; mask = mask[:, :Tm]
+        elif Tm > Tt:
+            targets = torch.cat([targets,
+                torch.zeros(targets.size(0), Tm-Tt, targets.size(2))], 1)
+            mask = torch.cat([mask,
+                torch.zeros(mask.size(0), Tm-Tt, dtype=torch.bool)], 1)
+        all_p.append(torch.sigmoid(logits).cpu())
+        all_t.append(targets); all_m.append(mask)
 
-    for audio, targets, padding_mask, _metas in val_loader:
-        audio = audio.to(device)
-        logits = model(audio)
-        T_model = logits.size(1)
-        T_target = targets.size(1)
-        if T_model < T_target:
-            targets = targets[:, :T_model, :]
-            padding_mask = padding_mask[:, :T_model]
-        elif T_model > T_target:
-            pad = torch.zeros(targets.size(0), T_model - T_target, targets.size(2))
-            targets = torch.cat([targets, pad], dim=1)
-            mask_pad = torch.zeros(padding_mask.size(0), T_model - T_target, dtype=torch.bool)
-            padding_mask = torch.cat([padding_mask, mask_pad], dim=1)
-
-        all_probs.append(torch.sigmoid(logits).cpu())
-        all_targets.append(targets)
-        all_masks.append(padding_mask)
-
-    all_probs = torch.cat(all_probs, dim=0)
-    all_targets = torch.cat(all_targets, dim=0)
-    all_masks = torch.cat(all_masks, dim=0)
-
-    best_thresholds = []
-    candidates = np.linspace(threshold_range[0], threshold_range[1], n_steps)
-
+    all_p = torch.cat(all_p); all_t = torch.cat(all_t); all_m = torch.cat(all_m)
+    cands = np.linspace(lo, hi, steps)
+    best = []
     for c in range(n_classes):
-        mask = all_masks.view(-1).bool()
-        targs = all_targets[..., c].view(-1)[mask]
-        probs_c = all_probs[..., c].view(-1)[mask]
-
-        best_f1 = 0.0
-        best_t = 0.5
-        for t in candidates:
-            preds = (probs_c > t).float()
-            tp = (preds * targs).sum().item()
-            fp = (preds * (1 - targs)).sum().item()
-            fn = ((1 - preds) * targs).sum().item()
-            prec = tp / (tp + fp + 1e-8)
-            rec = tp / (tp + fn + 1e-8)
-            f1 = 2 * prec * rec / (prec + rec + 1e-8)
-            if f1 > best_f1:
-                best_f1 = f1
-                best_t = t
-
-        best_thresholds.append(best_t)
-        print(f"  Class {c}: best threshold={best_t:.3f}, F1={best_f1:.3f}")
-
-    return torch.tensor(best_thresholds)
+        m = all_m.reshape(-1).bool()
+        tg = all_t[..., c].reshape(-1)[m]
+        pr = all_p[..., c].reshape(-1)[m]
+        bf1, bt = 0.0, 0.5
+        for t in cands:
+            pd_ = (pr > t).float()
+            tp = (pd_ * tg).sum().item()
+            fp = (pd_ * (1-tg)).sum().item()
+            fn = ((1-pd_) * tg).sum().item()
+            p = tp/(tp+fp+1e-8); r = tp/(tp+fn+1e-8)
+            f1 = 2*p*r/(p+r+1e-8)
+            if f1 > bf1: bf1, bt = f1, t
+        best.append(bt)
+        print(f"  class {c}: threshold={bt:.3f}  F1={bf1:.3f}")
+    return torch.tensor(best)
