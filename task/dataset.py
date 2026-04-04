@@ -64,7 +64,8 @@ def load_annotations(dataset_names: list[str]) -> pd.DataFrame:
 
     annotations = pd.concat(frames, ignore_index=True)
     for col in ["start_datetime", "end_datetime"]:
-        annotations[col] = pd.to_datetime(annotations[col], utc=True)
+        # Added format='mixed' to handle the inconsistent space vs 'T' datetime strings
+        annotations[col] = pd.to_datetime(annotations[col], format='mixed', utc=True)
     annotations["label_3class"] = annotations["annotation"].map(cfg.COLLAPSE_MAP)
     return annotations
 
