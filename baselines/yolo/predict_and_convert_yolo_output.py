@@ -16,7 +16,7 @@ def predict(ds, conf=0.1):
                                  name=predictions_folder.name,
                                  stream=True,
                                  save=False, show=False, save_conf=True, save_txt=True, conf=conf,
-                                 save_crop=False, agnostic_nms=True)
+                                 save_crop=False, agnostic_nms=False)
 
             for r in results_list:
                 pass
