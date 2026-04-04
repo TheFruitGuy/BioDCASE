@@ -33,26 +33,27 @@ import config as cfg
 def load_annotations(dataset_names: list[str]) -> pd.DataFrame:
     """
     Load and merge annotation CSVs for the given site-year datasets.
-    Expects one CSV per dataset at: {DATA_ROOT}/{dataset}/annotation.csv
+    Expects CSVs at: {DATA_ROOT}/annotations/{dataset}.csv
     """
     frames = []
+    annotations_dir = cfg.DATA_ROOT / "annotations"  # Added this subfolder
+
     for ds in dataset_names:
-        csv_path = cfg.DATA_ROOT / ds / "annotation.csv"
-        if not csv_path.exists():
-            for alt in ["annotations.csv", f"{ds}.csv"]:
-                alt_path = cfg.DATA_ROOT / ds / alt
-                if alt_path.exists():
-                    csv_path = alt_path
-                    break
+        # Check for the CSV using the dataset name (e.g., ballenyisland2015.csv)
+        csv_path = annotations_dir / f"{ds}.csv"
+
         if csv_path.exists():
             df = pd.read_csv(csv_path)
-            df["dataset"] = ds
+            # The preprocessing script expects 'dataset' column to exist,
+            # if it doesn't, we add it.
+            if 'dataset' not in df.columns:
+                df["dataset"] = ds
             frames.append(df)
         else:
-            print(f"Warning: no annotation file found for {ds}")
+            print(f"Warning: no annotation file found for {ds} at {csv_path}")
 
     if not frames:
-        raise FileNotFoundError(f"No annotation files found in {cfg.DATA_ROOT}")
+        raise FileNotFoundError(f"No annotation files found in {annotations_dir}")
 
     annotations = pd.concat(frames, ignore_index=True)
     for col in ["start_datetime", "end_datetime"]:
@@ -64,8 +65,14 @@ def load_annotations(dataset_names: list[str]) -> pd.DataFrame:
 def get_file_manifest(dataset_names: list[str]) -> pd.DataFrame:
     """Build a manifest of all WAV files with their durations."""
     records = []
+    audio_dir = cfg.DATA_ROOT / "audio"  # Added this subfolder
+
     for ds in dataset_names:
-        ds_dir = cfg.DATA_ROOT / ds
+        ds_dir = audio_dir / ds
+        if not ds_dir.exists():
+            print(f"Warning: Audio directory not found for {ds} at {ds_dir}")
+            continue
+
         for wf in sorted(ds_dir.glob("*.wav")):
             info = sf.info(str(wf))
             records.append({
