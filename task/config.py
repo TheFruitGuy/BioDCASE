@@ -22,7 +22,7 @@ SUBMISSION_PATH = Path("./submission.csv")       # inference output
 # ──────────────────────────────────────────────────────────────────────────────
 
 TRAIN_DATASETS = [
-    "ballenyisland2015",
+    "ballenyislands2015",
     "casey2014",
     "elephantisland2013",
     "elephantisland2014",
