@@ -33,27 +33,34 @@ import config as cfg
 def load_annotations(dataset_names: list[str]) -> pd.DataFrame:
     """
     Load and merge annotation CSVs for the given site-year datasets.
-    Expects CSVs at: {DATA_ROOT}/annotations/{dataset}.csv
+    Searches in both train/annotations/ and validation/annotations/.
     """
     frames = []
-    annotations_dir = cfg.DATA_ROOT / "annotations"  # Added this subfolder
+    # Look in both split directories
+    search_dirs = [
+        cfg.DATA_ROOT / "train" / "annotations",
+        cfg.DATA_ROOT / "validation" / "annotations"
+    ]
 
     for ds in dataset_names:
-        # Check for the CSV using the dataset name (e.g., ballenyisland2015.csv)
-        csv_path = annotations_dir / f"{ds}.csv"
+        found = False
+        for s_dir in search_dirs:
+            csv_path = s_dir / f"{ds}.csv"
 
-        if csv_path.exists():
-            df = pd.read_csv(csv_path)
-            # The preprocessing script expects 'dataset' column to exist,
-            # if it doesn't, we add it.
-            if 'dataset' not in df.columns:
-                df["dataset"] = ds
-            frames.append(df)
-        else:
-            print(f"Warning: no annotation file found for {ds} at {csv_path}")
+            if csv_path.exists():
+                df = pd.read_csv(csv_path)
+                # Ensure the dataset column exists
+                if 'dataset' not in df.columns:
+                    df["dataset"] = ds
+                frames.append(df)
+                found = True
+                break  # Stop searching once we find the file
+
+        if not found:
+            print(f"Warning: no annotation file found for {ds}")
 
     if not frames:
-        raise FileNotFoundError(f"No annotation files found in {annotations_dir}")
+        raise FileNotFoundError(f"No annotation files found in train/ or validation/ folders under {cfg.DATA_ROOT}")
 
     annotations = pd.concat(frames, ignore_index=True)
     for col in ["start_datetime", "end_datetime"]:
@@ -65,23 +72,33 @@ def load_annotations(dataset_names: list[str]) -> pd.DataFrame:
 def get_file_manifest(dataset_names: list[str]) -> pd.DataFrame:
     """Build a manifest of all WAV files with their durations."""
     records = []
-    audio_dir = cfg.DATA_ROOT / "audio"  # Added this subfolder
+    # Look in both split directories
+    search_dirs = [
+        cfg.DATA_ROOT / "train" / "audio",
+        cfg.DATA_ROOT / "validation" / "audio"
+    ]
 
     for ds in dataset_names:
-        ds_dir = audio_dir / ds
-        if not ds_dir.exists():
-            print(f"Warning: Audio directory not found for {ds} at {ds_dir}")
-            continue
+        found = False
+        for s_dir in search_dirs:
+            ds_dir = s_dir / ds
 
-        for wf in sorted(ds_dir.glob("*.wav")):
-            info = sf.info(str(wf))
-            records.append({
-                "dataset": ds,
-                "filename": wf.name,
-                "filepath": str(wf),
-                "duration_s": info.duration,
-                "sample_rate": info.samplerate,
-            })
+            if ds_dir.exists():
+                found = True
+                for wf in sorted(ds_dir.glob("*.wav")):
+                    info = sf.info(str(wf))
+                    records.append({
+                        "dataset": ds,
+                        "filename": wf.name,
+                        "filepath": str(wf),
+                        "duration_s": info.duration,
+                        "sample_rate": info.samplerate,
+                    })
+                break  # Stop searching once we find the audio directory
+
+        if not found:
+            print(f"Warning: Audio directory not found for {ds}")
+
     return pd.DataFrame(records)
 
 
