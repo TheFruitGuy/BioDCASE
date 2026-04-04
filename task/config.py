@@ -12,7 +12,7 @@ from pathlib import Path
 # Paths
 # ──────────────────────────────────────────────────────────────────────────────
 
-DATA_ROOT       = Path("2026_BioDCASE_development_set")           # site-year folders with .wav + annotation.csv
+DATA_ROOT       = Path("/home/matthias-nagl/BioDCASE/data/ATBFL/")           # site-year folders with .wav + annotation.csv
 OUTPUT_DIR      = Path("./runs")                # training checkpoints & logs
 SUBMISSION_PATH = Path("./submission.csv")       # inference output
 
