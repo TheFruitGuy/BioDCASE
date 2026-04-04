@@ -17,6 +17,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import config as cfg
 from model import WhaleConformer, WeightedBCEWithFocal
@@ -75,7 +76,11 @@ def _align_lengths(logits, targets, padding_mask, device):
 def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoch):
     model.train()
     total_loss, n = 0.0, 0
-    for i, (audio, targets, mask, _) in enumerate(loader):
+
+    # Wrap your loader in tqdm to create a sleek progress bar
+    pbar = tqdm(loader, desc=f"Epoch {epoch}/{cfg.EPOCHS}", leave=False)
+
+    for i, (audio, targets, mask, _) in enumerate(pbar):
         audio, targets, mask = audio.to(device), targets.to(device), mask.to(device)
         logits = model(audio)
         targets, mask = _align_lengths(logits, targets, mask, device)
@@ -89,8 +94,10 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
 
         total_loss += loss.item()
         n += 1
-        if i % 50 == 0:
-            print(f"  [Epoch {epoch}] batch {i}/{len(loader)}  loss={loss.item():.4f}")
+
+        # Update the progress bar text with the current loss
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
+
     scheduler.step()
     return total_loss / max(n, 1)
 
