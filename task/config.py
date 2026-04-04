@@ -107,7 +107,7 @@ FOCAL_ALPHA   = 0.25
 FOCAL_GAMMA   = 2.0
 FOCAL_WEIGHT  = 1.0        # weight of focal term relative to BCE
 
-NUM_WORKERS   = 4
+NUM_WORKERS   = 24
 SEED          = 42
 
 

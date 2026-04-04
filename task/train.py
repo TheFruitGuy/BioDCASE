@@ -17,6 +17,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
+from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 import config as cfg
@@ -73,29 +74,39 @@ def _align_lengths(logits, targets, padding_mask, device):
 # Train / validate
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoch):
+def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, scaler):
     model.train()
     total_loss, n = 0.0, 0
 
-    # Wrap your loader in tqdm to create a sleek progress bar
     pbar = tqdm(loader, desc=f"Epoch {epoch}/{cfg.EPOCHS}", leave=False)
 
     for i, (audio, targets, mask, _) in enumerate(pbar):
-        audio, targets, mask = audio.to(device), targets.to(device), mask.to(device)
-        logits = model(audio)
-        targets, mask = _align_lengths(logits, targets, mask, device)
-        loss = criterion(logits, targets, mask)
+        # 1. non_blocking=True speeds up the CPU -> GPU transfer
+        audio = audio.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
 
         optimizer.zero_grad()
-        loss.backward()
+
+        # 2. Wrap the forward pass in autocast for 16-bit speed
+        with autocast():
+            logits = model(audio)
+            targets, mask = _align_lengths(logits, targets, mask, device)
+            loss = criterion(logits, targets, mask)
+
+        # 3. Use the scaler for the backward pass
+        scaler.scale(loss).backward()
+
         if cfg.GRAD_CLIP > 0:
+            # Unscale before clipping gradients
+            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-        optimizer.step()
+
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item()
         n += 1
-
-        # Update the progress bar text with the current loss
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     scheduler.step()
@@ -180,12 +191,15 @@ def main():
     scheduler = SequentialLR(optimizer, [warmup, cosine],
                              milestones=[cfg.WARMUP_EPOCHS])
 
+    # Initialize the AMP GradScaler
+    scaler = GradScaler()
+
     # --- training loop ---
     best_f1 = 0.0
     thresholds = torch.tensor(cfg.DEFAULT_THRESHOLDS, device=device)
 
     for epoch in range(1, cfg.EPOCHS + 1):
-        print(f"\n{'='*60}\nEpoch {epoch}/{cfg.EPOCHS}\n{'='*60}")
+        print(f"\n{'=' * 60}\nEpoch {epoch}/{cfg.EPOCHS}\n{'=' * 60}")
 
         train_ds.resample_negatives()
         train_loader = DataLoader(
@@ -193,8 +207,9 @@ def main():
             num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
         )
 
+        # Pass the scaler here!
         train_loss = train_one_epoch(
-            model, train_loader, criterion, optimizer, scheduler, device, epoch,
+            model, train_loader, criterion, optimizer, scheduler, device, epoch, scaler
         )
         val = validate(model, val_loader, criterion, device, thresholds)
 
