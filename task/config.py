@@ -96,9 +96,9 @@ DROPOUT     = 0.1
 
 EPOCHS        = 60
 BATCH_SIZE    = 16
-LR            = 1e-4
+LR            = 5e-4
 WEIGHT_DECAY  = 0.001
-WARMUP_EPOCHS = 5
+WARMUP_EPOCHS = 3
 GRAD_CLIP     = 1.0
 
 # Loss — CRITICAL FIXES from previous version:
