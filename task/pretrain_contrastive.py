@@ -45,7 +45,8 @@ PRETRAIN_DATA_DIR   = Path("./data_unlabeled/kerguelen2020")
 PRETRAIN_OUTPUT_DIR = Path("./runs/pretrain")
 
 PRETRAIN_EPOCHS     = 30
-PRETRAIN_BATCH_SIZE = 64       # larger batches = more negatives = better contrastive learning
+PRETRAIN_BATCH_SIZE = 16       # larger batches = more negatives = better contrastive learning
+ACCUMULATION_STEPS  = 4         # effective batch = 16 × 4 = 64
 PRETRAIN_LR         = 1e-3
 PRETRAIN_WARMUP     = 3
 SEGMENT_LENGTH_S    = 30.0     # segment length in seconds
@@ -255,32 +256,33 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch):
     n = 0
 
     pbar = tqdm(loader, desc=f"Pretrain {epoch}/{PRETRAIN_EPOCHS}", leave=False)
-    for view1, view2 in pbar:
+    optimizer.zero_grad()
+
+    for step, (view1, view2) in enumerate(pbar):
         view1 = view1.to(device, non_blocking=True)
         view2 = view2.to(device, non_blocking=True)
-
-        optimizer.zero_grad()
 
         with autocast("cuda", dtype=torch.bfloat16):
             z1 = model(view1)
             z2 = model(view2)
-            loss = criterion(z1, z2)
+            loss = criterion(z1, z2) / ACCUMULATION_STEPS
 
-        # NaN guard
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"  *** NaN detected, skipping batch ***")
-            optimizer.zero_grad()
             continue
 
         scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optimizer)
-        scaler.update()
 
-        total_loss += loss.item()
+        if (step + 1) % ACCUMULATION_STEPS == 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        total_loss += loss.item() * ACCUMULATION_STEPS
         n += 1
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
+        pbar.set_postfix(loss=f"{loss.item() * ACCUMULATION_STEPS:.4f}")
 
     return total_loss / max(n, 1)
 
