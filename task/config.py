@@ -96,7 +96,7 @@ DROPOUT     = 0.1
 
 EPOCHS        = 60
 BATCH_SIZE    = 16
-LR            = 5e-4
+LR            = 3e-4
 WEIGHT_DECAY  = 0.001
 WARMUP_EPOCHS = 3
 GRAD_CLIP     = 1.0
@@ -106,7 +106,7 @@ GRAD_CLIP     = 1.0
 # 1) pos_weight: upweights the positive (call-present) term in BCE.
 #    With ~5% positive frames, pos_weight ≈ 19 balances the classes.
 #    Set to None to auto-compute from actual training data.
-POS_WEIGHT    = None        # auto-computed from training data
+POS_WEIGHT    = 15        
 
 # 2) focal_alpha > 0.5 upweights positives (minority class).
 #    NOTE: alpha=0.25 DOWNWEIGHTS positives — was backwards before!

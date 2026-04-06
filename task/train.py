@@ -159,6 +159,15 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
 
         total_loss += loss.item()
         n += 1
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  *** NaN/Inf detected at batch {i}, restoring best checkpoint ***")
+            best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device)
+            model.load_state_dict(best_ckpt["model_state_dict"])
+            optimizer = AdamW(model.parameters(), lr=cfg.LR * 0.5,
+                              weight_decay=cfg.WEIGHT_DECAY)
+            break
+
         pbar.set_postfix(loss=f"{loss.item():.4f}")
 
     scheduler.step()
