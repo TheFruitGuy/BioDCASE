@@ -106,13 +106,13 @@ GRAD_CLIP     = 1.0
 # 1) pos_weight: upweights the positive (call-present) term in BCE.
 #    With ~5% positive frames, pos_weight ≈ 19 balances the classes.
 #    Set to None to auto-compute from actual training data.
-POS_WEIGHT    = 15        
+POS_WEIGHT    = 5
 
 # 2) focal_alpha > 0.5 upweights positives (minority class).
 #    NOTE: alpha=0.25 DOWNWEIGHTS positives — was backwards before!
 FOCAL_ALPHA   = 0.75        # was 0.25 — that killed positive predictions
 FOCAL_GAMMA   = 2.0
-FOCAL_WEIGHT  = 1.0
+FOCAL_WEIGHT  = 0
 
 NUM_WORKERS   = 24
 SEED          = 42
@@ -122,8 +122,8 @@ SEED          = 42
 # Postprocessing
 # ──────────────────────────────────────────────────────────────────────────────
 
-SMOOTH_KERNEL_MS = 500
-MERGE_GAP_S      = 0.5
+SMOOTH_KERNEL_MS = 1000
+MERGE_GAP_S      = 2.0
 POST_MIN_DUR_S   = 0.5
 POST_MAX_DUR_S   = 30.0
 

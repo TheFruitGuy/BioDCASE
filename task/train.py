@@ -143,18 +143,16 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
 
         optimizer.zero_grad()
 
-        with autocast("cuda", dtype=torch.bfloat16):
-            logits = model(audio)
-            targets, mask = _align_lengths(logits, targets, mask, device)
-            loss = criterion(logits, targets, mask)
+        logits = model(audio)
+        targets, mask = _align_lengths(logits, targets, mask, device)
+        loss = criterion(logits, targets, mask)
 
-        scaler.scale(loss).backward()
+        loss.backward()
 
         if cfg.GRAD_CLIP > 0:
-            scaler.unscale_(optimizer)
             nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
 
-        scaler.step(optimizer)
+        optimizer.step()
         scaler.update()
 
         total_loss += loss.item()
@@ -176,45 +174,67 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
 
 @torch.no_grad()
 def validate(model, loader, criterion, device, thresholds, epoch=0):
+    from postprocess import postprocess_predictions, compute_metrics, Detection
+    from dataset import load_annotations, _parse_file_start_dt
+
     model.eval()
     total_loss, n = 0.0, 0
-    all_probs, all_targ, all_mask = [], [], []
+    all_probs = {}
 
-    for audio, targets, mask, _ in loader:
+    # 1. Gather frame-level predictions
+    for audio, targets, mask, metas in loader:
         audio, targets, mask = audio.to(device), targets.to(device), mask.to(device)
         logits = model(audio)
-        targets, mask = _align_lengths(logits, targets, mask, device)
-        total_loss += criterion(logits, targets, mask).item()
+        targets_aligned, mask_aligned = _align_lengths(logits, targets, mask, device)
+        total_loss += criterion(logits, targets_aligned, mask_aligned).item()
         n += 1
-        all_probs.append(torch.sigmoid(logits).cpu())
-        all_targ.append(targets.cpu())
-        all_mask.append(mask.cpu())
 
-    all_probs = torch.cat(all_probs)
-    all_targ = torch.cat(all_targ)
-    all_mask = torch.cat(all_mask)
+        probs = torch.sigmoid(logits).cpu().numpy()
+        for j, meta in enumerate(metas):
+            key = (meta["dataset"], meta["filename"], meta["start_sample"])
+            n_samp = meta["end_sample"] - meta["start_sample"]
+            n_frames = n_samp // model.hop_length
+            all_probs[key] = probs[j, :n_frames, :]
 
-    # Diagnostic: print prediction statistics
-    _print_prediction_stats(all_probs, all_targ, all_mask, epoch)
+    # 2. Convert raw probabilities to continuous event detections
+    thresh_np = thresholds.cpu().numpy()
+    pred_events = postprocess_predictions(all_probs, thresh_np)
 
-    class_f1s = []
-    for c in range(cfg.n_classes()):
-        m = all_mask.view(-1).bool()
-        preds = (all_probs[..., c].reshape(-1)[m] > thresholds[c].cpu()).float()
-        targs = all_targ[..., c].reshape(-1)[m]
-        tp = (preds * targs).sum().item()
-        fp = (preds * (1 - targs)).sum().item()
-        fn = ((1 - preds) * targs).sum().item()
-        prec = tp / (tp + fp + 1e-8)
-        rec = tp / (tp + fn + 1e-8)
-        f1 = 2 * prec * rec / (prec + rec + 1e-8)
-        class_f1s.append(f1)
-        print(f"  class {c} ({cfg.class_names()[c]}): "
-              f"TP={int(tp)} FP={int(fp)} FN={int(fn)} "
-              f"P={prec:.3f} R={rec:.3f} F1={f1:.3f}")
+    # 3. Load Ground Truth Events for the Validation Set
+    val_annots = load_annotations(cfg.VAL_DATASETS)
+    gt_events = []
+    class_map = cfg.class_to_idx()
+    label_col = "label_3class" if cfg.USE_3CLASS else "annotation"
 
-    return {"loss": total_loss / max(n, 1), "class_f1": class_f1s,
-            "mean_f1": float(np.mean(class_f1s))}
+    for _, row in val_annots.iterrows():
+        cls_name = row[label_col]
+        if cls_name not in class_map:
+            continue
+
+        file_start_dt = _parse_file_start_dt(row["filename"])
+        if file_start_dt is None:
+            continue
+
+        start_s = (row["start_datetime"] - file_start_dt).total_seconds()
+        end_s = (row["end_datetime"] - file_start_dt).total_seconds()
+
+        gt_events.append(Detection(
+            dataset=row["dataset"], filename=row["filename"],
+            label=cls_name, start_s=start_s, end_s=end_s
+        ))
+
+    # 4. Compute 1D IoU Metrics
+    metrics = compute_metrics(pred_events, gt_events, iou_threshold=0.3)
+    mean_f1 = metrics.get("overall", {}).get("f1", 0.0)
+
+    print(f"\n  Event-level Validation (1D IoU):")
+    for cls_name, m in metrics.items():
+        if cls_name == "overall":
+            continue
+        print(f"  {cls_name.upper()}: TP={m['tp']} FP={m['fp']} FN={m['fn']} | "
+              f"Prec={m['precision']:.3f} Rec={m['recall']:.3f} F1={m['f1']:.3f}")
+
+    return {"loss": total_loss / max(n, 1), "mean_f1": mean_f1}
 
 
 # ---------------------------------------------------------------------------
