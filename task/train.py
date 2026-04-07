@@ -143,17 +143,19 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
 
         optimizer.zero_grad()
 
+        # Run in standard float32 for stability (no autocast)
         logits = model(audio)
-        targets, mask = _align_lengths(logits, targets, mask, device)
-        loss = criterion(logits, targets, mask)
+        targets_aligned, mask_aligned = _align_lengths(logits, targets, mask, device)
+        loss = criterion(logits, targets_aligned, mask_aligned)
 
+        # Standard backward pass (no scaler)
         loss.backward()
 
         if cfg.GRAD_CLIP > 0:
             nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
 
+        # Standard optimizer step (no scaler)
         optimizer.step()
-        scaler.update()
 
         total_loss += loss.item()
         n += 1
