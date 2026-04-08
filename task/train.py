@@ -191,11 +191,13 @@ def validate(model, loader, criterion, device, thresholds, epoch=0):
         total_loss += criterion(logits, targets_aligned, mask_aligned).item()
         n += 1
 
+        hop_length = model.module.hop_length if isinstance(model, nn.DataParallel) else model.hop_length
+
         probs = torch.sigmoid(logits).cpu().numpy()
         for j, meta in enumerate(metas):
             key = (meta["dataset"], meta["filename"], meta["start_sample"])
             n_samp = meta["end_sample"] - meta["start_sample"]
-            n_frames = n_samp // model.hop_length
+            n_frames = n_samp // hop_length
             all_probs[key] = probs[j, :n_frames, :]
 
     # 2. Convert raw probabilities to continuous event detections
