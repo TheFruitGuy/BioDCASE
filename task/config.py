@@ -106,7 +106,7 @@ GRAD_CLIP     = 1.0
 # 1) pos_weight: upweights the positive (call-present) term in BCE.
 #    With ~5% positive frames, pos_weight ≈ 19 balances the classes.
 #    Set to None to auto-compute from actual training data.
-POS_WEIGHT    = 5
+POS_WEIGHT    = 15
 
 # 2) focal_alpha > 0.5 upweights positives (minority class).
 #    NOTE: alpha=0.25 DOWNWEIGHTS positives — was backwards before!
@@ -128,7 +128,7 @@ POST_MIN_DUR_S   = 0.5
 POST_MAX_DUR_S   = 30.0
 
 # Lower default — the model's probabilities are low early in training
-DEFAULT_THRESHOLDS = [0.3, 0.3, 0.3]
+DEFAULT_THRESHOLDS = [0.1, 0.1, 0.1]
 
 
 # ──────────────────────────────────────────────────────────────────────────────

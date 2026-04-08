@@ -70,6 +70,10 @@ def main():
         ckpt["encoder_state_dict"], strict=False
     )
     print(f"Loaded pretrained encoder from: {args.pretrained}")
+    if torch.cuda.device_count() > 1:
+        print(f"Training across {torch.cuda.device_count()} GPUs!")
+        model = nn.DataParallel(model)
+
     print(f"  Pretrain loss was: {ckpt.get('loss', '?')}")
     print(f"  Missing keys (expected — classifier head): {missing}")
     if unexpected:
@@ -124,17 +128,17 @@ def main():
                 mask = mask.to(device, non_blocking=True)
 
                 head_optimizer.zero_grad()
-                with autocast("cuda", dtype=torch.bfloat16):
-                    logits = model(audio)
-                    targets, mask = _align_lengths(logits, targets, mask, device)
-                    loss = criterion(logits, targets, mask)
+                logits = model(audio)
+                targets_aligned, mask_aligned = _align_lengths(logits, targets, mask, device)
+                loss = criterion(logits, targets_aligned, mask_aligned)
 
                 if torch.isnan(loss):
                     continue
 
-                scaler.scale(loss).backward()
-                scaler.step(head_optimizer)
-                scaler.update()
+                loss.backward()
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+                head_optimizer.step()
+
                 total_loss += loss.item()
                 n += 1
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -182,20 +186,17 @@ def main():
             mask = mask.to(device, non_blocking=True)
 
             optimizer.zero_grad()
-            with autocast("cuda", dtype=torch.bfloat16):
-                logits = model(audio)
-                targets, mask = _align_lengths(logits, targets, mask, device)
-                loss = criterion(logits, targets, mask)
+            logits = model(audio)
+            targets_aligned, mask_aligned = _align_lengths(logits, targets, mask, device)
+            loss = criterion(logits, targets_aligned, mask_aligned)
 
             if torch.isnan(loss):
-                print(f"  *** NaN at batch, skipping ***")
                 continue
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            # Standard backward and step (Removed scaler)
+            loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()  # (or head_optimizer.step() in Phase 1)
 
             total_loss += loss.item()
             n += 1
@@ -207,7 +208,8 @@ def main():
         print(f"\nTrain loss: {total_loss/max(n,1):.4f}   Val loss: {val['loss']:.4f}")
         print(f"  Mean F1: {val['mean_f1']:.3f}")
 
-        model_state = model.state_dict()
+        model_state = (model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict())
+
         ckpt = {"epoch": epoch, "model_state_dict": model_state,
                 "best_f1": best_f1, "thresholds": thresholds.cpu(),
                 "pretrained_from": args.pretrained}
@@ -222,13 +224,17 @@ def main():
 
     # --- threshold tuning ---
     print(f"\n{'='*60}\nTuning thresholds\n{'='*60}")
-    model.load_state_dict(
-        torch.load(run_dir / "best_model.pt", map_location=device)["model_state_dict"]
-    )
+    best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device)
+    if isinstance(model, nn.DataParallel):
+        model.module.load_state_dict(best_ckpt["model_state_dict"])
+    else:
+        model.load_state_dict(best_ckpt["model_state_dict"])
     best_thresholds = tune_thresholds(model, val_loader, device, cfg.n_classes())
     print(f"Tuned thresholds: {best_thresholds.tolist()}")
 
-    torch.save({"model_state_dict": model.state_dict(),
+    final_state = (model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict())
+
+    torch.save({"model_state_dict": final_state,
                 "thresholds": best_thresholds,
                 "pretrained_from": args.pretrained},
                run_dir / "final_model.pt")
