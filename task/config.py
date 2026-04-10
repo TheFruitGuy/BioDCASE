@@ -95,7 +95,7 @@ DROPOUT     = 0.1
 # ──────────────────────────────────────────────────────────────────────────────
 
 EPOCHS        = 60
-BATCH_SIZE    = 16
+BATCH_SIZE    = 96
 LR            = 3e-4
 WEIGHT_DECAY  = 0.001
 WARMUP_EPOCHS = 3

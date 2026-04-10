@@ -29,8 +29,7 @@ from model import WhaleConformer, WeightedBCEWithFocal
 from dataset import build_dataloaders, load_annotations, collate_fn
 from postprocess import tune_thresholds
 from train import (
-    set_seed, compute_pos_weight, _align_lengths,
-    _print_prediction_stats, validate,
+    set_seed, compute_pos_weight, _align_lengths, validate,
 )
 
 
