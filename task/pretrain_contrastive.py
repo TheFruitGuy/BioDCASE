@@ -45,7 +45,7 @@ PRETRAIN_DATA_DIR   = Path("./data_unlabeled")
 PRETRAIN_OUTPUT_DIR = Path("./runs/pretrain")
 
 PRETRAIN_EPOCHS     = 30
-PRETRAIN_BATCH_SIZE = 16       # larger batches = more negatives = better contrastive learning
+PRETRAIN_BATCH_SIZE = 96       # larger batches = more negatives = better contrastive learning
 ACCUMULATION_STEPS  = 4         # effective batch = 16 × 4 = 64
 PRETRAIN_LR         = 1e-3
 PRETRAIN_WARMUP     = 3
@@ -372,6 +372,10 @@ def main():
 
     model = ContrastiveModel(encoder, proj_dim=PROJ_DIM).to(device)
 
+    if torch.cuda.device_count() > 1:
+        print(f"Pretraining across {torch.cuda.device_count()} GPUs!")
+        model = nn.DataParallel(model)
+
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params:,}")
 
@@ -404,17 +408,18 @@ def main():
         # Save best encoder weights (without projection head)
         if loss < best_loss:
             best_loss = loss
-            # Save just the encoder state dict (not the projection head)
+
+            full_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+
             encoder_state = {}
-            for k, v in model.state_dict().items():
+            for k, v in full_state.items():
                 if k.startswith("encoder."):
-                    # Strip the "encoder." prefix so it loads directly into WhaleConformer
                     encoder_state[k[len("encoder."):]] = v
 
             torch.save({
                 "epoch": epoch,
                 "encoder_state_dict": encoder_state,
-                "full_model_state_dict": model.state_dict(),
+                "full_model_state_dict": full_state,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "loss": loss,
                 "alignment": alignment,
@@ -422,11 +427,13 @@ def main():
             }, run_dir / "best_pretrained.pt")
             print(f"  *** New best loss: {best_loss:.4f} — saved ***")
 
-        # Also save latest
+            # Also save latest
+        full_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
         encoder_state = {}
-        for k, v in model.state_dict().items():
+        for k, v in full_state.items():
             if k.startswith("encoder."):
                 encoder_state[k[len("encoder."):]] = v
+
         torch.save({
             "epoch": epoch,
             "encoder_state_dict": encoder_state,
