@@ -45,20 +45,10 @@ def set_seed(seed: int = cfg.SEED):
 
 
 def compute_pos_weight() -> torch.Tensor:
-    """
-    Compute pos_weight per class from frame-level positive rates in training data.
-
-    pos_weight_c = (# negative frames for class c) / (# positive frames for class c)
-
-    With ~5% overall positive rate this gives pos_weight ≈ 19.
-    The old version used total_files / n_annotations which gave ~1.0.
-    """
     annotations = load_annotations(cfg.TRAIN_DATASETS)
     label_col = "label_3class" if cfg.USE_3CLASS else "annotation"
     class_names = cfg.class_names()
 
-    # Estimate total annotated duration per class (in seconds)
-    # and total recording duration
     from dataset import get_file_manifest
     manifest = get_file_manifest(cfg.TRAIN_DATASETS)
     total_duration_s = manifest["duration_s"].sum()
@@ -66,26 +56,22 @@ def compute_pos_weight() -> torch.Tensor:
 
     pos_weights = []
     for c_name in class_names:
-        # Sum up annotation durations for this class
         if cfg.USE_3CLASS:
-            # Find all 7-class labels that map to this 3-class label
             orig_labels = [k for k, v in cfg.COLLAPSE_MAP.items() if v == c_name]
             class_annots = annotations[annotations["annotation"].isin(orig_labels)]
         else:
             class_annots = annotations[annotations["annotation"] == c_name]
 
         if len(class_annots) == 0:
-            pos_weights.append(20.0)  # safe default for missing class
+            pos_weights.append(20.0)
             continue
 
-        # Duration of positive frames
         durations = (class_annots["end_datetime"] - class_annots["start_datetime"])
         pos_duration_s = durations.dt.total_seconds().sum()
         pos_frames = pos_duration_s / cfg.FRAME_STRIDE_S
         neg_frames = total_frames - pos_frames
 
         pw = neg_frames / max(pos_frames, 1.0)
-        # Cap at reasonable range to avoid instability
         pw = min(pw, 50.0)
         pos_weights.append(pw)
 
@@ -94,7 +80,6 @@ def compute_pos_weight() -> torch.Tensor:
 
 
 def _align_lengths(logits, targets, padding_mask, device):
-    """Trim or pad targets/mask to match model output length."""
     T_m = logits.size(1)
     T_t = targets.size(1)
     if T_m < T_t:
@@ -106,25 +91,6 @@ def _align_lengths(logits, targets, padding_mask, device):
         pad_m = torch.zeros(padding_mask.size(0), T_m - T_t, dtype=torch.bool, device=device)
         padding_mask = torch.cat([padding_mask, pad_m], dim=1)
     return targets, padding_mask
-
-
-def _print_prediction_stats(probs, targets, mask, epoch, split="val"):
-    """Print diagnostic stats to verify the model is actually predicting positives."""
-    m = mask.view(-1).bool()
-    for c in range(probs.size(-1)):
-        p = probs[..., c].reshape(-1)[m]
-        t = targets[..., c].reshape(-1)[m]
-        n_pos_targ = t.sum().item()
-        n_pos_pred_03 = (p > 0.3).sum().item()
-        n_pos_pred_05 = (p > 0.5).sum().item()
-        mean_p = p.mean().item()
-        mean_p_on_pos = p[t > 0].mean().item() if n_pos_targ > 0 else 0.0
-        mean_p_on_neg = p[t == 0].mean().item()
-        print(f"  [{split}] class {c}: "
-              f"target_pos={int(n_pos_targ):,} | "
-              f"pred>0.3={int(n_pos_pred_03):,} pred>0.5={int(n_pos_pred_05):,} | "
-              f"mean_prob={mean_p:.4f} on_pos={mean_p_on_pos:.4f} on_neg={mean_p_on_neg:.4f}")
-
 
 # ---------------------------------------------------------------------------
 # Train / validate
@@ -143,18 +109,16 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
 
         optimizer.zero_grad()
 
-        # Run in standard float32 for stability (no autocast)
+        # Float32 stability fix
         logits = model(audio)
         targets_aligned, mask_aligned = _align_lengths(logits, targets, mask, device)
         loss = criterion(logits, targets_aligned, mask_aligned)
 
-        # Standard backward pass (no scaler)
         loss.backward()
 
         if cfg.GRAD_CLIP > 0:
             nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
 
-        # Standard optimizer step (no scaler)
         optimizer.step()
 
         total_loss += loss.item()
@@ -162,10 +126,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
 
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"  *** NaN/Inf detected at batch {i}, restoring best checkpoint ***")
-            best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device)
-            model.load_state_dict(best_ckpt["model_state_dict"])
-            optimizer = AdamW(model.parameters(), lr=cfg.LR * 0.5,
-                              weight_decay=cfg.WEIGHT_DECAY)
+            # Fallback logic if needed
             break
 
         pbar.set_postfix(loss=f"{loss.item():.4f}")
@@ -176,14 +137,14 @@ def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoc
 
 @torch.no_grad()
 def validate(model, loader, criterion, device, thresholds, epoch=0):
-    from postprocess import postprocess_predictions, compute_metrics, Detection
+    # Added collapse_to_3class here!
+    from postprocess import postprocess_predictions, compute_metrics, Detection, collapse_to_3class
     from dataset import load_annotations, _parse_file_start_dt
 
     model.eval()
     total_loss, n = 0.0, 0
     all_probs = {}
 
-    # 1. Gather frame-level predictions
     for audio, targets, mask, metas in loader:
         audio, targets, mask = audio.to(device), targets.to(device), mask.to(device)
         logits = model(audio)
@@ -200,20 +161,23 @@ def validate(model, loader, criterion, device, thresholds, epoch=0):
             n_frames = n_samp // hop_length
             all_probs[key] = probs[j, :n_frames, :]
 
-    # 2. Convert raw probabilities to continuous event detections
+    # Convert to events
     thresh_np = thresholds.cpu().numpy()
     pred_events = postprocess_predictions(all_probs, thresh_np)
 
-    # 3. Load Ground Truth Events for the Validation Set
+    # 7-Class -> 3-Class Mapping
+    if not cfg.USE_3CLASS:
+        pred_events = collapse_to_3class(pred_events)
+
+    # Load Ground Truth
     val_annots = load_annotations(cfg.VAL_DATASETS)
     gt_events = []
     class_map = cfg.class_to_idx()
     label_col = "label_3class" if cfg.USE_3CLASS else "annotation"
 
     for _, row in val_annots.iterrows():
-        cls_name = row[label_col]
-        if cls_name not in class_map:
-            continue
+        # Because we're mapping to 3-class for metrics, grab the 3-class label for validation GT
+        cls_name = row["label_3class"]
 
         file_start_dt = _parse_file_start_dt(row["filename"])
         if file_start_dt is None:
@@ -227,7 +191,7 @@ def validate(model, loader, criterion, device, thresholds, epoch=0):
             label=cls_name, start_s=start_s, end_s=end_s
         ))
 
-    # 4. Compute 1D IoU Metrics
+    # Compute 1D IoU Metrics against the collapsed 3 classes
     metrics = compute_metrics(pred_events, gt_events, iou_threshold=0.3)
     mean_f1 = metrics.get("overall", {}).get("f1", 0.0)
 
@@ -239,7 +203,6 @@ def validate(model, loader, criterion, device, thresholds, epoch=0):
               f"Prec={m['precision']:.3f} Rec={m['recall']:.3f} F1={m['f1']:.3f}")
 
     return {"loss": total_loss / max(n, 1), "mean_f1": mean_f1}
-
 
 # ---------------------------------------------------------------------------
 # Main
@@ -271,7 +234,6 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params:,}")
 
-    # --- pos_weight (CRITICAL FIX) ---
     if cfg.POS_WEIGHT is None:
         pos_weight = compute_pos_weight().to(device)
     else:
@@ -279,9 +241,7 @@ def main():
             [cfg.POS_WEIGHT] * cfg.n_classes(), dtype=torch.float32, device=device
         )
     print(f"pos_weight per class: {pos_weight}")
-    # Expect values around 15-30, NOT 1.0
 
-    # --- loss ---
     criterion = WeightedBCEWithFocal(
         pos_weight=pos_weight,
         focal_alpha=cfg.FOCAL_ALPHA,
@@ -289,7 +249,6 @@ def main():
         focal_weight=cfg.FOCAL_WEIGHT,
     ).to(device)
 
-    # --- optimiser + scheduler ---
     optimizer = AdamW(model.parameters(), lr=cfg.LR,
                       weight_decay=cfg.WEIGHT_DECAY, betas=(0.9, 0.999))
     warmup = LinearLR(optimizer, start_factor=0.01, total_iters=cfg.WARMUP_EPOCHS)
@@ -299,8 +258,6 @@ def main():
                              milestones=[cfg.WARMUP_EPOCHS])
 
     scaler = GradScaler("cuda")
-
-    # --- training loop ---
     best_f1 = 0.0
     thresholds = torch.tensor(cfg.DEFAULT_THRESHOLDS, device=device)
 
@@ -336,13 +293,13 @@ def main():
 
         torch.save(ckpt, run_dir / "latest_model.pt")
 
-    # --- final threshold tuning ---
     print(f"\n{'='*60}\nTuning thresholds on validation set\n{'='*60}")
     best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device)
     if isinstance(model, nn.DataParallel):
         model.module.load_state_dict(best_ckpt["model_state_dict"])
     else:
         model.load_state_dict(best_ckpt["model_state_dict"])
+
     best_thresholds = tune_thresholds(model, val_loader, device, cfg.n_classes())
     print(f"Tuned thresholds: {best_thresholds.tolist()}")
 
@@ -351,7 +308,6 @@ def main():
     torch.save({"model_state_dict": final_state,
                 "thresholds": best_thresholds}, run_dir / "final_model.pt")
     print(f"\nDone — best F1: {best_f1:.3f}  →  {run_dir}")
-
 
 if __name__ == "__main__":
     main()

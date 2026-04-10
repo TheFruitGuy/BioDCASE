@@ -80,6 +80,26 @@ def threshold_to_detections(
 # Merging & filtering
 # ---------------------------------------------------------------------------
 
+def collapse_to_3class(detections: list[Detection]) -> list[Detection]:
+    """Map 7 fine-grained predictions back to the 3 challenge evaluation classes."""
+    collapsed = []
+    for d in detections:
+        # Map class down if a 7-class label, otherwise keep as is
+        new_label = cfg.COLLAPSE_MAP.get(d.label, d.label)
+        collapsed.append(Detection(
+            dataset=d.dataset,
+            filename=d.filename,
+            label=new_label,
+            start_s=d.start_s,
+            end_s=d.end_s,
+            confidence=d.confidence
+        ))
+
+    # Run merge_detections again!
+    # If a 'bma' predicted right next to a 'bmb' they will now merge.
+    return merge_detections(collapsed)
+
+
 def merge_detections(detections: list[Detection]) -> list[Detection]:
     """Merge nearby same-class detections, filter by duration."""
     groups: dict[tuple, list[Detection]] = {}

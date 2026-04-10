@@ -62,7 +62,7 @@ COLLAPSE_MAP = {
     "bpd": "bp", "bp20": "bp", "bp20plus": "bp",
 }
 
-USE_3CLASS = True
+USE_3CLASS = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -128,7 +128,7 @@ POST_MIN_DUR_S   = 0.5
 POST_MAX_DUR_S   = 30.0
 
 # Lower default — the model's probabilities are low early in training
-DEFAULT_THRESHOLDS = [0.1, 0.1, 0.1]
+DEFAULT_THRESHOLDS = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
 
 
 # ──────────────────────────────────────────────────────────────────────────────

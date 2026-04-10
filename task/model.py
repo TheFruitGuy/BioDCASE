@@ -17,7 +17,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 # ---------------------------------------------------------------------------
 # Building blocks
 # ---------------------------------------------------------------------------
@@ -32,11 +31,9 @@ class GLU(nn.Module):
         a, b = x.chunk(2, dim=self.dim)
         return a * torch.sigmoid(b)
 
-
 class Swish(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x * torch.sigmoid(x)
-
 
 class PositionalEncoding(nn.Module):
     """Sinusoidal positional encoding (added, not concatenated)."""
@@ -53,10 +50,8 @@ class PositionalEncoding(nn.Module):
         self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, D)
         x = x + self.pe[:, : x.size(1)]
         return self.dropout(x)
-
 
 class RelativeMultiHeadAttention(nn.Module):
     """Multi-head self-attention with relative positional encoding."""
@@ -87,28 +82,23 @@ class RelativeMultiHeadAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(B, T, self.d_model)
         return self.w_out(out)
 
-
 class ConvolutionModule(nn.Module):
     """Conformer convolution module: pointwise → GLU → depthwise → BN → Swish → pointwise."""
     def __init__(self, d_model: int, kernel_size: int = 31, dropout: float = 0.1):
         super().__init__()
         self.layer_norm = nn.LayerNorm(d_model)
-        # Pointwise expansion (×2 for GLU)
         self.pointwise1 = nn.Conv1d(d_model, 2 * d_model, kernel_size=1)
         self.glu = GLU(dim=1)
-        # Depthwise conv
         self.depthwise = nn.Conv1d(
             d_model, d_model, kernel_size=kernel_size,
             padding=kernel_size // 2, groups=d_model
         )
         self.batch_norm = nn.BatchNorm1d(d_model)
         self.activation = Swish()
-        # Pointwise projection
         self.pointwise2 = nn.Conv1d(d_model, d_model, kernel_size=1)
         self.dropout = nn.Dropout(p=dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, T, D)
         x = self.layer_norm(x)
         x = x.transpose(1, 2)  # (B, D, T)
         x = self.pointwise1(x)
@@ -119,7 +109,6 @@ class ConvolutionModule(nn.Module):
         x = self.pointwise2(x)
         x = self.dropout(x)
         return x.transpose(1, 2)  # (B, T, D)
-
 
 class FeedForwardModule(nn.Module):
     """Conformer feed-forward module: LN → Linear → Swish → Dropout → Linear → Dropout."""
@@ -140,23 +129,10 @@ class FeedForwardModule(nn.Module):
         x = self.linear2(x)
         return self.dropout2(x)
 
-
 class ConformerBlock(nn.Module):
-    """
-    Single Conformer block (Gulati et al., 2020):
-        x = x + 0.5 * FFN(x)
-        x = x + MHSA(x)
-        x = x + Conv(x)
-        x = x + 0.5 * FFN(x)
-        x = LayerNorm(x)
-    """
     def __init__(
-        self,
-        d_model: int = 256,
-        n_heads: int = 4,
-        d_ff: int = 1024,
-        conv_kernel_size: int = 31,
-        dropout: float = 0.1,
+        self, d_model: int = 256, n_heads: int = 4, d_ff: int = 1024,
+        conv_kernel_size: int = 31, dropout: float = 0.1,
     ):
         super().__init__()
         self.ff1 = FeedForwardModule(d_model, d_ff, dropout)
@@ -176,37 +152,61 @@ class ConformerBlock(nn.Module):
         x = x + 0.5 * self.ff2(x)
         return self.final_norm(x)
 
+# ---------------------------------------------------------------------------
+# Multi-Scale Head
+# ---------------------------------------------------------------------------
+
+class MultiScaleClassifier(nn.Module):
+    """
+    Parallel classification heads tailored to 7 whale call durations.
+    Maintains sequence length but smooths temporal features locally.
+    Assumes class order: [bma, bmb, bmz, bmd, bpd, bp20, bp20plus]
+    """
+    def __init__(self, d_model: int):
+        super().__init__()
+        # Long (2.5s) for Z-calls: bma, bmb, bmz (3 classes)
+        self.pool_long = nn.AvgPool1d(kernel_size=125, stride=1, padding=62)
+        self.classifier_long = nn.Linear(d_model, 3)
+
+        # Medium (0.5s) for downsweeps: bmd, bpd (2 classes)
+        self.pool_med = nn.AvgPool1d(kernel_size=25, stride=1, padding=12)
+        self.classifier_med = nn.Linear(d_model, 2)
+
+        # Short (0.1s) for pulses: bp20, bp20plus (2 classes)
+        self.pool_short = nn.AvgPool1d(kernel_size=5, stride=1, padding=2)
+        self.classifier_short = nn.Linear(d_model, 2)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_t = x.transpose(1, 2)  # (B, D, T)
+
+        feat_long = self.pool_long(x_t).transpose(1, 2)   # (B, T, D)
+        feat_med = self.pool_med(x_t).transpose(1, 2)     # (B, T, D)
+        feat_short = self.pool_short(x_t).transpose(1, 2) # (B, T, D)
+
+        logit_long = self.classifier_long(feat_long)      # (B, T, 3)
+        logit_med = self.classifier_med(feat_med)         # (B, T, 2)
+        logit_short = self.classifier_short(feat_short)   # (B, T, 2)
+
+        # Recombine into (B, T, 7)
+        return torch.cat([logit_long, logit_med, logit_short], dim=-1)
 
 # ---------------------------------------------------------------------------
-# Front-end: phase-aware spectrogram → learned filterbank → subsampling
+# Front-end
 # ---------------------------------------------------------------------------
 
 class PhaseAwareFrontEnd(nn.Module):
-    """
-    Replicates the Whale-VAD insight: instead of just power spectrum,
-    feed (magnitude, cos θ, sin θ) as a 3-channel input.
-    Then apply a learned 1-D filterbank + CNN subsampling.
-    """
     def __init__(
-        self,
-        n_fft: int = 256,
-        hop_length: int = 5,       # 20 ms at 250 Hz
-        win_length: int = 250,     # ~1 s at 250 Hz
-        d_model: int = 256,
-        dropout: float = 0.1,
+        self, n_fft: int = 256, hop_length: int = 5, win_length: int = 250,
+        d_model: int = 256, dropout: float = 0.1,
     ):
         super().__init__()
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.win_length = win_length
-        n_freq = n_fft // 2 + 1  # 129 bins
 
-        # 3-channel input: (mag, cos_phase, sin_phase)
-        # Learned filterbank: 1-D conv across frequency axis per frame
         self.filterbank = nn.Conv2d(3, 64, kernel_size=(7, 1), stride=(3, 1), padding=(2, 0))
         self.bn0 = nn.BatchNorm2d(64)
 
-        # Two conv blocks for further feature extraction & frequency reduction
         self.conv1 = nn.Conv2d(64, 128, kernel_size=(5, 5), stride=(3, 1), padding=(1, 2))
         self.bn1 = nn.BatchNorm2d(128)
         self.pool1 = nn.MaxPool2d(kernel_size=(5, 1), stride=(2, 1), padding=(2, 0))
@@ -215,21 +215,17 @@ class PhaseAwareFrontEnd(nn.Module):
         self.bn2 = nn.BatchNorm2d(128)
         self.pool2 = nn.MaxPool2d(kernel_size=(3, 1), stride=(2, 1), padding=(1, 0))
 
-        # Projection to d_model — computed dynamically
         self._proj = None
         self._d_model = d_model
         self.dropout = nn.Dropout(p=dropout)
 
     def _get_projection(self, freq_dim: int, device: torch.device) -> nn.Linear:
-        """Lazily create projection layer once we know the frequency dimension."""
         if self._proj is None or self._proj.in_features != freq_dim * 128:
             self._proj = nn.Linear(freq_dim * 128, self._d_model).to(device)
         return self._proj
 
     def _compute_stft(self, audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute STFT and return (magnitude, cos_phase, sin_phase), each (B, F, T)."""
         window = torch.hann_window(self.win_length, device=audio.device)
-        # Pad the window to n_fft if win_length < n_fft
         if self.win_length < self.n_fft:
             pad_left = (self.n_fft - self.win_length) // 2
             pad_right = self.n_fft - self.win_length - pad_left
@@ -245,61 +241,29 @@ class PhaseAwareFrontEnd(nn.Module):
         return mag, torch.cos(phase), torch.sin(phase)
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            audio: (B, num_samples)
-        Returns:
-            features: (B, T_out, d_model)
-        """
         mag, cos_ph, sin_ph = self._compute_stft(audio)
-        # Stack to (B, 3, F, T)
         x = torch.stack([mag, cos_ph, sin_ph], dim=1)
-
-        # Learned filterbank
         x = F.gelu(self.bn0(self.filterbank(x)))
-
-        # Conv blocks — treat freq as "height", time as "width"
         x = F.gelu(self.bn1(self.conv1(x)))
         x = self.pool1(x)
         x = F.gelu(self.bn2(self.conv2(x)))
         x = self.pool2(x)
 
-        # (B, C, F', T) → (B, T, C*F')
         B, C, F_out, T = x.shape
         x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * F_out)
-
-        # Project to d_model
         proj = self._get_projection(F_out, x.device)
         x = self.dropout(proj(x))
         return x
-
 
 # ---------------------------------------------------------------------------
 # Full model
 # ---------------------------------------------------------------------------
 
 class WhaleConformer(nn.Module):
-    """
-    Conformer-based whale call sound event detector.
-
-    Pipeline:
-        audio → PhaseAwareFrontEnd → PositionalEncoding → N × ConformerBlock → Linear → sigmoid
-
-    Outputs per-frame probabilities for each call class.
-    """
     def __init__(
-        self,
-        n_classes: int = 3,
-        d_model: int = 256,
-        n_heads: int = 4,
-        d_ff: int = 1024,
-        n_layers: int = 4,
-        conv_kernel_size: int = 31,
-        dropout: float = 0.1,
-        n_fft: int = 256,
-        hop_length: int = 5,
-        win_length: int = 250,
-        sample_rate: int = 250,
+        self, n_classes: int = 7, d_model: int = 256, n_heads: int = 4, d_ff: int = 1024,
+        n_layers: int = 4, conv_kernel_size: int = 31, dropout: float = 0.1,
+        n_fft: int = 256, hop_length: int = 5, win_length: int = 250, sample_rate: int = 250,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -320,81 +284,30 @@ class WhaleConformer(nn.Module):
             for _ in range(n_layers)
         ])
 
-        self.classifier = nn.Linear(d_model, n_classes)
+        # Use Multi-Scale Head for 7 classes, fallback to Linear otherwise
+        if n_classes == 7:
+            self.classifier = MultiScaleClassifier(d_model)
+        else:
+            self.classifier = nn.Linear(d_model, n_classes)
 
-    def forward(
-        self, audio: torch.Tensor, mask: torch.Tensor | None = None
-    ) -> torch.Tensor:
-        """
-        Args:
-            audio: (B, num_samples) raw waveform at 250 Hz
-            mask:  optional (B, 1, T, T) attention mask
-
-        Returns:
-            logits: (B, T_frames, n_classes) — apply sigmoid for probabilities
-        """
-        x = self.frontend(audio)       # (B, T, d_model)
+    def forward(self, audio: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        x = self.frontend(audio)
         x = self.pos_enc(x)
-
         for block in self.conformer_blocks:
             x = block(x, mask=mask)
-
-        logits = self.classifier(x)    # (B, T, n_classes)
+        logits = self.classifier(x)
         return logits
-
-    @classmethod
-    def from_config(cls, cfg=None) -> "WhaleConformer":
-        """Build model from the central Config object."""
-        if cfg is None:
-            from config import CFG
-            cfg = CFG
-        return cls(
-            n_classes=cfg.model.n_classes,
-            d_model=cfg.model.d_model,
-            n_heads=cfg.model.n_heads,
-            d_ff=cfg.model.d_ff,
-            n_layers=cfg.model.n_layers,
-            conv_kernel_size=cfg.model.conv_kernel_size,
-            dropout=cfg.model.dropout,
-            n_fft=cfg.audio.n_fft,
-            hop_length=cfg.audio.hop_length,
-            win_length=cfg.audio.win_length,
-            sample_rate=cfg.audio.sample_rate,
-        )
-
-    def predict(self, audio: torch.Tensor, thresholds: torch.Tensor | None = None) -> torch.Tensor:
-        """Convenience method: returns binary predictions after sigmoid + threshold."""
-        logits = self.forward(audio)
-        probs = torch.sigmoid(logits)
-        if thresholds is None:
-            thresholds = torch.tensor([0.5] * self.n_classes, device=probs.device)
-        return (probs > thresholds.view(1, 1, -1)).long()
-
 
 # ---------------------------------------------------------------------------
 # Loss functions
 # ---------------------------------------------------------------------------
 
 class WeightedBCEWithFocal(nn.Module):
-    """
-    BCE + focal loss with proper positive-class weighting.
-
-    CRITICAL FIX: uses pos_weight to upweight the positive (call-present)
-    term in the BCE. With ~5% positive frames, pos_weight ≈ 19 makes
-    missing a call as costly as 19 false alarms — this prevents the model
-    from collapsing to "predict all zeros".
-
-    focal_alpha > 0.5 further upweights positives in the focal term.
-    """
     def __init__(
-        self,
-        pos_weight: torch.Tensor | None = None,
-        focal_alpha: float = 0.75,
-        focal_gamma: float = 2.0,
-        focal_weight: float = 1.0,
+        self, pos_weight: torch.Tensor | None = None, focal_alpha: float = 0.75,
+        focal_gamma: float = 2.0, focal_weight: float = 1.0,
     ):
         super().__init__()
-        # pos_weight: (C,) — one weight per class
         if pos_weight is not None:
             self.register_buffer("pos_weight", pos_weight)
         else:
@@ -403,61 +316,20 @@ class WeightedBCEWithFocal(nn.Module):
         self.focal_gamma = focal_gamma
         self.focal_weight = focal_weight
 
-    def forward(
-        self, logits: torch.Tensor, targets: torch.Tensor,
-        padding_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            logits:       (B, T, C)
-            targets:      (B, T, C) binary
-            padding_mask: (B, T) — True where valid, False where padded
-        """
-        # --- Weighted BCE ---
-        # pos_weight scales ONLY the positive term: -w * y * log(p) - (1-y) * log(1-p)
+    def forward(self, logits: torch.Tensor, targets: torch.Tensor, padding_mask: torch.Tensor | None = None) -> torch.Tensor:
         pw = self.pos_weight.view(1, 1, -1) if self.pos_weight is not None else None
-        bce = F.binary_cross_entropy_with_logits(
-            logits, targets, pos_weight=pw, reduction="none"
-        )
+        bce = F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pw, reduction="none")
 
-        # --- Focal modulation ---
         if self.focal_weight > 0:
             probs = torch.sigmoid(logits)
             p_t = probs * targets + (1 - probs) * (1 - targets)
-            # alpha > 0.5 upweights positives (minority)
             alpha_t = self.focal_alpha * targets + (1 - self.focal_alpha) * (1 - targets)
             focal_mod = alpha_t * (1 - p_t) ** self.focal_gamma
             loss = bce + self.focal_weight * focal_mod * bce
         else:
             loss = bce
 
-        # --- Mask out padding ---
         if padding_mask is not None:
             loss = loss * padding_mask.unsqueeze(-1).float()
             return loss.sum() / (padding_mask.sum() * logits.size(-1) + 1e-8)
         return loss.mean()
-
-
-# ---------------------------------------------------------------------------
-# Quick sanity check
-# ---------------------------------------------------------------------------
-
-if __name__ == "__main__":
-    import config as cfg
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = WhaleConformer(
-        n_classes=cfg.n_classes(),
-        d_model=cfg.D_MODEL, n_heads=cfg.N_HEADS, d_ff=cfg.D_FF,
-        n_layers=cfg.N_LAYERS, conv_kernel_size=cfg.CONV_KERNEL, dropout=cfg.DROPOUT,
-        n_fft=cfg.N_FFT, hop_length=cfg.HOP_LENGTH, win_length=cfg.WIN_LENGTH,
-        sample_rate=cfg.SAMPLE_RATE,
-    ).to(device)
-
-    # Simulate a 30s clip
-    batch = torch.randn(2, cfg.SAMPLE_RATE * 30, device=device)
-    logits = model(batch)
-    print(f"Input:  {batch.shape}")
-    print(f"Output: {logits.shape}  (B, T_frames, n_classes)")
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Params: {n_params:,}")
