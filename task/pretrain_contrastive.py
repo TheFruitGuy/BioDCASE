@@ -41,7 +41,7 @@ from augmentations import AudioAugmentor
 # Config — edit these for pretraining
 # ---------------------------------------------------------------------------
 
-PRETRAIN_DATA_DIR   = Path("./data_unlabeled/kerguelen2020")
+PRETRAIN_DATA_DIR   = Path("./data_unlabeled")
 PRETRAIN_OUTPUT_DIR = Path("./runs/pretrain")
 
 PRETRAIN_EPOCHS     = 30
@@ -78,7 +78,7 @@ class UnlabeledAudioDataset(Dataset):
 
         # Build file list with durations
         self.files = []
-        for wf in sorted(self.data_dir.glob("*.wav")):
+        for wf in sorted(self.data_dir.rglob("*.wav")):
             try:
                 info = sf.info(str(wf))
                 if info.duration >= segment_length_s:
