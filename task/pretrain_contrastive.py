@@ -45,8 +45,8 @@ PRETRAIN_DATA_DIR   = Path("./data_unlabeled")
 PRETRAIN_OUTPUT_DIR = Path("./runs/pretrain")
 
 PRETRAIN_EPOCHS     = 30
-PRETRAIN_BATCH_SIZE = 72       # larger batches = more negatives = better contrastive learning
-ACCUMULATION_STEPS  = 4         # effective batch = 16 × 4 = 64
+PRETRAIN_BATCH_SIZE = 36       # larger batches = more negatives = better contrastive learning
+ACCUMULATION_STEPS  = 8         # effective batch = 16 × 4 = 64
 PRETRAIN_LR         = 1e-3
 PRETRAIN_WARMUP     = 3
 SEGMENT_LENGTH_S    = 30.0     # segment length in seconds
