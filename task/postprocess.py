@@ -113,8 +113,14 @@ def filter_and_merge_events(events: list[Detection]) -> list[Detection]:
     final_events = []
 
     for (ds, fn, label), class_events in events_by_group.items():
+        # Look up class-specific minimum duration (or default to 0.5)
         min_dur = cfg.CLASS_MIN_DURATION_S.get(label, 0.5)
-        max_gap = cfg.CLASS_MERGE_GAP_S.get(label, 0.0)
+
+        # Smart Merge Gap: Check if it's a dictionary or a universal float
+        if isinstance(cfg.CLASS_MERGE_GAP_S, dict):
+            max_gap = cfg.CLASS_MERGE_GAP_S.get(label, 0.5)
+        else:
+            max_gap = float(cfg.CLASS_MERGE_GAP_S)  # Use the universal 0.5s gap!
 
         # 1. Sort by start time
         class_events.sort(key=lambda x: x.start_s)
