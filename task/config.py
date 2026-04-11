@@ -62,7 +62,7 @@ COLLAPSE_MAP = {
     "bpd": "bp", "bp20": "bp", "bp20plus": "bp",
 }
 
-USE_3CLASS = False
+USE_3CLASS = True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -106,7 +106,7 @@ GRAD_CLIP     = 1.0
 # 1) pos_weight: upweights the positive (call-present) term in BCE.
 #    With ~5% positive frames, pos_weight ≈ 19 balances the classes.
 #    Set to None to auto-compute from actual training data.
-POS_WEIGHT    = 15
+POS_WEIGHT    = None
 
 # 2) focal_alpha > 0.5 upweights positives (minority class).
 #    NOTE: alpha=0.25 DOWNWEIGHTS positives — was backwards before!
@@ -122,13 +122,9 @@ SEED          = 42
 # Postprocessing
 # ──────────────────────────────────────────────────────────────────────────────
 
-SMOOTH_KERNEL_MS = 1000
+SMOOTH_KERNEL_MS = 500
 
-CLASS_MERGE_GAP_S = {
-    "bmabz": 3.0,  # Bridge gaps up to 3s in Z-calls
-    "d": 0.5,      # Bridge tiny gaps in D-calls
-    "bp": 0.1      # Do not merge separate Fin pulses!
-}
+CLASS_MERGE_GAP_S = 0.5
 
 CLASS_MIN_DURATION_S = {
     "bmabz": 4.0,  # Z-calls are massive; ignore anything under 4s

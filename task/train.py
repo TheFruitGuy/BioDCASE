@@ -30,6 +30,7 @@ from dataset import (
     build_dataloaders, load_annotations, collate_fn,
 )
 from postprocess import tune_thresholds
+from model import compute_segment_weights
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +236,7 @@ def main():
     print(f"Parameters: {n_params:,}")
 
     if cfg.POS_WEIGHT is None:
-        pos_weight = compute_pos_weight().to(device)
+        pos_weight = compute_segment_weights(cfg.n_classes()).to(device)
     else:
         pos_weight = torch.tensor(
             [cfg.POS_WEIGHT] * cfg.n_classes(), dtype=torch.float32, device=device
