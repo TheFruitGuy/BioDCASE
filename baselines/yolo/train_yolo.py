@@ -50,6 +50,7 @@ def run():
         'bgr': 0,
         'mosaic': 0,
         'mixup': 0,
+        'mixup': 0,
         'copy_paste': 0,
         'erasing': 0,
         'crop_fraction': 0,

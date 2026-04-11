@@ -98,24 +98,25 @@ class UnlabeledAudioDataset(Dataset):
         # But for simplicity, just return file count — random offset gives variety
         return len(self.files)
 
-    def __getitem__(self, idx: int):
+    def __getitem__(self, idx):
         f = self.files[idx]
 
-        # Random start position
+        # Two DIFFERENT random positions from the same file
         max_start = f["n_samples"] - self.segment_samples
-        start = random.randint(0, max(0, max_start))
+        start1 = random.randint(0, max(0, max_start))
+        start2 = random.randint(0, max(0, max_start))
 
-        # Load audio
-        audio, sr = sf.read(f["path"], start=start,
-                            stop=start + self.segment_samples, dtype="float32")
-        assert sr == self.sample_rate
+        audio1, _ = sf.read(f["path"], start=start1,
+                            stop=start1 + self.segment_samples, dtype="float32")
+        audio2, _ = sf.read(f["path"], start=start2,
+                            stop=start2 + self.segment_samples, dtype="float32")
 
-        # Mean subtraction
-        audio = audio - audio.mean()
-        audio = torch.from_numpy(audio)
+        audio1 = torch.from_numpy(audio1 - audio1.mean())
+        audio2 = torch.from_numpy(audio2 - audio2.mean())
 
-        # Two augmented views
-        view1, view2 = self.augmentor(audio)
+        # Still apply augmentations on top
+        view1 = self.augmentor._augment_waveform(audio1)
+        view2 = self.augmentor._augment_waveform(audio2)
 
         return view1, view2
 

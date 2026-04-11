@@ -133,7 +133,7 @@ CLASS_MERGE_GAP_S = {
 CLASS_MIN_DURATION_S = {
     "bmabz": 4.0,  # Z-calls are massive; ignore anything under 4s
     "d": 0.5,      # D-calls are medium downsweeps
-    "bp": 0.1      # Fin pulses are tiny, keep almost everything
+    "bp": 0.3      # Fin pulses are tiny, keep almost everything
 }
 
 POST_MAX_DUR_S   = 30.0

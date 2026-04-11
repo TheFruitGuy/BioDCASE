@@ -173,7 +173,7 @@ class MultiScaleClassifier(nn.Module):
         self.classifier_med = nn.Linear(d_model, 2)
 
         # Short (0.1s) for pulses: bp20, bp20plus (2 classes)
-        self.pool_short = nn.AvgPool1d(kernel_size=5, stride=1, padding=2)
+        self.pool_short = nn.AvgPool1d(kernel_size=15, stride=1, padding=7)
         self.classifier_short = nn.Linear(d_model, 2)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
