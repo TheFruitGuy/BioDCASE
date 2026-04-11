@@ -176,18 +176,29 @@ def _stitch_segments(
 # Full pipeline
 # ---------------------------------------------------------------------------
 
-def postprocess_predictions(
+ddef postprocess_predictions(
     all_probs: dict[tuple[str, str, int], np.ndarray],
     thresholds: np.ndarray,
 ) -> list[Detection]:
-    """Raw segment probs → merged, filtered Detection list."""
+    """Raw segment probs → mapped to 3-class → merged and filtered."""
     file_probs = _stitch_segments(all_probs)
     all_dets = []
     for (ds, fn), probs in file_probs.items():
         probs = smooth_probabilities(probs)
         dets = threshold_to_detections(probs, thresholds, ds, fn)
         all_dets.extend(dets)
-    return filter_and_merge_events(all_dets)
+
+    # ---> FIX: Map 7-class to 3-class IMMEDIATELY <---
+    mapped_dets = []
+    for d in all_dets:
+        new_label = cfg.COLLAPSE_MAP.get(d.label, d.label)
+        mapped_dets.append(Detection(
+            dataset=d.dataset, filename=d.filename, label=new_label,
+            start_s=d.start_s, end_s=d.end_s, confidence=d.confidence
+        ))
+
+    # Now that everything is 'bmabz', 'd', or 'bp', merge and filter!
+    return filter_and_merge_events(mapped_dets)
 
 
 # ---------------------------------------------------------------------------
