@@ -102,17 +102,19 @@ def collapse_to_3class(detections: list[Detection]) -> list[Detection]:
 
 def filter_and_merge_events(events: list[Detection]) -> list[Detection]:
     """Applies class-specific minimum durations and merge gaps."""
-    # Group events by class first
-    events_by_class = {"bmabz": [], "d": [], "bp": []}
+    # Group dynamically instead of hardcoding the 3 classes
+    events_by_class = {}
     for e in events:
-        if e.label in events_by_class:
-            events_by_class[e.label].append(e)
+        events_by_class.setdefault(e.label, []).append(e)
 
     final_events = []
 
     for label, class_events in events_by_class.items():
-        min_dur = cfg.CLASS_MIN_DURATION_S[label]
-        max_gap = cfg.CLASS_MERGE_GAP_S[label]
+        # Map 7-class ('bma') to 3-class ('bmabz') to look up config values
+        eval_label = cfg.COLLAPSE_MAP.get(label, label)
+
+        min_dur = cfg.CLASS_MIN_DURATION_S.get(eval_label, 0.5)
+        max_gap = cfg.CLASS_MERGE_GAP_S.get(eval_label, 0.0)
 
         # 1. Sort by start time
         class_events.sort(key=lambda x: x.start_s)
