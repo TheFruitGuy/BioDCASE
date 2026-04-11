@@ -123,8 +123,19 @@ SEED          = 42
 # ──────────────────────────────────────────────────────────────────────────────
 
 SMOOTH_KERNEL_MS = 1000
-MERGE_GAP_S      = 2.0
-POST_MIN_DUR_S   = 0.5
+
+CLASS_MERGE_GAP_S = {
+    "bmabz": 3.0,  # Bridge gaps up to 3s in Z-calls
+    "d": 0.5,      # Bridge tiny gaps in D-calls
+    "bp": 0.1      # Do not merge separate Fin pulses!
+}
+
+CLASS_MIN_DURATION_S = {
+    "bmabz": 4.0,  # Z-calls are massive; ignore anything under 4s
+    "d": 0.5,      # D-calls are medium downsweeps
+    "bp": 0.1      # Fin pulses are tiny, keep almost everything
+}
+
 POST_MAX_DUR_S   = 30.0
 
 # Lower default — the model's probabilities are low early in training

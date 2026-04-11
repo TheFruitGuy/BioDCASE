@@ -97,31 +97,46 @@ def collapse_to_3class(detections: list[Detection]) -> list[Detection]:
 
     # Run merge_detections again!
     # If a 'bma' predicted right next to a 'bmb' they will now merge.
-    return merge_detections(collapsed)
+    return filter_and_merge_events(collapsed)
 
 
-def merge_detections(detections: list[Detection]) -> list[Detection]:
-    """Merge nearby same-class detections, filter by duration."""
-    groups: dict[tuple, list[Detection]] = {}
-    for d in detections:
-        groups.setdefault((d.dataset, d.filename, d.label), []).append(d)
+def filter_and_merge_events(events: list[Detection]) -> list[Detection]:
+    """Applies class-specific minimum durations and merge gaps."""
+    # Group events by class first
+    events_by_class = {"bmabz": [], "d": [], "bp": []}
+    for e in events:
+        if e.label in events_by_class:
+            events_by_class[e.label].append(e)
 
-    merged = []
-    for dets in groups.values():
-        dets.sort(key=lambda x: x.start_s)
-        cur = dets[0]
-        for d in dets[1:]:
-            if d.start_s - cur.end_s < cfg.MERGE_GAP_S:
-                cur = Detection(cur.dataset, cur.filename, cur.label,
-                                cur.start_s, max(cur.end_s, d.end_s),
-                                max(cur.confidence, d.confidence))
+    final_events = []
+
+    for label, class_events in events_by_class.items():
+        min_dur = cfg.CLASS_MIN_DURATION_S[label]
+        max_gap = cfg.CLASS_MERGE_GAP_S[label]
+
+        # 1. Sort by start time
+        class_events.sort(key=lambda x: x.start_s)
+
+        # 2. Merge close events
+        merged = []
+        for e in class_events:
+            if not merged:
+                merged.append(e)
             else:
-                merged.append(cur)
-                cur = d
-        merged.append(cur)
+                last = merged[-1]
+                # If gap is smaller than max_gap, merge them
+                if e.start_s - last.end_s <= max_gap:
+                    last.end_s = max(last.end_s, e.end_s)
+                    last.confidence = max(last.confidence, e.confidence)
+                else:
+                    merged.append(e)
 
-    return [d for d in merged
-            if cfg.POST_MIN_DUR_S <= (d.end_s - d.start_s) <= cfg.POST_MAX_DUR_S]
+        # 3. Filter out events that are too short
+        for m in merged:
+            if (m.end_s - m.start_s) >= min_dur:
+                final_events.append(m)
+
+    return final_events
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +185,7 @@ def postprocess_predictions(
         probs = smooth_probabilities(probs)
         dets = threshold_to_detections(probs, thresholds, ds, fn)
         all_dets.extend(dets)
-    return merge_detections(all_dets)
+    return filter_and_merge_events(all_dets)
 
 
 # ---------------------------------------------------------------------------
