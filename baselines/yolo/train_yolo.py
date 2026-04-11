@@ -52,7 +52,7 @@ def run():
         'crop_fraction': 0,
     }
     model.train(epochs=40, batch=192, data=YAML_FILE,
-                project=config['path'] + '/runs/' + run_name, resume=False, patience=0, workers=32 **best_params)
+                project=config['path'] + '/runs/' + run_name, resume=False, patience=0, workers=32, **best_params)
 
     if "COMET_API_KEY" in os.environ and comet_ml is not None:
         experiment.end()
