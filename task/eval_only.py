@@ -33,8 +33,8 @@ def main():
         model = torch.nn.DataParallel(model)
 
     # Use the tuned thresholds from your previous run output!
-    tuned_thresholds = torch.tensor([0.8, 0.8, 0.8, 0.5, 0.8, 0.8, 0.8], device=device)
-    
+    tuned_thresholds = torch.tensor([0.2, 0.2, 0.2, 0.3, 0.5, 0.5, 0.5], device=device)
+
     print("Running validation with class-specific post-processing...")
     criterion = WeightedBCEWithFocal().to(device)  # Just a dummy for validate to work
 
