@@ -101,20 +101,20 @@ def collapse_to_3class(detections: list[Detection]) -> list[Detection]:
 
 
 def filter_and_merge_events(events: list[Detection]) -> list[Detection]:
-    """Applies class-specific minimum durations and merge gaps."""
-    # Group dynamically instead of hardcoding the 3 classes
-    events_by_class = {}
+    """Applies class-specific minimum durations and merge gaps per file."""
+
+    # FIX 1: Group by dataset AND filename so we don't merge the whole dataset!
+    events_by_group = {}
     for e in events:
-        events_by_class.setdefault(e.label, []).append(e)
+        eval_label = cfg.COLLAPSE_MAP.get(e.label, e.label)
+        key = (e.dataset, e.filename, eval_label)
+        events_by_group.setdefault(key, []).append(e)
 
     final_events = []
 
-    for label, class_events in events_by_class.items():
-        # Map 7-class ('bma') to 3-class ('bmabz') to look up config values
-        eval_label = cfg.COLLAPSE_MAP.get(label, label)
-
-        min_dur = cfg.CLASS_MIN_DURATION_S.get(eval_label, 0.5)
-        max_gap = cfg.CLASS_MERGE_GAP_S.get(eval_label, 0.0)
+    for (ds, fn, label), class_events in events_by_group.items():
+        min_dur = cfg.CLASS_MIN_DURATION_S.get(label, 0.5)
+        max_gap = cfg.CLASS_MERGE_GAP_S.get(label, 0.0)
 
         # 1. Sort by start time
         class_events.sort(key=lambda x: x.start_s)
@@ -183,12 +183,12 @@ def postprocess_predictions(
     """Raw segment probs → mapped to 3-class → merged and filtered."""
     file_probs = _stitch_segments(all_probs)
     all_dets = []
+
     for (ds, fn), probs in file_probs.items():
-        probs = smooth_probabilities(probs)
+        # FIX 2: Removed smooth_probabilities! Let the Multi-Scale head do its job.
         dets = threshold_to_detections(probs, thresholds, ds, fn)
         all_dets.extend(dets)
 
-    # ---> FIX: Map 7-class to 3-class IMMEDIATELY <---
     mapped_dets = []
     for d in all_dets:
         new_label = cfg.COLLAPSE_MAP.get(d.label, d.label)
@@ -197,7 +197,6 @@ def postprocess_predictions(
             start_s=d.start_s, end_s=d.end_s, confidence=d.confidence
         ))
 
-    # Now that everything is 'bmabz', 'd', or 'bp', merge and filter!
     return filter_and_merge_events(mapped_dets)
 
 
