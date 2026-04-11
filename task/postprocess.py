@@ -176,7 +176,7 @@ def _stitch_segments(
 # Full pipeline
 # ---------------------------------------------------------------------------
 
-ddef postprocess_predictions(
+def postprocess_predictions(
     all_probs: dict[tuple[str, str, int], np.ndarray],
     thresholds: np.ndarray,
 ) -> list[Detection]:
