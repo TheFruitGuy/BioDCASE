@@ -8,6 +8,8 @@ from ultralytics import YOLO
 import os
 os.environ["WANDB_PROJECT"] = "BioDCASE_Task2_Baseline"
 os.environ["COMET_MODE"] = "disabled"
+os.environ['WANDB_API_KEY'] = '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'
+
 
 def run():
     YAML_FILE = './custom.yaml'
