@@ -1,7 +1,7 @@
 import json
+import wandb
 from ultralytics import YOLO
 import yaml
-
 import preprocess_data
 
 
@@ -10,6 +10,14 @@ def predict(ds, conf=0.1):
     if not predictions_folder.exists():
         model_path = input('Folder still not predicted. Where is the path to the model to predict?')
         model = YOLO(model_path)
+
+        # Log prediction run to wandb
+        wandb.init(project="biodcase-task2", job_type="prediction", config={
+            "model_path": model_path,
+            "confidence_threshold": conf,
+            "dataset": str(ds.path_to_dataset),
+        })
+
         if ds.images_folder.exists():
             results_list = model(source=str(ds.images_folder),
                                  project=str(ds.path_to_dataset),
@@ -17,9 +25,10 @@ def predict(ds, conf=0.1):
                                  stream=True,
                                  save=False, show=False, save_conf=True, save_txt=True, conf=conf,
                                  save_crop=False, agnostic_nms=True)
-
             for r in results_list:
                 pass
+
+        wandb.finish()
     else:
         print('Using existing predictions folder. Delete if you wanted to overwrite')
 
