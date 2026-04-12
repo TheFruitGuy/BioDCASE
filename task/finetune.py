@@ -29,8 +29,9 @@ from model import WhaleConformer, WeightedBCEWithFocal
 from dataset import build_dataloaders, load_annotations, collate_fn
 from postprocess import tune_thresholds
 from train import (
-    set_seed, compute_pos_weight, _align_lengths, validate,
+    set_seed, _align_lengths, validate,
 )
+from model import compute_segment_weights
 
 
 def parse_args():
@@ -82,7 +83,7 @@ def main():
     print(f"Parameters: {n_params:,}")
 
     # --- loss ---
-    pos_weight = compute_pos_weight().to(device)
+    pos_weight = compute_segment_weights(cfg.n_classes()).to(device)
     # Cap pos_weight to avoid NaN explosion
     pos_weight = pos_weight.clamp(max=15.0)
     print(f"pos_weight (capped): {pos_weight}")

@@ -191,7 +191,7 @@ def postprocess_predictions(
     all_dets = []
 
     for (ds, fn), probs in file_probs.items():
-        # FIX 2: Removed smooth_probabilities! Let the Multi-Scale head do its job.
+        probs = smooth_probabilities(probs)
         dets = threshold_to_detections(probs, thresholds, ds, fn)
         all_dets.extend(dets)
 

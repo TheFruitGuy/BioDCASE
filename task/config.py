@@ -87,7 +87,7 @@ N_HEADS     = 4
 D_FF        = 1024
 N_LAYERS    = 4
 CONV_KERNEL = 15
-DROPOUT     = 0.1
+DROPOUT     = 0.3
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -96,7 +96,7 @@ DROPOUT     = 0.1
 
 EPOCHS        = 60
 BATCH_SIZE    = 36
-LR            = 3e-4
+LR            = 1e-5
 WEIGHT_DECAY  = 0.001
 WARMUP_EPOCHS = 3
 GRAD_CLIP     = 1.0
@@ -110,9 +110,9 @@ POS_WEIGHT    = None
 
 # 2) focal_alpha > 0.5 upweights positives (minority class).
 #    NOTE: alpha=0.25 DOWNWEIGHTS positives — was backwards before!
-FOCAL_ALPHA   = 0.75        # was 0.25 — that killed positive predictions
+FOCAL_ALPHA   = 0.25
 FOCAL_GAMMA   = 2.0
-FOCAL_WEIGHT  = 0
+FOCAL_WEIGHT  = 1.0
 
 NUM_WORKERS   = 24
 SEED          = 42
@@ -135,7 +135,7 @@ CLASS_MIN_DURATION_S = {
 POST_MAX_DUR_S   = 30.0
 
 # Lower default — the model's probabilities are low early in training
-DEFAULT_THRESHOLDS = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
+DEFAULT_THRESHOLDS = [0.3, 0.3, 0.3]
 
 
 # ──────────────────────────────────────────────────────────────────────────────

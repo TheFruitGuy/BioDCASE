@@ -192,6 +192,9 @@ class PhaseAwareFrontEnd(nn.Module):
 
     def forward(self, audio):
         mag, cos_ph, sin_ph = self._compute_stft(audio)
+        mag = mag - mag.mean(dim=-1, keepdim=True)
+        cos_ph = cos_ph - cos_ph.mean(dim=-1, keepdim=True)
+        sin_ph = sin_ph - sin_ph.mean(dim=-1, keepdim=True)
         x = torch.stack([mag, cos_ph, sin_ph], dim=1)
         x = F.gelu(self.bn0(self.filterbank(x)))
         x = F.gelu(self.bn1(self.conv1(x)))
