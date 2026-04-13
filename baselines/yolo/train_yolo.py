@@ -14,7 +14,7 @@ os.environ['WANDB_API_KEY'] = 'wandb_v1_AJM2OYNvPVKHSfJhbyUebWwC3Z4_GSLjCk1Jebas
 
 def run():
     YAML_FILE = './custom.yaml'
-    run_name = 'biodcase_baseline'  # Change to the name of your run
+    run_name = 'biodcase_baseline_2'  # Change to the name of your run
 
     # Check if CUDA is available
     print('CUDA device count:')
@@ -57,7 +57,7 @@ def run():
     }
 
     # YOLO will automatically detect the active W&B run we started above
-    model.train(epochs=40, batch=96, data=YAML_FILE,
+    model.train(epochs=100, batch=48, data=YAML_FILE,
                 project=config['path'] + '/runs/' + run_name, resume=False, patience=0, workers=32, **best_params)
 
     # 4. Cleanly close the W&B run when training is done
