@@ -57,7 +57,7 @@ def run():
     }
 
     # YOLO will automatically detect the active W&B run we started above
-    model.train(epochs=100, batch=48, data=YAML_FILE,
+    model.train(epochs=100, batch=32, data=YAML_FILE,
                 project=config['path'] + '/runs/' + run_name, resume=False, patience=0, workers=32, **best_params)
 
     # 4. Cleanly close the W&B run when training is done
