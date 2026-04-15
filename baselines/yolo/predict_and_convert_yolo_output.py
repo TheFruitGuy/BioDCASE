@@ -47,5 +47,5 @@ if __name__ == '__main__':
 
     yolo_ds = preprocess_data.YOLODataset(config, path_to_dataset)
     output_folder = predict(yolo_ds)
-    correct_names = {0: 'bmabz', 1: 'bmabz', 2: 'bmabz', 3: 'd', 4: 'd', 5: 'bp', 6: 'bp'}
+    correct_names = {0: 'bmabz', 1: 'd', 2: 'bp'}
     yolo_ds.convert_yolo_detections_to_csv(output_folder, reverse_class_encoding=correct_names)
