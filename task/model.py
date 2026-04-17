@@ -255,12 +255,13 @@ class WhaleVADLoss(nn.Module):
 def compute_class_weights() -> torch.Tensor:
     """
     Paper Section 5.6: w_c = N / P_c
-    With 1:1 neg:pos undersampling, N ≈ total positives.
+    Interpreted as: N = files NOT containing class c, P_c = files containing class c.
+    This gives each class weight proportional to its rarity across files.
     """
     from dataset import load_annotations
 
     annotations = load_annotations(cfg.TRAIN_DATASETS)
-    total_pos = len(annotations)
+    total_files = annotations.groupby(["dataset", "filename"]).ngroups
 
     class_names = cfg.class_names()
     weights = []
@@ -271,15 +272,15 @@ def compute_class_weights() -> torch.Tensor:
         else:
             class_annots = annotations[annotations["annotation"] == c_name]
 
-        p_c = max(len(class_annots), 1)
-        w = total_pos / p_c
-        w = min(w, 50.0)
+        p_c = max(class_annots.groupby(["dataset", "filename"]).ngroups, 1)
+        n_neg = max(total_files - p_c, 1)
+        w = n_neg / p_c
         weights.append(w)
 
     result = torch.tensor(weights, dtype=torch.float32)
-    print(f"Class weights (w_c = N/P_c):")
+    print(f"Class weights (w_c = N/P_c, file-level):")
     for name, w in zip(class_names, result.tolist()):
-        print(f"  {name}: {w:.2f}")
+        print(f"  {name}: {w:.3f}")
     return result
 
 
