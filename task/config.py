@@ -142,7 +142,7 @@ AGG_DROPOUT         = 0.2                     # Section 5.4: "Dropout2d"
 # Training (Section 5.6)
 # ----------------------------------------------------------------------
 
-EPOCHS        = 60
+EPOCHS        = 150
 BATCH_SIZE    = 32
 LR            = 1e-5                          # paper: "1 × 10⁻⁵"
 WEIGHT_DECAY  = 0.001                         # paper: "weight decay factor of 0.001"
