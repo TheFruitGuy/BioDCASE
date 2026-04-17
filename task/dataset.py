@@ -1,8 +1,19 @@
 """
 Dataset loading for the Acoustic Trends Blue Fin Library (ATBFL).
 
+Directory layout (BioDCASE 2026):
+    DATA_ROOT/
+      train/
+        annotations/{dataset}.csv
+        audio/{dataset}/*.wav
+      validation/
+        annotations/{dataset}.csv
+        audio/{dataset}/*.wav
+
 Handles:
   - Reading per-dataset boundary annotation CSVs
+  - Matching annotations to audio files via datetime overlap
+    (CSVs may not have a 'filename' column)
   - Training segments: each positive annotation + random collar (Section 5.1)
   - Negative segments: random "no-call" windows, sampled fresh each epoch (5.5)
   - Validation segments: 30s windows with 2s overlap (Section 5.1)
@@ -24,15 +35,27 @@ import config as cfg
 
 
 # ----------------------------------------------------------------------
+# Path resolution — maps dataset name → split directory
+# ----------------------------------------------------------------------
+
+def _split_for_dataset(ds: str) -> str:
+    """Return 'train' or 'validation' for a given dataset name."""
+    if ds in cfg.TRAIN_DATASETS:
+        return "train"
+    if ds in cfg.VAL_DATASETS:
+        return "validation"
+    for split in ("train", "validation"):
+        if (cfg.DATA_ROOT / split / "audio" / ds).exists():
+            return split
+    raise FileNotFoundError(f"Cannot find split for dataset '{ds}'")
+
+
+# ----------------------------------------------------------------------
 # Filename → datetime parsing
 # ----------------------------------------------------------------------
-# ATBFL filenames look like: 2014-06-29T23-00-00_000.wav
-#   ↑ file start datetime in ISO-ish format with T separator
 
 def _parse_file_start_dt(filename: str):
-    """Parse ATBFL filename → file start datetime (UTC)."""
-    stem = Path(filename).stem           # e.g. "2014-06-29T23-00-00_000"
-    # Drop any trailing "_000" (milliseconds, always zero in ATBFL)
+    stem = Path(filename).stem
     stem = stem.split("_")[0]
     try:
         return datetime.strptime(stem, "%Y-%m-%dT%H-%M-%S").replace(tzinfo=timezone.utc)
@@ -41,65 +64,91 @@ def _parse_file_start_dt(filename: str):
 
 
 # ----------------------------------------------------------------------
-# Annotation & file manifest loading
+# File manifest
+# ----------------------------------------------------------------------
+
+def get_file_manifest(datasets: list[str]) -> pd.DataFrame:
+    rows = []
+    for ds in datasets:
+        try:
+            split = _split_for_dataset(ds)
+        except FileNotFoundError:
+            print(f"Warning: cannot locate {ds}")
+            continue
+        audio_dir = cfg.DATA_ROOT / split / "audio" / ds
+        if not audio_dir.exists():
+            print(f"Warning: audio directory missing for {ds}: {audio_dir}")
+            continue
+        for wav in sorted(audio_dir.glob("*.wav")):
+            info = sf.info(str(wav))
+            start_dt = _parse_file_start_dt(wav.name)
+            end_dt = start_dt + timedelta(seconds=info.duration) if start_dt else None
+            rows.append({
+                "dataset": ds,
+                "filename": wav.name,
+                "path": str(wav),
+                "duration_s": info.duration,
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+            })
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------
+# Annotation loading
 # ----------------------------------------------------------------------
 
 def load_annotations(datasets: list[str]) -> pd.DataFrame:
     """
-    Load boundary annotations for the given datasets.
-    Returns DataFrame with columns:
-        dataset, filename, start_datetime, end_datetime, annotation, label_3class
+    Load annotations. CSVs may not have a 'filename' column — in that case
+    we match each annotation to a file by finding the audio file whose
+    datetime range contains the annotation's start_datetime.
     """
     all_rows = []
+    manifest = get_file_manifest(datasets)
+
     for ds in datasets:
-        ds_dir = cfg.DATA_ROOT / ds
-        ann_path = ds_dir / "annotations.csv"
+        try:
+            split = _split_for_dataset(ds)
+        except FileNotFoundError:
+            continue
+        ann_path = cfg.DATA_ROOT / split / "annotations" / f"{ds}.csv"
         if not ann_path.exists():
-            # Some releases name it differently; search for any CSV
-            candidates = list(ds_dir.glob("*.csv"))
-            if not candidates:
-                print(f"Warning: no annotations found for {ds}")
-                continue
-            ann_path = candidates[0]
+            print(f"Warning: no annotations for {ds}: {ann_path}")
+            continue
 
         df = pd.read_csv(ann_path)
         df["dataset"] = ds
+
+        df["start_datetime"] = pd.to_datetime(df["start_datetime"], utc=True)
+        df["end_datetime"]   = pd.to_datetime(df["end_datetime"], utc=True)
+
+        # Match annotations to files via datetime overlap if 'filename' missing
+        if "filename" not in df.columns:
+            ds_files = manifest[manifest["dataset"] == ds].sort_values("start_dt").reset_index(drop=True)
+            filenames = []
+            for _, row in df.iterrows():
+                ann_start = row["start_datetime"]
+                match = ds_files[
+                    (ds_files["start_dt"] <= ann_start) &
+                    (ds_files["end_dt"]   >  ann_start)
+                ]
+                filenames.append(match.iloc[0]["filename"] if len(match) else None)
+            df["filename"] = filenames
+            n_before = len(df)
+            df = df[df["filename"].notna()].reset_index(drop=True)
+            n_dropped = n_before - len(df)
+            if n_dropped > 0:
+                print(f"  {ds}: dropped {n_dropped}/{n_before} annotations with no matching file")
+
         all_rows.append(df)
 
     if not all_rows:
         return pd.DataFrame()
 
     ann = pd.concat(all_rows, ignore_index=True)
-
-    # Parse datetimes
-    ann["start_datetime"] = pd.to_datetime(ann["start_datetime"], utc=True)
-    ann["end_datetime"]   = pd.to_datetime(ann["end_datetime"], utc=True)
-
-    # Add 3-class label for collapsed evaluation
     ann["label_3class"] = ann["annotation"].map(cfg.COLLAPSE_MAP).fillna(ann["annotation"])
-
     return ann
-
-
-def get_file_manifest(datasets: list[str]) -> pd.DataFrame:
-    """
-    Return DataFrame of all audio files: dataset, filename, path, duration_s, start_dt.
-    """
-    rows = []
-    for ds in datasets:
-        audio_dir = cfg.DATA_ROOT / ds / "audio"
-        if not audio_dir.exists():
-            audio_dir = cfg.DATA_ROOT / ds           # some releases omit /audio
-        for wav in sorted(audio_dir.glob("*.wav")):
-            info = sf.info(str(wav))
-            rows.append({
-                "dataset": ds,
-                "filename": wav.name,
-                "path": str(wav),
-                "duration_s": info.duration,
-                "start_dt": _parse_file_start_dt(wav.name),
-            })
-    return pd.DataFrame(rows)
 
 
 # ----------------------------------------------------------------------
@@ -114,7 +163,6 @@ class Segment:
     start_sample: int
     end_sample: int
     file_start_dt: datetime
-    # Annotations intersecting this segment, for target construction
     annotations: list[dict]
     is_positive: bool
 
@@ -129,11 +177,10 @@ def build_positive_segments(
     collar_min_s: float = cfg.COLLAR_MIN_S,
     collar_max_s: float = cfg.COLLAR_MAX_S,
 ) -> list[Segment]:
-    """
-    For each annotated call, create a segment with random collar before/after.
-    Multiple overlapping annotations in the same segment are all included.
-    """
     segments = []
+    if manifest.empty or annotations.empty:
+        return segments
+
     manifest_idx = manifest.set_index(["dataset", "filename"])
 
     for _, row in annotations.iterrows():
@@ -145,11 +192,9 @@ def build_positive_segments(
         if file_start_dt is None:
             continue
 
-        # Call start/end relative to file start (seconds)
         call_start_s = (row["start_datetime"] - file_start_dt).total_seconds()
         call_end_s   = (row["end_datetime"]   - file_start_dt).total_seconds()
 
-        # Reject malformed annotations
         if call_end_s <= call_start_s or call_end_s <= 0:
             continue
         if call_end_s - call_start_s > cfg.MAX_CALL_DURATION_S:
@@ -157,13 +202,11 @@ def build_positive_segments(
         if call_end_s - call_start_s < cfg.MIN_CALL_DURATION_S:
             continue
 
-        # Random collars
         pre  = random.uniform(collar_min_s, collar_max_s)
         post = random.uniform(collar_min_s, collar_max_s)
         seg_start_s = max(0.0, call_start_s - pre)
         seg_end_s   = min(file_row["duration_s"], call_end_s + post)
 
-        # Gather ALL annotations intersecting this segment (for target construction)
         file_anns = annotations[
             (annotations["dataset"] == row["dataset"]) &
             (annotations["filename"] == row["filename"])
@@ -201,29 +244,27 @@ def build_negative_segments(
     min_dur_s: float = 5.0,
     max_dur_s: float = 30.0,
 ) -> list[Segment]:
-    """
-    Sample random negative (no-call) segments from files.
-    Called fresh each epoch (Section 5.5).
-    """
     segments = []
-    # Per-file list of call intervals for overlap check
+    if manifest.empty:
+        return segments
+
     call_intervals: dict[tuple, list[tuple[float, float]]] = {}
-    for _, a in annotations.iterrows():
-        key = (a["dataset"], a["filename"])
-        file_rows = manifest[(manifest["dataset"] == a["dataset"]) &
-                             (manifest["filename"] == a["filename"])]
-        if file_rows.empty:
-            continue
-        fsd = file_rows.iloc[0]["start_dt"]
-        if fsd is None:
-            continue
-        s = (a["start_datetime"] - fsd).total_seconds()
-        e = (a["end_datetime"]   - fsd).total_seconds()
-        call_intervals.setdefault(key, []).append((s, e))
+    if not annotations.empty:
+        for _, a in annotations.iterrows():
+            key = (a["dataset"], a["filename"])
+            file_rows = manifest[(manifest["dataset"] == a["dataset"]) &
+                                 (manifest["filename"] == a["filename"])]
+            if file_rows.empty:
+                continue
+            fsd = file_rows.iloc[0]["start_dt"]
+            if fsd is None:
+                continue
+            s = (a["start_datetime"] - fsd).total_seconds()
+            e = (a["end_datetime"]   - fsd).total_seconds()
+            call_intervals.setdefault(key, []).append((s, e))
 
     files = manifest.to_dict("records")
-    tries = 0
-    max_tries = n_segments * 20
+    tries, max_tries = 0, n_segments * 20
 
     while len(segments) < n_segments and tries < max_tries:
         tries += 1
@@ -236,7 +277,6 @@ def build_negative_segments(
         seg_start_s = random.uniform(0, dur - seg_len)
         seg_end_s   = seg_start_s + seg_len
 
-        # Reject if overlaps any call
         intervals = call_intervals.get(key, [])
         overlap = any(seg_end_s > cs and seg_start_s < ce for cs, ce in intervals)
         if overlap:
@@ -257,7 +297,7 @@ def build_negative_segments(
 
 
 # ----------------------------------------------------------------------
-# Build validation segments (Section 5.1, eval-style but with targets)
+# Build validation segments
 # ----------------------------------------------------------------------
 
 def build_val_segments(
@@ -266,30 +306,29 @@ def build_val_segments(
     segment_s: float = cfg.EVAL_SEGMENT_S,
     overlap_s: float = cfg.EVAL_OVERLAP_S,
 ) -> list[Segment]:
-    """
-    Fixed 30s windows with 2s overlap, but include annotations
-    intersecting each window so we can compute validation loss/metrics.
-    """
     segments = []
+    if manifest.empty:
+        return segments
+
     step_s = segment_s - overlap_s
 
-    # Pre-group annotations by (dataset, filename) for efficiency
     ann_by_file: dict[tuple, list[dict]] = {}
-    for _, a in annotations.iterrows():
-        key = (a["dataset"], a["filename"])
-        file_rows = manifest[(manifest["dataset"] == a["dataset"]) &
-                             (manifest["filename"] == a["filename"])]
-        if file_rows.empty:
-            continue
-        fsd = file_rows.iloc[0]["start_dt"]
-        if fsd is None:
-            continue
-        ann_by_file.setdefault(key, []).append({
-            "start_s": (a["start_datetime"] - fsd).total_seconds(),
-            "end_s":   (a["end_datetime"]   - fsd).total_seconds(),
-            "label":   a["annotation"],
-            "label_3class": a["label_3class"],
-        })
+    if not annotations.empty:
+        for _, a in annotations.iterrows():
+            key = (a["dataset"], a["filename"])
+            file_rows = manifest[(manifest["dataset"] == a["dataset"]) &
+                                 (manifest["filename"] == a["filename"])]
+            if file_rows.empty:
+                continue
+            fsd = file_rows.iloc[0]["start_dt"]
+            if fsd is None:
+                continue
+            ann_by_file.setdefault(key, []).append({
+                "start_s": (a["start_datetime"] - fsd).total_seconds(),
+                "end_s":   (a["end_datetime"]   - fsd).total_seconds(),
+                "label":   a["annotation"],
+                "label_3class": a["label_3class"],
+            })
 
     for _, f in manifest.iterrows():
         key = (f["dataset"], f["filename"])
@@ -321,14 +360,6 @@ def build_val_segments(
 # ----------------------------------------------------------------------
 
 class WhaleDataset(Dataset):
-    """
-    PyTorch Dataset for segments.
-    Returns: (audio, targets, mask, meta)
-      audio:   (T_samples,) waveform
-      targets: (T_frames, n_classes) binary labels at 20ms resolution
-      mask:    (T_frames,) bool — True = valid frame
-      meta:    dict with dataset, filename, start_sample, etc.
-    """
     def __init__(self, segments: list[Segment]):
         self.segments = segments
         self.stride_samp = int(cfg.FRAME_STRIDE_S * cfg.SAMPLE_RATE)
@@ -342,17 +373,12 @@ class WhaleDataset(Dataset):
         seg = self.segments[idx]
         n_samples = seg.end_sample - seg.start_sample
 
-        # Load audio
         audio, sr = sf.read(
-            seg.path,
-            start=seg.start_sample,
-            stop=seg.end_sample,
-            dtype="float32",
+            seg.path, start=seg.start_sample, stop=seg.end_sample, dtype="float32"
         )
         assert sr == cfg.SAMPLE_RATE, f"Expected {cfg.SAMPLE_RATE} Hz, got {sr}"
         audio = torch.from_numpy(audio)
 
-        # Build frame-level targets
         n_frames = n_samples // self.stride_samp
         targets = torch.zeros(n_frames, self.n_classes)
 
@@ -362,11 +388,8 @@ class WhaleDataset(Dataset):
             if label not in self.class_idx:
                 continue
             c = self.class_idx[label]
-
-            # Local start/end in seconds relative to segment start
             local_start_s = max(0.0, a["start_s"] - seg_start_s)
             local_end_s   = min(n_samples / cfg.SAMPLE_RATE, a["end_s"] - seg_start_s)
-
             f0 = int(local_start_s / cfg.FRAME_STRIDE_S)
             f1 = int(local_end_s / cfg.FRAME_STRIDE_S)
             targets[f0:f1, c] = 1.0
@@ -383,7 +406,6 @@ class WhaleDataset(Dataset):
 
 
 def collate_fn(batch):
-    """Pad variable-length segments to batch max (Section 5.1)."""
     audios, targets, masks, metas = zip(*batch)
     max_samp   = max(a.size(0) for a in audios)
     max_frames = max(t.size(0) for t in targets)
@@ -403,14 +425,10 @@ def collate_fn(batch):
 
 
 # ----------------------------------------------------------------------
-# High-level: build the three main dataloaders
+# High-level
 # ----------------------------------------------------------------------
 
 class TrainingDatasetWithResample(WhaleDataset):
-    """
-    Wraps WhaleDataset with the ability to re-sample negatives each epoch
-    (Section 5.5). Call .resample_negatives() at the start of each epoch.
-    """
     def __init__(self, positive_segments, manifest, annotations):
         self.positive_segments = positive_segments
         self.manifest = manifest
@@ -431,6 +449,7 @@ def build_dataloaders():
     print(f"Loading train datasets: {cfg.TRAIN_DATASETS}")
     train_annotations = load_annotations(cfg.TRAIN_DATASETS)
     train_manifest    = get_file_manifest(cfg.TRAIN_DATASETS)
+    print(f"  Found {len(train_manifest)} audio files, {len(train_annotations)} annotations")
 
     pos_segs = build_positive_segments(train_annotations, train_manifest)
     train_ds = TrainingDatasetWithResample(pos_segs, train_manifest, train_annotations)
@@ -445,6 +464,8 @@ def build_dataloaders():
     print(f"Loading val datasets: {cfg.VAL_DATASETS}")
     val_annotations = load_annotations(cfg.VAL_DATASETS)
     val_manifest    = get_file_manifest(cfg.VAL_DATASETS)
+    print(f"  Found {len(val_manifest)} audio files, {len(val_annotations)} annotations")
+
     val_segs = build_val_segments(val_manifest, val_annotations)
     val_ds = WhaleDataset(val_segs)
     print(f"Validation: {len(val_segs)} segments "
