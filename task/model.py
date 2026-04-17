@@ -254,22 +254,15 @@ class WhaleVADLoss(nn.Module):
 
 def compute_class_weights() -> torch.Tensor:
     """
-    Compute per-class weights using the paper's segment-based formula:
-        w_c = N / P_c
-    where N = total number of negative segments (no calls)
-    and  P_c = number of positive segments for class c.
+    Paper Section 5.6: w_c = N / P_c
+    With 1:1 neg:pos undersampling, N ≈ total positives.
     """
-    from dataset import load_annotations, get_file_manifest
+    from dataset import load_annotations
 
     annotations = load_annotations(cfg.TRAIN_DATASETS)
-    manifest = get_file_manifest(cfg.TRAIN_DATASETS)
+    total_pos = len(annotations)
 
-    # "Segments" here = annotation entries (positive) vs. files (as proxy for N)
-    # The paper is ambiguous; we use the approach from their codebase:
-    # count positive annotation segments per class vs. total file count.
     class_names = cfg.class_names()
-    n_total_files = len(manifest)
-
     weights = []
     for c_name in class_names:
         if cfg.USE_3CLASS:
@@ -279,18 +272,15 @@ def compute_class_weights() -> torch.Tensor:
             class_annots = annotations[annotations["annotation"] == c_name]
 
         p_c = max(len(class_annots), 1)
-        n_neg = max(n_total_files - len(class_annots), 1)
-        w = n_neg / p_c
-
-        # Clamp for stability — unbounded N/P_c can be 100+ and cause NaN
-        w = min(w, 15.0)
+        w = total_pos / p_c
+        w = min(w, 50.0)
         weights.append(w)
 
-    weights = torch.tensor(weights, dtype=torch.float32)
-    # Normalize so mean = 1 to keep loss magnitude reasonable
-    weights = weights / weights.mean()
-    print(f"Class weights (N/P_c, normalized): {weights.tolist()}")
-    return weights
+    result = torch.tensor(weights, dtype=torch.float32)
+    print(f"Class weights (w_c = N/P_c):")
+    for name, w in zip(class_names, result.tolist()):
+        print(f"  {name}: {w:.2f}")
+    return result
 
 
 # ----------------------------------------------------------------------
