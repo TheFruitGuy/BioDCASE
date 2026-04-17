@@ -1,335 +1,215 @@
 """
-Contrastive self-supervised pretraining for Whale-Conformer.
+Optional SSL extension: SimCLR contrastive pretraining on unlabeled audio.
 
-SimCLR-style: two augmented views of the same audio → encoder → projection head
-→ NT-Xent loss pulls positive pairs together, pushes negatives apart.
+    python pretrain_contrastive.py
 
-The encoder learns representations of Antarctic underwater soundscapes
-(whale calls, ice noise, ship noise, ocean background) without any labels.
+Trains the Whale-VAD encoder (filterbank + feature extractor + bottleneck +
+aggregation) on unlabeled audio using NT-Xent. Saves weights that can be
+loaded by train.py via --pretrained.
 
-After pretraining:
-  - Discard projection head
-  - Attach classification head
-  - Fine-tune on labeled ATBFL data
-
-Usage:
-    CUDA_VISIBLE_DEVICES=8 python pretrain_contrastive.py
+Everything about the feature extractor architecture is identical to the
+supervised model, so weights transfer cleanly.
 """
 
-import os
 import random
 import time
 from pathlib import Path
 
 import numpy as np
+import soundfile as sf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import Dataset, DataLoader
-from torch.amp import GradScaler, autocast
 from tqdm import tqdm
-import soundfile as sf
 
 import config as cfg
-from model import WhaleConformer
-from augmentations import AudioAugmentor
+from spectrogram import SpectrogramExtractor
+from model import WhaleVAD
 
 
-# ---------------------------------------------------------------------------
-# Config — edit these for pretraining
-# ---------------------------------------------------------------------------
-
-PRETRAIN_DATA_DIR   = Path("./data_unlabeled")
-PRETRAIN_OUTPUT_DIR = Path("./runs/pretrain")
+# ----------------------------------------------------------------------
+# Pretraining config — separate from supervised config
+# ----------------------------------------------------------------------
 
 PRETRAIN_EPOCHS     = 30
-PRETRAIN_BATCH_SIZE = 36       # larger batches = more negatives = better contrastive learning
-ACCUMULATION_STEPS  = 8         # effective batch = 16 × 4 = 64
+PRETRAIN_BATCH_SIZE = 16
+ACCUMULATION_STEPS  = 4                    # effective batch = 64
 PRETRAIN_LR         = 1e-3
 PRETRAIN_WARMUP     = 3
-SEGMENT_LENGTH_S    = 30.0     # segment length in seconds
-TEMPERATURE         = 0.07     # NT-Xent temperature (lower = harder negatives)
-PROJ_DIM            = 128      # projection head output dimension
+SEGMENT_LENGTH_S    = 30.0
+TEMPERATURE         = 0.07
+PROJ_DIM            = 128
 PRETRAIN_WORKERS    = 16
+PRETRAIN_OUTPUT_DIR = Path("./runs/pretrain")
 
 
-# ---------------------------------------------------------------------------
-# Unlabeled dataset — random segments from raw WAV files
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Waveform augmentations for contrastive views
+# ----------------------------------------------------------------------
+
+class AudioAugmentor:
+    def __init__(self, sample_rate: int = 250):
+        self.sr = sample_rate
+
+    def __call__(self, audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._aug(audio.clone()), self._aug(audio.clone())
+
+    def _aug(self, x: torch.Tensor) -> torch.Tensor:
+        # Time shift (circular)
+        if random.random() < 0.5:
+            shift = random.randint(-5 * self.sr, 5 * self.sr)
+            x = torch.roll(x, shifts=shift, dims=0)
+        # Additive noise
+        if random.random() < 0.5:
+            snr_db = random.uniform(5, 30)
+            sig_p = x.pow(2).mean()
+            n_p = sig_p / (10 ** (snr_db / 10) + 1e-8)
+            x = x + torch.randn_like(x) * n_p.sqrt()
+        # Gain
+        if random.random() < 0.8:
+            g = random.uniform(-6, 6)
+            x = x * (10 ** (g / 20))
+        return x
+
+
+# ----------------------------------------------------------------------
+# Unlabeled dataset: random 30s segments from unlabeled WAV files
+# ----------------------------------------------------------------------
 
 class UnlabeledAudioDataset(Dataset):
-    """
-    Loads random segments from unlabeled WAV files.
-    Each __getitem__ returns two augmented views of the same segment.
-    """
-    def __init__(
-        self,
-        data_dir: str | Path,
-        segment_length_s: float = SEGMENT_LENGTH_S,
-        sample_rate: int = cfg.SAMPLE_RATE,
-        augmentor: AudioAugmentor | None = None,
-    ):
+    def __init__(self, data_dir: Path, segment_length_s: float = SEGMENT_LENGTH_S):
         self.data_dir = Path(data_dir)
-        self.segment_samples = int(segment_length_s * sample_rate)
-        self.sample_rate = sample_rate
-        self.augmentor = augmentor or AudioAugmentor(sample_rate=sample_rate)
+        self.seg_samples = int(segment_length_s * cfg.SAMPLE_RATE)
+        self.augmentor = AudioAugmentor(sample_rate=cfg.SAMPLE_RATE)
 
-        # Build file list with durations
         self.files = []
-        for wf in sorted(self.data_dir.rglob("*.wav")):
+        for wf in sorted(self.data_dir.glob("*.wav")):
             try:
                 info = sf.info(str(wf))
                 if info.duration >= segment_length_s:
                     self.files.append({
                         "path": str(wf),
-                        "duration_s": info.duration,
-                        "n_samples": int(info.duration * sample_rate),
+                        "n_samples": int(info.duration * cfg.SAMPLE_RATE),
                     })
-            except Exception as e:
-                print(f"Warning: skipping {wf.name}: {e}")
+            except Exception:
+                continue
+        print(f"UnlabeledAudioDataset: {len(self.files)} files")
 
-        print(f"UnlabeledAudioDataset: {len(self.files)} files, "
-              f"{sum(f['duration_s'] for f in self.files)/3600:.0f} hours")
-
-    def __len__(self) -> int:
-        # Each file can yield multiple segments; use file count × segments_per_file
-        # But for simplicity, just return file count — random offset gives variety
+    def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
         f = self.files[idx]
-
-        # Two DIFFERENT random positions from the same file
-        max_start = f["n_samples"] - self.segment_samples
-        start1 = random.randint(0, max(0, max_start))
-        start2 = random.randint(0, max(0, max_start))
-
-        audio1, _ = sf.read(f["path"], start=start1,
-                            stop=start1 + self.segment_samples, dtype="float32")
-        audio2, _ = sf.read(f["path"], start=start2,
-                            stop=start2 + self.segment_samples, dtype="float32")
-
-        audio1 = torch.from_numpy(audio1 - audio1.mean())
-        audio2 = torch.from_numpy(audio2 - audio2.mean())
-
-        # Still apply augmentations on top
-        view1 = self.augmentor._augment_waveform(audio1)
-        view2 = self.augmentor._augment_waveform(audio2)
-
-        return view1, view2
+        start = random.randint(0, max(0, f["n_samples"] - self.seg_samples))
+        audio, sr = sf.read(f["path"], start=start,
+                            stop=start + self.seg_samples, dtype="float32")
+        assert sr == cfg.SAMPLE_RATE
+        audio = torch.from_numpy(audio - audio.mean())
+        return self.augmentor(audio)
 
 
-def collate_contrastive(batch):
-    """Collate pairs of views into two batched tensors."""
-    views1, views2 = zip(*batch)
-    return torch.stack(views1), torch.stack(views2)
+def collate(batch):
+    v1, v2 = zip(*batch)
+    return torch.stack(v1), torch.stack(v2)
 
 
-# ---------------------------------------------------------------------------
-# Projection head — maps encoder output to contrastive embedding space
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Contrastive model: supervised encoder + projection head
+# ----------------------------------------------------------------------
 
-class ProjectionHead(nn.Module):
+class ContrastiveEncoder(nn.Module):
     """
-    MLP projection head: encoder features → contrastive embedding.
-    
-    Following SimCLR, using a 2-layer MLP with ReLU.
-    This head is discarded after pretraining.
+    Wraps the Whale-VAD feature extractor (everything up to LSTM) plus
+    a projection head for SimCLR. After pretraining we save just the
+    encoder weights.
     """
-    def __init__(self, input_dim: int, hidden_dim: int = 512, output_dim: int = PROJ_DIM):
+    def __init__(self):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+        self.spec_extractor = SpectrogramExtractor()
+        # Full WhaleVAD model — we use its spec → residual stack path
+        self.backbone = WhaleVAD(num_classes=cfg.n_classes())
+
+        # Projection: pooled encoder features → contrastive space
+        # We pool the per-frame features (before LSTM) → 64-dim vector,
+        # then project to PROJ_DIM
+        self.projection = nn.Sequential(
+            nn.Linear(cfg.PROJECTION_DIM, 512),
+            nn.BatchNorm1d(512),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden_dim, output_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: (B, D) — pooled encoder output
-        return self.net(x)
-
-
-# ---------------------------------------------------------------------------
-# NT-Xent loss (Normalized Temperature-scaled Cross-Entropy)
-# ---------------------------------------------------------------------------
-
-class NTXentLoss(nn.Module):
-    """
-    SimCLR contrastive loss.
-    
-    For a batch of N pairs (2N total views):
-    - Each view i has exactly 1 positive (its augmented partner)
-    - And 2(N-1) negatives (all other views in the batch)
-    
-    Larger batch size = more negatives = better representations.
-    """
-    def __init__(self, temperature: float = TEMPERATURE):
-        super().__init__()
-        self.temperature = temperature
-
-    def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z1, z2: (B, D) L2-normalized embeddings from two views
-        Returns:
-            scalar loss
-        """
-        B = z1.size(0)
-        device = z1.device
-
-        # Concatenate: [z1_0, z1_1, ..., z1_B, z2_0, z2_1, ..., z2_B]
-        z = torch.cat([z1, z2], dim=0)  # (2B, D)
-
-        # Similarity matrix
-        sim = torch.mm(z, z.t()) / self.temperature  # (2B, 2B)
-
-        # Mask out self-similarity (diagonal)
-        mask_self = torch.eye(2 * B, dtype=torch.bool, device=device)
-        sim = sim.masked_fill(mask_self, -1e9)
-
-        # Positive pairs: (i, i+B) and (i+B, i)
-        pos_indices = torch.arange(2 * B, device=device)
-        pos_indices[:B] += B     # first half → second half
-        pos_indices[B:] -= B     # second half → first half
-
-        # NT-Xent: cross-entropy where the positive pair is the "correct class"
-        loss = F.cross_entropy(sim, pos_indices)
-
-        return loss
-
-
-# ---------------------------------------------------------------------------
-# Contrastive model wrapper
-# ---------------------------------------------------------------------------
-
-class ContrastiveModel(nn.Module):
-    """
-    Wraps the Conformer encoder + projection head for contrastive pretraining.
-    
-    encoder: Conformer (frontend + positional encoding + conformer blocks)
-    projection_head: MLP that maps pooled features → contrastive space
-    """
-    def __init__(self, encoder: WhaleConformer, proj_dim: int = PROJ_DIM):
-        super().__init__()
-        self.encoder = encoder
-        # Average-pool the temporal dimension, then project
-        self.projection_head = ProjectionHead(
-            input_dim=cfg.D_MODEL,
-            output_dim=proj_dim,
+            nn.Linear(512, PROJ_DIM),
         )
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            audio: (B, T_samples) raw waveform
-        Returns:
-            z: (B, proj_dim) L2-normalized embedding
-        """
-        # Get per-frame features from encoder (skip the classification head)
-        x = self.encoder.frontend(audio)       # (B, T, d_model)
-        x = self.encoder.pos_enc(x)
-        for block in self.encoder.conformer_blocks:
-            x = block(x)
-        # (B, T_frames, d_model)
+        spec = self.spec_extractor(audio)
+        # Go through encoder up to the projection layer (not the LSTM)
+        x = self.backbone.filterbank(spec)
+        x = self.backbone.feat_extractor(x)
+        x = self.backbone.residual_stack(x)
 
-        # Global average pooling over time
-        h = x.mean(dim=1)  # (B, d_model)
+        B, C, F, T = x.shape
+        x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
+        self.backbone._init_projection(C * F, x.device)
+        x = self.backbone.feat_proj(x)                # (B, T, 64)
 
+        # Global average pool time → (B, 64)
+        h = x.mean(dim=1)
         # Project to contrastive space
-        z = self.projection_head(h)  # (B, proj_dim)
-
-        # L2 normalize
-        z = F.normalize(z, dim=1)
-
-        return z
+        z = self.projection(h)
+        return F.normalize(z, dim=1)
 
 
-# ---------------------------------------------------------------------------
-# Training
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# NT-Xent loss (SimCLR)
+# ----------------------------------------------------------------------
 
-def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch):
-    model.train()
-    total_loss = 0.0
-    n = 0
+class NTXentLoss(nn.Module):
+    def __init__(self, temperature: float = TEMPERATURE):
+        super().__init__()
+        self.tau = temperature
 
-    pbar = tqdm(loader, desc=f"Pretrain {epoch}/{PRETRAIN_EPOCHS}", leave=False)
-    optimizer.zero_grad()
+    def forward(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+        B = z1.size(0)
+        device = z1.device
+        z = torch.cat([z1, z2], dim=0)                # (2B, D)
+        sim = torch.mm(z, z.t()) / self.tau           # (2B, 2B)
+        mask_self = torch.eye(2 * B, dtype=torch.bool, device=device)
+        sim = sim.masked_fill(mask_self, -1e9)
 
-    for step, (view1, view2) in enumerate(pbar):
-        view1 = view1.to(device, non_blocking=True)
-        view2 = view2.to(device, non_blocking=True)
+        pos = torch.arange(2 * B, device=device)
+        pos[:B] += B
+        pos[B:] -= B
+        return F.cross_entropy(sim, pos)
 
-        with autocast("cuda", dtype=torch.bfloat16):
-            z1 = model(view1)
-            z2 = model(view2)
-            loss = criterion(z1, z2) / ACCUMULATION_STEPS
 
-        if torch.isnan(loss) or torch.isinf(loss):
-            print(f"  *** NaN detected, skipping batch ***")
-            continue
-
-        scaler.scale(loss).backward()
-
-        if (step + 1) % ACCUMULATION_STEPS == 0:
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
-
-        total_loss += loss.item() * ACCUMULATION_STEPS
-        n += 1
-        pbar.set_postfix(loss=f"{loss.item() * ACCUMULATION_STEPS:.4f}")
-
-    return total_loss / max(n, 1)
-
+# ----------------------------------------------------------------------
+# Diagnostics: alignment & uniformity
+# ----------------------------------------------------------------------
 
 @torch.no_grad()
-def compute_alignment_uniformity(model, loader, device, n_batches=20):
-    """
-    Diagnostic metrics for contrastive learning quality:
-    
-    Alignment: how close positive pairs are (lower = better)
-    Uniformity: how uniformly distributed embeddings are on hypersphere (lower = better)
-    
-    Good pretraining: alignment decreases, uniformity stays stable or decreases.
-    Collapse: both go to 0 (everything maps to same point).
-    """
+def alignment_uniformity(model, loader, device, n_batches=20):
     model.eval()
-    all_z1, all_z2 = [], []
-
+    all1, all2 = [], []
     for i, (v1, v2) in enumerate(loader):
         if i >= n_batches:
             break
-        z1 = model(v1.to(device))
-        z2 = model(v2.to(device))
-        all_z1.append(z1.cpu())
-        all_z2.append(z2.cpu())
-
-    z1 = torch.cat(all_z1)
-    z2 = torch.cat(all_z2)
-
-    # Alignment: mean squared distance between positive pairs
-    alignment = (z1 - z2).pow(2).sum(dim=1).mean().item()
-
-    # Uniformity: log of average pairwise Gaussian potential
+        all1.append(model(v1.to(device)).cpu())
+        all2.append(model(v2.to(device)).cpu())
+    z1 = torch.cat(all1); z2 = torch.cat(all2)
+    align = (z1 - z2).pow(2).sum(dim=1).mean().item()
     z = torch.cat([z1, z2])
-    sq_pdist = torch.cdist(z, z).pow(2)
-    # Exclude diagonal
+    pdist = torch.cdist(z, z).pow(2)
     n = z.size(0)
     mask = ~torch.eye(n, dtype=torch.bool)
-    uniformity = torch.log(torch.exp(-2 * sq_pdist[mask]).mean()).item()
+    unif = torch.log(torch.exp(-2 * pdist[mask]).mean()).item()
+    return align, unif
 
-    return alignment, uniformity
 
-
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Main
-# ---------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 def main():
     random.seed(cfg.SEED)
@@ -344,108 +224,87 @@ def main():
     run_dir = PRETRAIN_OUTPUT_DIR / f"contrastive_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # --- data ---
-    augmentor = AudioAugmentor(sample_rate=cfg.SAMPLE_RATE)
-    dataset = UnlabeledAudioDataset(
-        PRETRAIN_DATA_DIR,
-        segment_length_s=SEGMENT_LENGTH_S,
-        augmentor=augmentor,
-    )
+    dataset = UnlabeledAudioDataset(cfg.UNLABELED_DATA_DIR)
     loader = DataLoader(
-        dataset,
-        batch_size=PRETRAIN_BATCH_SIZE,
-        shuffle=True,
-        num_workers=PRETRAIN_WORKERS,
-        collate_fn=collate_contrastive,
-        pin_memory=True,
-        drop_last=True,  # important for contrastive: need consistent batch size
+        dataset, batch_size=PRETRAIN_BATCH_SIZE, shuffle=True,
+        num_workers=PRETRAIN_WORKERS, collate_fn=collate,
+        pin_memory=True, drop_last=True,
     )
-    print(f"Batches per epoch: {len(loader)}")
+    print(f"Batches/epoch: {len(loader)}")
 
-    # --- model ---
-    # Create the Conformer encoder (same architecture as supervised)
-    encoder = WhaleConformer(
-        n_classes=cfg.n_classes(), d_model=cfg.D_MODEL, n_heads=cfg.N_HEADS,
-        d_ff=cfg.D_FF, n_layers=cfg.N_LAYERS, conv_kernel_size=cfg.CONV_KERNEL,
-        dropout=cfg.DROPOUT, n_fft=cfg.N_FFT, hop_length=cfg.HOP_LENGTH,
-        win_length=cfg.WIN_LENGTH, sample_rate=cfg.SAMPLE_RATE,
-    )
+    model = ContrastiveEncoder().to(device)
 
-    model = ContrastiveModel(encoder, proj_dim=PROJ_DIM).to(device)
+    # Warm up lazy projection
+    with torch.no_grad():
+        dummy = torch.randn(2, cfg.SAMPLE_RATE * 30, device=device)
+        model(dummy)
 
-    if torch.cuda.device_count() > 1:
-        print(f"Pretraining across {torch.cuda.device_count()} GPUs!")
-        model = nn.DataParallel(model)
+    n = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Parameters: {n:,}")
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Parameters: {n_params:,}")
-
-    # --- loss + optimizer ---
-    criterion = NTXentLoss(temperature=TEMPERATURE)
+    criterion = NTXentLoss()
     optimizer = AdamW(model.parameters(), lr=PRETRAIN_LR, weight_decay=0.01)
-
     warmup = LinearLR(optimizer, start_factor=0.01, total_iters=PRETRAIN_WARMUP)
     cosine = CosineAnnealingLR(optimizer, T_max=PRETRAIN_EPOCHS - PRETRAIN_WARMUP)
     scheduler = SequentialLR(optimizer, [warmup, cosine],
                              milestones=[PRETRAIN_WARMUP])
 
-    scaler = GradScaler("cuda")
-
-    # --- training loop ---
     best_loss = float("inf")
 
     for epoch in range(1, PRETRAIN_EPOCHS + 1):
-        print(f"\n{'='*60}\nPretrain Epoch {epoch}/{PRETRAIN_EPOCHS}\n{'='*60}")
+        print(f"\n{'='*60}\nPretrain {epoch}/{PRETRAIN_EPOCHS}\n{'='*60}")
 
-        loss = train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch)
+        model.train()
+        total_loss, n_steps = 0.0, 0
+        optimizer.zero_grad()
+
+        pbar = tqdm(loader, desc=f"Pretrain {epoch}", leave=False)
+        for step, (v1, v2) in enumerate(pbar):
+            v1 = v1.to(device, non_blocking=True)
+            v2 = v2.to(device, non_blocking=True)
+
+            z1 = model(v1); z2 = model(v2)
+            loss = criterion(z1, z2) / ACCUMULATION_STEPS
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
+
+            loss.backward()
+
+            if (step + 1) % ACCUMULATION_STEPS == 0:
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                optimizer.step()
+                optimizer.zero_grad()
+
+            total_loss += loss.item() * ACCUMULATION_STEPS
+            n_steps += 1
+            pbar.set_postfix(loss=f"{loss.item() * ACCUMULATION_STEPS:.4f}")
+
         scheduler.step()
 
-        # Diagnostics
-        alignment, uniformity = compute_alignment_uniformity(model, loader, device)
-        print(f"  Loss: {loss:.4f}  |  Alignment: {alignment:.4f}  |  "
-              f"Uniformity: {uniformity:.4f}")
-        print(f"  LR: {optimizer.param_groups[0]['lr']:.6f}")
+        avg_loss = total_loss / max(n_steps, 1)
+        align, unif = alignment_uniformity(model, loader, device)
+        print(f"  Loss: {avg_loss:.4f} | Align: {align:.4f} | Unif: {unif:.4f}")
+        print(f"  LR:   {optimizer.param_groups[0]['lr']:.6f}")
 
-        # Save best encoder weights (without projection head)
-        if loss < best_loss:
-            best_loss = loss
-
-            full_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-
-            encoder_state = {}
-            for k, v in full_state.items():
-                if k.startswith("encoder."):
-                    encoder_state[k[len("encoder."):]] = v
-
+        if avg_loss < best_loss:
+            best_loss = avg_loss
+            # Save just the backbone (WhaleVAD encoder) weights — these
+            # load directly into train.py's model via load_state_dict
+            encoder_state = {
+                k: v for k, v in model.backbone.state_dict().items()
+            }
             torch.save({
                 "epoch": epoch,
                 "encoder_state_dict": encoder_state,
-                "full_model_state_dict": full_state,
-                "optimizer_state_dict": optimizer.state_dict(),
-                "loss": loss,
-                "alignment": alignment,
-                "uniformity": uniformity,
+                "loss": avg_loss,
+                "alignment": align,
+                "uniformity": unif,
             }, run_dir / "best_pretrained.pt")
-            print(f"  *** New best loss: {best_loss:.4f} — saved ***")
+            print(f"  *** New best: {best_loss:.4f} saved")
 
-            # Also save latest
-        full_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-        encoder_state = {}
-        for k, v in full_state.items():
-            if k.startswith("encoder."):
-                encoder_state[k[len("encoder."):]] = v
-
-        torch.save({
-            "epoch": epoch,
-            "encoder_state_dict": encoder_state,
-            "loss": loss,
-        }, run_dir / "latest_pretrained.pt")
-
-    print(f"\nPretraining done. Best loss: {best_loss:.4f}")
-    print(f"Encoder weights saved to: {run_dir / 'best_pretrained.pt'}")
-    print(f"\nTo fine-tune, load with:")
-    print(f"  ckpt = torch.load('{run_dir}/best_pretrained.pt')")
-    print(f"  model.load_state_dict(ckpt['encoder_state_dict'], strict=False)")
+    print(f"\nDone. Best loss: {best_loss:.4f}")
+    print(f"To use: python train.py --pretrained {run_dir}/best_pretrained.pt --freeze_epochs 5")
 
 
 if __name__ == "__main__":

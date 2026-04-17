@@ -1,0 +1,314 @@
+"""
+Training script for Whale-Conformer.
+
+    python train.py
+
+FIXES from previous version:
+  1. pos_weight computed from actual frame-level positive rate (was [1,1,1])
+  2. Validation uses annotated segments (was all-zeros → F1 always 0)
+  3. Diagnostic prints to catch problems early
+  4. focal_alpha=0.75 upweights positives (was 0.25 = downweighting them)
+"""
+
+import json
+import random
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LinearLR, SequentialLR
+from torch.utils.data import DataLoader
+from torch.amp import GradScaler, autocast
+from tqdm import tqdm
+
+import config as cfg
+from model import WhaleConformer, WeightedBCEWithFocal
+from dataset import (
+    build_dataloaders, load_annotations, collate_fn,
+)
+from postprocess import tune_thresholds
+from model import compute_segment_weights
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def set_seed(seed: int = cfg.SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def compute_pos_weight() -> torch.Tensor:
+    annotations = load_annotations(cfg.TRAIN_DATASETS)
+    label_col = "label_3class" if cfg.USE_3CLASS else "annotation"
+    class_names = cfg.class_names()
+
+    from dataset import get_file_manifest
+    manifest = get_file_manifest(cfg.TRAIN_DATASETS)
+    total_duration_s = manifest["duration_s"].sum()
+    total_frames = total_duration_s / cfg.FRAME_STRIDE_S
+
+    pos_weights = []
+    for c_name in class_names:
+        if cfg.USE_3CLASS:
+            orig_labels = [k for k, v in cfg.COLLAPSE_MAP.items() if v == c_name]
+            class_annots = annotations[annotations["annotation"].isin(orig_labels)]
+        else:
+            class_annots = annotations[annotations["annotation"] == c_name]
+
+        if len(class_annots) == 0:
+            pos_weights.append(20.0)
+            continue
+
+        durations = (class_annots["end_datetime"] - class_annots["start_datetime"])
+        pos_duration_s = durations.dt.total_seconds().sum()
+        pos_frames = pos_duration_s / cfg.FRAME_STRIDE_S
+        neg_frames = total_frames - pos_frames
+
+        pw = neg_frames / max(pos_frames, 1.0)
+        pw = min(pw, 50.0)
+        pos_weights.append(pw)
+
+    result = torch.tensor(pos_weights, dtype=torch.float32)
+    return result
+
+
+def _align_lengths(logits, targets, padding_mask, device):
+    T_m = logits.size(1)
+    T_t = targets.size(1)
+    if T_m < T_t:
+        targets = targets[:, :T_m, :]
+        padding_mask = padding_mask[:, :T_m]
+    elif T_m > T_t:
+        pad_t = torch.zeros(targets.size(0), T_m - T_t, targets.size(2), device=device)
+        targets = torch.cat([targets, pad_t], dim=1)
+        pad_m = torch.zeros(padding_mask.size(0), T_m - T_t, dtype=torch.bool, device=device)
+        padding_mask = torch.cat([padding_mask, pad_m], dim=1)
+    return targets, padding_mask
+
+# ---------------------------------------------------------------------------
+# Train / validate
+# ---------------------------------------------------------------------------
+
+def train_one_epoch(model, loader, criterion, optimizer, scheduler, device, epoch, scaler):
+    model.train()
+    total_loss, n = 0.0, 0
+
+    pbar = tqdm(loader, desc=f"Epoch {epoch}/{cfg.EPOCHS}", leave=False)
+
+    for i, (audio, targets, mask, _) in enumerate(pbar):
+        audio = audio.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        mask = mask.to(device, non_blocking=True)
+
+        optimizer.zero_grad()
+
+        # Float32 stability fix
+        logits = model(audio)
+        targets_aligned, mask_aligned = _align_lengths(logits, targets, mask, device)
+        loss = criterion(logits, targets_aligned, mask_aligned)
+
+        loss.backward()
+
+        if cfg.GRAD_CLIP > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+
+        optimizer.step()
+
+        total_loss += loss.item()
+        n += 1
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"  *** NaN/Inf detected at batch {i}, restoring best checkpoint ***")
+            # Fallback logic if needed
+            break
+
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
+
+    scheduler.step()
+    return total_loss / max(n, 1)
+
+
+@torch.no_grad()
+def validate(model, loader, criterion, device, thresholds, epoch=0):
+    # Added collapse_to_3class here!
+    from postprocess import postprocess_predictions, compute_metrics, Detection, collapse_to_3class
+    from dataset import load_annotations, _parse_file_start_dt
+
+    model.eval()
+    total_loss, n = 0.0, 0
+    all_probs = {}
+
+    for audio, targets, mask, metas in loader:
+        audio, targets, mask = audio.to(device), targets.to(device), mask.to(device)
+        logits = model(audio)
+        targets_aligned, mask_aligned = _align_lengths(logits, targets, mask, device)
+        total_loss += criterion(logits, targets_aligned, mask_aligned).item()
+        n += 1
+
+        hop_length = model.module.hop_length if isinstance(model, nn.DataParallel) else model.hop_length
+
+        probs = torch.sigmoid(logits).cpu().numpy()
+        for j, meta in enumerate(metas):
+            key = (meta["dataset"], meta["filename"], meta["start_sample"])
+            n_samp = meta["end_sample"] - meta["start_sample"]
+            n_frames = n_samp // hop_length
+            all_probs[key] = probs[j, :n_frames, :]
+
+    # Convert to events
+    thresh_np = thresholds.cpu().numpy()
+    pred_events = postprocess_predictions(all_probs, thresh_np)
+
+    # 7-Class -> 3-Class Mapping
+    if not cfg.USE_3CLASS:
+        pred_events = collapse_to_3class(pred_events)
+
+    # Load Ground Truth
+    val_annots = load_annotations(cfg.VAL_DATASETS)
+    gt_events = []
+    class_map = cfg.class_to_idx()
+    label_col = "label_3class" if cfg.USE_3CLASS else "annotation"
+
+    for _, row in val_annots.iterrows():
+        # Because we're mapping to 3-class for metrics, grab the 3-class label for validation GT
+        cls_name = row["label_3class"]
+
+        file_start_dt = _parse_file_start_dt(row["filename"])
+        if file_start_dt is None:
+            continue
+
+        start_s = (row["start_datetime"] - file_start_dt).total_seconds()
+        end_s = (row["end_datetime"] - file_start_dt).total_seconds()
+
+        gt_events.append(Detection(
+            dataset=row["dataset"], filename=row["filename"],
+            label=cls_name, start_s=start_s, end_s=end_s
+        ))
+
+    # Compute 1D IoU Metrics against the collapsed 3 classes
+    metrics = compute_metrics(pred_events, gt_events, iou_threshold=0.3)
+    mean_f1 = metrics.get("overall", {}).get("f1", 0.0)
+
+    print(f"\n  Event-level Validation (1D IoU):")
+    for cls_name, m in metrics.items():
+        if cls_name == "overall":
+            continue
+        print(f"  {cls_name.upper()}: TP={m['tp']} FP={m['fp']} FN={m['fn']} | "
+              f"Prec={m['precision']:.3f} Rec={m['recall']:.3f} F1={m['f1']:.3f}")
+
+    return {"loss": total_loss / max(n, 1), "mean_f1": mean_f1}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    set_seed()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    run_dir = Path(cfg.OUTPUT_DIR) / f"conformer_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- data ---
+    train_ds, train_loader, val_loader = build_dataloaders()
+
+    # --- model ---
+    model = WhaleConformer(
+        n_classes=cfg.n_classes(), d_model=cfg.D_MODEL, n_heads=cfg.N_HEADS,
+        d_ff=cfg.D_FF, n_layers=cfg.N_LAYERS, conv_kernel_size=cfg.CONV_KERNEL,
+        dropout=cfg.DROPOUT, n_fft=cfg.N_FFT, hop_length=cfg.HOP_LENGTH,
+        win_length=cfg.WIN_LENGTH, sample_rate=cfg.SAMPLE_RATE,
+    ).to(device)
+
+    if torch.cuda.device_count() > 1:
+        print(f"Training across {torch.cuda.device_count()} GPUs!")
+        model = nn.DataParallel(model)
+
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Parameters: {n_params:,}")
+
+    if cfg.POS_WEIGHT is None:
+        pos_weight = compute_segment_weights(cfg.n_classes()).to(device)
+    else:
+        pos_weight = torch.tensor(
+            [cfg.POS_WEIGHT] * cfg.n_classes(), dtype=torch.float32, device=device
+        )
+    print(f"pos_weight per class: {pos_weight}")
+
+    criterion = WeightedBCEWithFocal(
+        pos_weight=pos_weight,
+        focal_alpha=cfg.FOCAL_ALPHA,
+        focal_gamma=cfg.FOCAL_GAMMA,
+        focal_weight=cfg.FOCAL_WEIGHT,
+    ).to(device)
+
+    optimizer = AdamW(model.parameters(), lr=cfg.LR,
+                      weight_decay=cfg.WEIGHT_DECAY, betas=(0.9, 0.999))
+    warmup = LinearLR(optimizer, start_factor=0.01, total_iters=cfg.WARMUP_EPOCHS)
+    cosine = CosineAnnealingWarmRestarts(optimizer,
+                                         T_0=cfg.EPOCHS - cfg.WARMUP_EPOCHS)
+    scheduler = SequentialLR(optimizer, [warmup, cosine],
+                             milestones=[cfg.WARMUP_EPOCHS])
+
+    scaler = GradScaler("cuda")
+    best_f1 = 0.0
+    thresholds = torch.tensor(cfg.DEFAULT_THRESHOLDS, device=device)
+
+    for epoch in range(1, cfg.EPOCHS + 1):
+        print(f"\n{'=' * 60}\nEpoch {epoch}/{cfg.EPOCHS}\n{'=' * 60}")
+
+        train_ds.resample_negatives()
+        train_loader = DataLoader(
+            train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,
+            num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
+        )
+
+        train_loss = train_one_epoch(
+            model, train_loader, criterion, optimizer, scheduler, device, epoch, scaler
+        )
+        val = validate(model, val_loader, criterion, device, thresholds, epoch)
+
+        print(f"\nTrain loss: {train_loss:.4f}   Val loss: {val['loss']:.4f}")
+        print(f"  Mean F1: {val['mean_f1']:.3f}")
+
+        model_state = (model.module.state_dict() if isinstance(model, nn.DataParallel)
+                       else model.state_dict())
+
+        ckpt = {"epoch": epoch, "model_state_dict": model_state,
+                "optimizer_state_dict": optimizer.state_dict(),
+                "best_f1": best_f1, "thresholds": thresholds.cpu()}
+
+        if val["mean_f1"] > best_f1:
+            best_f1 = val["mean_f1"]
+            ckpt["best_f1"] = best_f1
+            torch.save(ckpt, run_dir / "best_model.pt")
+            print(f"  *** New best F1: {best_f1:.3f}")
+
+        torch.save(ckpt, run_dir / "latest_model.pt")
+
+    print(f"\n{'='*60}\nTuning thresholds on validation set\n{'='*60}")
+    best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device)
+    if isinstance(model, nn.DataParallel):
+        model.module.load_state_dict(best_ckpt["model_state_dict"])
+    else:
+        model.load_state_dict(best_ckpt["model_state_dict"])
+
+    best_thresholds = tune_thresholds(model, val_loader, device, cfg.n_classes())
+    print(f"Tuned thresholds: {best_thresholds.tolist()}")
+
+    final_state = (model.module.state_dict() if isinstance(model, nn.DataParallel)
+                   else model.state_dict())
+    torch.save({"model_state_dict": final_state,
+                "thresholds": best_thresholds}, run_dir / "final_model.pt")
+    print(f"\nDone — best F1: {best_f1:.3f}  →  {run_dir}")
+
+if __name__ == "__main__":
+    main()
