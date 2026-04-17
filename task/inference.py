@@ -36,8 +36,8 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     ckpt = torch.load(args.checkpoint, map_location=device)
-    thresholds = ckpt["thresholds"].numpy() if torch.is_tensor(ckpt["thresholds"]) \
-                 else np.array(ckpt["thresholds"])
+    thresholds = ckpt["thresholds"].cpu().numpy() if torch.is_tensor(ckpt["thresholds"]) \
+        else np.array(ckpt["thresholds"])
 
     spec_extractor = SpectrogramExtractor().to(device)
     model = WhaleVAD(num_classes=cfg.n_classes()).to(device)

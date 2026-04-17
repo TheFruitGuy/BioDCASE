@@ -305,6 +305,14 @@ def main():
     )
     print(f"Tuned thresholds: {tuned.tolist()}")
 
+    # After tune_thresholds_event_level:
+    print("\n=== Final evaluation with tuned thresholds ===")
+    val = validate(
+        model_to_load, spec_extractor, val_loader, criterion, device,
+        torch.tensor(tuned, device=device), val_annotations, file_start_dts,
+    )
+    print(f"TUNED overall F1: {val['mean_f1']:.3f}")
+
     # Save final with tuned thresholds
     final_state = model_to_load.state_dict()
     torch.save({
