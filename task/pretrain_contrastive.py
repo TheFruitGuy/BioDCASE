@@ -151,7 +151,7 @@ class ContrastiveEncoder(nn.Module):
 
         B, C, Fr, T = x.shape
         x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * Fr)
-        self.backbone._init_projection(C * F, x.device)
+        self.backbone._init_projection(C * Fr, x.device)
         x = self.backbone.feat_proj(x)                # (B, T, 64)
 
         # Global average pool time → (B, 64)
