@@ -158,7 +158,7 @@ GRAD_CLIP     = 1.0
 # Paper uses BOTH weighted BCE AND focal loss (focal on top of BCE)
 # Weights: w_c = N / P_c where N = # negative segments, P_c = # positive for class c
 USE_WEIGHTED_BCE = True
-USE_FOCAL_LOSS   = True
+USE_FOCAL_LOSS   = False
 
 # Paper: "class imbalance term to 0.25 and focus term to 2"
 FOCAL_ALPHA = 0.25
