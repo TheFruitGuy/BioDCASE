@@ -149,8 +149,8 @@ class ContrastiveEncoder(nn.Module):
         x = self.backbone.feat_extractor(x)
         x = self.backbone.residual_stack(x)
 
-        B, C, F, T = x.shape
-        x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * F)
+        B, C, Fr, T = x.shape
+        x = x.permute(0, 3, 1, 2).contiguous().view(B, T, C * Fr)
         self.backbone._init_projection(C * F, x.device)
         x = self.backbone.feat_proj(x)                # (B, T, 64)
 

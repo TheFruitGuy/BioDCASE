@@ -178,12 +178,12 @@ class WhaleVAD(nn.Module):
         x = self.residual_stack(x)                            # (B, 128, F'', T)
 
         # Flatten (channels × freq) → features for linear projection
-        B, C, F, T = x.shape
+        B, C, Fr, T = x.shape
         x = x.permute(0, 3, 1, 2).contiguous()                # (B, T, C, F)
-        x = x.view(B, T, C * F)                               # (B, T, C*F)
+        x = x.view(B, T, C * Fr)                               # (B, T, C*F)
 
         # Lazy init projection (depends on F at first forward pass)
-        self._init_projection(C * F, x.device)
+        self._init_projection(C * Fr, x.device)
         x = self.feat_proj(x)                                 # (B, T, 64)
 
         # BiLSTM temporal processing
