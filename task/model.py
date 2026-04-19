@@ -153,7 +153,10 @@ class WhaleVAD(nn.Module):
 
         # ── Classifier ──────────────────────────────────────────────
         self.classifier = nn.Linear(
-            cfg.LSTM_HIDDEN * 2, num_classes   # bidirectional → *2
+            cfg.LSTM_HIDDEN * 2, num_classes,   # bidirectional → *2
+            # Initialize bias to reflect prior class prevalence (~5%)
+            # σ(-3) ≈ 0.047, so start predicting ~5% by default
+            nn.init.constant_(self.classifier.bias, -3.0)
         )
 
     def _init_projection(self, in_dim: int, device: torch.device):
@@ -253,11 +256,6 @@ class WhaleVADLoss(nn.Module):
 # ----------------------------------------------------------------------
 
 def compute_class_weights() -> torch.Tensor:
-    """
-    Paper Section 5.6: w_c = N / P_c
-    Interpreted as: N = files NOT containing class c, P_c = files containing class c.
-    This gives each class weight proportional to its rarity across files.
-    """
     from dataset import load_annotations
 
     annotations = load_annotations(cfg.TRAIN_DATASETS)
@@ -278,7 +276,9 @@ def compute_class_weights() -> torch.Tensor:
         weights.append(w)
 
     result = torch.tensor(weights, dtype=torch.float32)
-    print(f"Class weights (w_c = N/P_c, file-level):")
+    # Shift so minimum weight = 1 (no class is actively downweighted)
+    result = result / result.min()
+    print(f"Class weights (w_c = N/P_c, normalized to min=1):")
     for name, w in zip(class_names, result.tolist()):
         print(f"  {name}: {w:.3f}")
     return result
