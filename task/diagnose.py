@@ -81,7 +81,8 @@ def check_2_annotation_coverage():
     # Average
     total_pos = 0
     total_frames = 0
-    for i in range(min(100, len(pos_segs))):
+    n_to_check = min(100, len(ds))
+    for i in range(n_to_check):
         _, t, _, _ = ds[i]
         total_pos += (t.sum(dim=-1) > 0).sum().item()
         total_frames += t.size(0)
