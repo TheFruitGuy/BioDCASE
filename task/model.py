@@ -152,12 +152,11 @@ class WhaleVAD(nn.Module):
         )
 
         # ── Classifier ──────────────────────────────────────────────
-        self.classifier = nn.Linear(
-            cfg.LSTM_HIDDEN * 2, num_classes,   # bidirectional → *2
-            # Initialize bias to reflect prior class prevalence (~5%)
-            # σ(-3) ≈ 0.047, so start predicting ~5% by default
-            nn.init.constant_(self.classifier.bias, -3.0)
-        )
+        self.classifier = nn.Linear(cfg.LSTM_HIDDEN * 2, num_classes)
+
+        # Initialize bias to reflect prior class prevalence (~5%)
+        # σ(-3) ≈ 0.047, so start predicting ~5% by default
+        nn.init.constant_(self.classifier.bias, -3.0)
 
     def _init_projection(self, in_dim: int, device: torch.device):
         if self.feat_proj is None or self.feat_proj.in_features != in_dim:
