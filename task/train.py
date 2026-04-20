@@ -1,19 +1,14 @@
 """
-Whale-VAD training — paper reproduction.
+Whale-VAD training — STABILIZED VERSION.
+
+Key differences from original train.py:
+  1. Negatives resample every 5 epochs (not every epoch) — reduces val noise
+  2. ReduceLROnPlateau — drops LR when val F1 stagnates
+  3. Early stopping — stops if no improvement for 15 epochs
 
 Usage:
-    # Train from scratch (paper default)
     python train.py
-
-    # Load contrastive-pretrained encoder (optional)
-    python train.py --pretrained /path/to/encoder.pt --freeze_epochs 5
-
-Matches paper (Geldenhuys et al., DCASE 2025):
-  - AdamW lr=1e-5, weight_decay=1e-3, betas=(0.9, 0.999)
-  - Weighted BCE + Focal (alpha=0.25, gamma=2)
-  - Stochastic negative mini-batch undersampling
-  - 500ms median filter smoothing on validation probs
-  - Event-level 1D IoU evaluation
+    python train.py --pretrained PATH --freeze_epochs 5
 """
 
 import argparse
@@ -25,6 +20,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -33,7 +29,7 @@ from spectrogram import SpectrogramExtractor
 from model import WhaleVAD, WhaleVADLoss, compute_class_weights
 from dataset import (
     build_dataloaders, load_annotations, get_file_manifest,
-    collate_fn, _parse_file_start_dt,
+    collate_fn,
 )
 from postprocess import (
     postprocess_predictions, compute_metrics, Detection,
@@ -42,13 +38,22 @@ from postprocess import (
 
 
 # ----------------------------------------------------------------------
+# Stabilization hyperparameters
+# ----------------------------------------------------------------------
+
+RESAMPLE_EVERY = 5
+EARLY_STOP_PATIENCE = 15
+LR_PATIENCE = 5
+LR_FACTOR = 0.5
+MIN_LR = 1e-7
+
+
+# ----------------------------------------------------------------------
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--pretrained", type=str, default=None,
-                   help="Optional path to contrastive-pretrained encoder")
-    p.add_argument("--freeze_epochs", type=int, default=0,
-                   help="Epochs to freeze encoder if pretrained is given")
+    p.add_argument("--pretrained", type=str, default=None)
+    p.add_argument("--freeze_epochs", type=int, default=0)
     return p.parse_args()
 
 
@@ -61,7 +66,6 @@ def set_seed(seed: int = cfg.SEED):
 
 
 def align_lengths(logits, targets, mask):
-    """Align model output length with target/mask length."""
     T_m, T_t = logits.size(1), targets.size(1)
     if T_m < T_t:
         targets = targets[:, :T_m, :]
@@ -75,10 +79,6 @@ def align_lengths(logits, targets, mask):
         mask = torch.cat([mask, pad_m], dim=1)
     return targets, mask
 
-
-# ----------------------------------------------------------------------
-# Validation: event-level 1D IoU F1
-# ----------------------------------------------------------------------
 
 @torch.no_grad()
 def validate(model, spec_extractor, loader, criterion, device,
@@ -106,7 +106,6 @@ def validate(model, spec_extractor, loader, criterion, device,
             n_frames = min(n_samp // hop, probs[j].shape[0])
             all_probs[key] = probs[j, :n_frames, :]
 
-    # Event-level metrics
     pred_events = postprocess_predictions(all_probs, thresholds.cpu().numpy())
     gt_events = []
     for _, row in val_annotations.iterrows():
@@ -140,10 +139,6 @@ def validate(model, spec_extractor, loader, criterion, device,
     }
 
 
-# ----------------------------------------------------------------------
-# Training
-# ----------------------------------------------------------------------
-
 def train_epoch(model, spec_extractor, loader, criterion, optimizer, device, epoch):
     model.train()
     total_loss, n = 0.0, 0
@@ -176,8 +171,6 @@ def train_epoch(model, spec_extractor, loader, criterion, optimizer, device, epo
     return total_loss / max(n, 1)
 
 
-# ----------------------------------------------------------------------
-
 def main():
     args = parse_args()
     set_seed()
@@ -189,35 +182,29 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir: {run_dir}")
 
-    # ── data ──────────────────────────────────────────────────────
     train_ds, train_loader, val_loader = build_dataloaders()
 
-    # Cache for validation
     val_annotations = load_annotations(cfg.VAL_DATASETS)
     val_manifest    = get_file_manifest(cfg.VAL_DATASETS)
     file_start_dts = {
-        (r.dataset, r.filename): r.start_dt
-        for _, r in val_manifest.iterrows()
+        (r.dataset, r.filename): r.start_dt for _, r in val_manifest.iterrows()
     }
 
-    # ── model ─────────────────────────────────────────────────────
     spec_extractor = SpectrogramExtractor().to(device)
     model = WhaleVAD(num_classes=cfg.n_classes()).to(device)
 
-    # Initialize lazy projection layer with a dry run
     with torch.no_grad():
         dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
         model(spec_extractor(dummy))
 
-    # Optional pretrained encoder loading (for your SSL extension)
     if args.pretrained:
         print(f"Loading pretrained encoder: {args.pretrained}")
-        ckpt = torch.load(args.pretrained, map_location=device)
+        ckpt = torch.load(args.pretrained, map_location=device, weights_only=False)
         state = ckpt.get("encoder_state_dict", ckpt.get("model_state_dict", ckpt))
         missing, unexpected = model.load_state_dict(state, strict=False)
-        print(f"  Missing (expected — classifier/LSTM): {len(missing)} keys")
+        print(f"  Missing: {len(missing)} keys")
         if unexpected:
-            print(f"  Unexpected keys: {len(unexpected)}")
+            print(f"  Unexpected: {len(unexpected)}")
 
     if torch.cuda.device_count() > 1:
         print(f"DataParallel across {torch.cuda.device_count()} GPUs")
@@ -226,38 +213,43 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params:,}")
 
-    # ── loss ──────────────────────────────────────────────────────
     pos_weight = compute_class_weights().to(device) if cfg.USE_WEIGHTED_BCE else None
     criterion = WhaleVADLoss(pos_weight=pos_weight).to(device)
 
-    # ── optimizer (paper: AdamW, lr=1e-5, wd=1e-3) ────────────────
     optimizer = AdamW(
-        model.parameters(),
-        lr=cfg.LR,
-        weight_decay=cfg.WEIGHT_DECAY,
+        model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY,
         betas=(cfg.BETA1, cfg.BETA2),
     )
 
-    # ── training loop ─────────────────────────────────────────────
+    scheduler = ReduceLROnPlateau(
+        optimizer, mode="max", factor=LR_FACTOR,
+        patience=LR_PATIENCE, min_lr=MIN_LR,
+    )
+    print(f"Scheduler: ReduceLROnPlateau (patience={LR_PATIENCE}, factor={LR_FACTOR})")
+    print(f"Early stopping: patience={EARLY_STOP_PATIENCE}")
+    print(f"Negative resampling: every {RESAMPLE_EVERY} epochs")
+
     best_f1 = 0.0
+    no_improve_epochs = 0
     thresholds = torch.tensor(cfg.DEFAULT_THRESHOLDS, device=device)
 
     for epoch in range(1, cfg.EPOCHS + 1):
-        print(f"\n{'='*60}\nEpoch {epoch}/{cfg.EPOCHS}\n{'='*60}")
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"\n{'='*60}\nEpoch {epoch}/{cfg.EPOCHS}  LR={current_lr:.2e}\n{'='*60}")
 
-        # Re-sample negatives (Section 5.5)
-        train_ds.resample_negatives()
-        train_loader = DataLoader(
-            train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,
-            num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
-        )
+        if (epoch - 1) % RESAMPLE_EVERY == 0:
+            print(f"  Resampling negatives")
+            train_ds.resample_negatives()
+            train_loader = DataLoader(
+                train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,
+                num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
+            )
 
-        # Freeze encoder for first freeze_epochs if pretrained
         if args.pretrained and epoch <= args.freeze_epochs:
             for name, p in model.named_parameters():
                 if "classifier" not in name and "lstm" not in name:
                     p.requires_grad = False
-            print("  [frozen encoder — training LSTM + classifier only]")
+            print("  [frozen encoder]")
         elif args.pretrained and epoch == args.freeze_epochs + 1:
             for p in model.parameters():
                 p.requires_grad = True
@@ -272,10 +264,11 @@ def main():
             thresholds, val_annotations, file_start_dts,
         )
 
-        print(f"\n  Train loss: {train_loss:.4f}  Val loss: {val['loss']:.4f}")
-        print(f"  Mean F1:    {val['mean_f1']:.3f}")
+        scheduler.step(val["mean_f1"])
 
-        # Save
+        print(f"\n  Train loss: {train_loss:.4f}  Val loss: {val['loss']:.4f}")
+        print(f"  Mean F1: {val['mean_f1']:.3f}  Best F1: {best_f1:.3f}")
+
         model_state = (model.module.state_dict() if isinstance(model, nn.DataParallel)
                        else model.state_dict())
         ckpt = {
@@ -290,12 +283,20 @@ def main():
             ckpt["best_f1"] = best_f1
             torch.save(ckpt, run_dir / "best_model.pt")
             print(f"  *** New best F1: {best_f1:.3f}")
+            no_improve_epochs = 0
+        else:
+            no_improve_epochs += 1
+            print(f"  No improvement for {no_improve_epochs}/{EARLY_STOP_PATIENCE} epochs")
 
         torch.save(ckpt, run_dir / "latest_model.pt")
 
-    # ── final threshold tuning ────────────────────────────────────
-    print(f"\n{'='*60}\nTuning per-class thresholds on validation\n{'='*60}")
-    best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device)
+        if no_improve_epochs >= EARLY_STOP_PATIENCE:
+            print(f"\n  Early stopping: no improvement for {EARLY_STOP_PATIENCE} epochs")
+            break
+
+    # Threshold tuning at end
+    print(f"\n{'='*60}\nTuning thresholds on best model\n{'='*60}")
+    best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device, weights_only=False)
     model_to_load = model.module if isinstance(model, nn.DataParallel) else model
     model_to_load.load_state_dict(best_ckpt["model_state_dict"])
 
@@ -305,23 +306,15 @@ def main():
     )
     print(f"Tuned thresholds: {tuned.tolist()}")
 
-    # After tune_thresholds_event_level:
-    print("\n=== Final evaluation with tuned thresholds ===")
-    val = validate(
-        model_to_load, spec_extractor, val_loader, criterion, device,
-        torch.tensor(tuned, device=device), val_annotations, file_start_dts,
-    )
-    print(f"TUNED overall F1: {val['mean_f1']:.3f}")
-
-    # Save final with tuned thresholds
     final_state = model_to_load.state_dict()
     torch.save({
         "model_state_dict": final_state,
         "thresholds": torch.tensor(tuned),
     }, run_dir / "final_model.pt")
 
-    print(f"\nDone — best F1 (default thresholds): {best_f1:.3f}")
+    print(f"\nDone. Best F1 (default thresholds): {best_f1:.3f}")
     print(f"Run dir: {run_dir}")
+    print(f"Next: python tune_thresholds.py --checkpoint {run_dir}/best_model.pt")
 
 
 if __name__ == "__main__":
