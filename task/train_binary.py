@@ -1,18 +1,41 @@
 """
-Binary Whale-VAD training — one class per model.
+Binary Per-Class Whale-VAD Training
+===================================
 
-Usage:
+Trains a specialized single-class Whale-VAD model. Unlike the main
+``train.py`` which trains one multi-label model over all three classes,
+this script trains one binary detector per class. Three separate runs
+(one each for ``bmabz``, ``d``, ``bp``) produce three models whose
+predictions are then combined by ``inference_binary.py`` at test time.
+
+Motivation
+----------
+The three target classes have very different properties:
+
+    - **bmabz**: abundant (~24k annotations), temporally coherent, frequency-
+      localized. The multi-label model already performs reasonably well.
+    - **bp**:    moderately abundant but spectrally variable across
+      sub-types (bpd / bp20 / bp20plus all collapse into bp).
+    - **d**:     rarest (~13k annotations), highly variable downsweep
+      whose acoustic signature overlaps with environmental noise.
+
+In the multi-label model the loss is dominated by the common class, and
+the model effectively learns a single shared representation that is a
+compromise between all three. Binary specialization lets each model
+dedicate all of its capacity to one class and use class-appropriate
+thresholds and training hyperparameters.
+
+Usage
+-----
+::
+
     python train_binary.py --class bmabz
     python train_binary.py --class d
     python train_binary.py --class bp
 
-Each model is trained independently with the full WhaleVAD architecture
-but with num_classes=1. Only this class's annotations become positive
-targets; all other annotations are ignored (neither positive nor
-explicit negative). Negative segments are randomly sampled from files
-that don't contain THIS class.
-
-At inference, run all three models and concatenate detections.
+Each invocation creates a separate run directory under ``runs/`` and
+saves ``final_model.pt`` containing both the trained weights and the
+tuned threshold.
 """
 
 import argparse
@@ -42,6 +65,10 @@ from postprocess import (
 )
 
 
+# ======================================================================
+# Stabilization hyperparameters (see train.py for rationale)
+# ======================================================================
+
 RESAMPLE_EVERY = 5
 EARLY_STOP_PATIENCE = 15
 LR_PATIENCE = 5
@@ -49,16 +76,23 @@ LR_FACTOR = 0.5
 MIN_LR = 1e-7
 
 
+# ======================================================================
+# CLI
+# ======================================================================
+
 def parse_args():
+    """Parse command-line arguments."""
     p = argparse.ArgumentParser()
     p.add_argument("--class", dest="target_class", type=str, required=True,
                    choices=cfg.CALL_TYPES_3,
-                   help="Which class to train (bmabz / d / bp)")
-    p.add_argument("--epochs", type=int, default=cfg.EPOCHS)
+                   help="Which class to train a specialized binary model for.")
+    p.add_argument("--epochs", type=int, default=cfg.EPOCHS,
+                   help="Maximum training epochs (early stopping may cut short).")
     return p.parse_args()
 
 
 def set_seed(seed: int = cfg.SEED):
+    """Seed all stochastic sources for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -67,6 +101,12 @@ def set_seed(seed: int = cfg.SEED):
 
 
 def align_lengths(logits, targets, mask):
+    """
+    Reconcile small length mismatches between logits and targets.
+
+    See ``train.align_lengths`` for details. Duplicated here to avoid a
+    cross-script import dependency for this utility.
+    """
     T_m, T_t = logits.size(1), targets.size(1)
     if T_m < T_t:
         targets = targets[:, :T_m, :]
@@ -81,18 +121,46 @@ def align_lengths(logits, targets, mask):
     return targets, mask
 
 
-# ----------------------------------------------------------------------
-# Binary dataset — filter annotations to one class
-# ----------------------------------------------------------------------
+# ======================================================================
+# Binary dataset wrappers
+# ======================================================================
 
 class BinaryWhaleDataset(WhaleDataset):
-    """WhaleDataset that only targets one class (num_classes=1)."""
+    """
+    Variant of ``WhaleDataset`` whose targets are restricted to one class.
+
+    Only annotations matching ``target_class`` contribute positive frames;
+    annotations for the other two classes become implicit negatives (they
+    are neither explicitly positive nor excluded). This is important
+    because it means the binary model learns to distinguish its target
+    class from calls of other classes, not just from silence.
+
+    Parameters
+    ----------
+    segments : list of Segment
+        Pre-built segments.
+    target_class : str
+        Coarse class label this dataset targets (one of CALL_TYPES_3).
+    """
+
     def __init__(self, segments: list[Segment], target_class: str):
         super().__init__(segments)
         self.target_class = target_class
-        self.n_classes = 1      # override
+        # Override the parent's multi-class setting.
+        self.n_classes = 1
 
     def __getitem__(self, idx: int):
+        """
+        Load one segment and build a 1-dim (binary) frame-level target.
+
+        Returns
+        -------
+        audio : torch.Tensor
+        targets : torch.Tensor, shape (n_frames, 1)
+            Single-class binary labels.
+        mask : torch.Tensor, dtype=bool
+        meta : dict
+        """
         import soundfile as sf
 
         seg = self.segments[idx]
@@ -104,15 +172,18 @@ class BinaryWhaleDataset(WhaleDataset):
         audio = torch.from_numpy(audio)
 
         n_frames = n_samples // self.stride_samp
-        targets = torch.zeros(n_frames, 1)            # single-class
+        targets = torch.zeros(n_frames, 1)  # single-class targets
 
         seg_start_s = seg.start_sample / cfg.SAMPLE_RATE
         for a in seg.annotations:
             label = a["label_3class"] if cfg.USE_3CLASS else a["label"]
+            # Skip annotations of other classes: they should not contribute
+            # positive labels to this binary model, but their mere presence
+            # in the segment is fine (implicit negative context).
             if label != self.target_class:
                 continue
             local_start_s = max(0.0, a["start_s"] - seg_start_s)
-            local_end_s   = min(n_samples / cfg.SAMPLE_RATE, a["end_s"] - seg_start_s)
+            local_end_s = min(n_samples / cfg.SAMPLE_RATE, a["end_s"] - seg_start_s)
             f0 = int(local_start_s / cfg.FRAME_STRIDE_S)
             f1 = int(local_end_s / cfg.FRAME_STRIDE_S)
             targets[f0:f1, 0] = 1.0
@@ -128,7 +199,22 @@ class BinaryWhaleDataset(WhaleDataset):
 
 
 class BinaryTrainingDataset(BinaryWhaleDataset):
-    """Training dataset with resampleable negatives, for binary task."""
+    """
+    Binary-target training dataset with resampleable negative segments.
+
+    Parameters
+    ----------
+    positive_segments : list of Segment
+        Segments containing at least one target-class annotation.
+    manifest : pd.DataFrame
+        Full file manifest (used by the negative sampler).
+    annotations : pd.DataFrame
+        Annotations for *all* classes, not just the target. Passed to the
+        negative sampler so that it avoids windows overlapping any call
+        (not just target-class calls).
+    target_class : str
+    """
+
     def __init__(self, positive_segments, manifest, annotations, target_class):
         self.positive_segments = positive_segments
         self.manifest = manifest
@@ -139,6 +225,7 @@ class BinaryTrainingDataset(BinaryWhaleDataset):
         super().__init__(self.positive_segments + self.negative_segments, target_class)
 
     def resample_negatives(self):
+        """Draw a fresh set of negative segments for this epoch."""
         n_neg = int(len(self.positive_segments) * cfg.NEG_RATIO)
         self.negative_segments = build_negative_segments(
             self.annotations, self.manifest, n_segments=n_neg,
@@ -146,25 +233,65 @@ class BinaryTrainingDataset(BinaryWhaleDataset):
         self.segments = self.positive_segments + self.negative_segments
 
 
-# ----------------------------------------------------------------------
-# Filter training set to segments that are positive for target class
-# ----------------------------------------------------------------------
+# ======================================================================
+# Annotation filtering
+# ======================================================================
 
 def filter_segments_for_class(
-    annotations: pd.DataFrame, target_class: str
+    annotations: pd.DataFrame, target_class: str,
 ) -> pd.DataFrame:
-    """Return only annotations for this class."""
+    """
+    Return only the annotations that belong to ``target_class`` after
+    7→3 label collapsing.
+
+    Parameters
+    ----------
+    annotations : pd.DataFrame
+        Full annotations DataFrame.
+    target_class : str
+        Coarse 3-class label.
+
+    Returns
+    -------
+    pd.DataFrame
+        Subset of the input containing only rows whose raw annotation
+        label maps to ``target_class`` via ``COLLAPSE_MAP``.
+    """
     orig_labels = [k for k, v in cfg.COLLAPSE_MAP.items() if v == target_class]
     return annotations[annotations["annotation"].isin(orig_labels)].reset_index(drop=True)
 
 
-# ----------------------------------------------------------------------
-# Validation (binary)
-# ----------------------------------------------------------------------
+# ======================================================================
+# Binary validation
+# ======================================================================
 
 @torch.no_grad()
 def validate_binary(model, spec_extractor, loader, criterion, device,
                     threshold, val_annotations, file_start_dts, target_class):
+    """
+    Single-class event-level validation.
+
+    Mirrors ``train.validate`` but works with a 1-class model and only
+    evaluates against ground-truth annotations of ``target_class``.
+
+    Parameters
+    ----------
+    model : nn.Module
+    spec_extractor : nn.Module
+    loader : DataLoader
+    criterion : WhaleVADLoss
+    device : torch.device
+    threshold : float
+        Single confidence threshold for the binary model.
+    val_annotations : pd.DataFrame
+    file_start_dts : dict
+    target_class : str
+
+    Returns
+    -------
+    dict
+        ``{"loss": mean loss, "f1": target-class F1}``.
+    """
     model.eval()
     total_loss, n_batches = 0.0, 0
     all_probs: dict = {}
@@ -188,34 +315,33 @@ def validate_binary(model, spec_extractor, loader, criterion, device,
             n_frames = min(n_samp // hop, probs[j].shape[0])
             all_probs[key] = probs[j, :n_frames, :]
 
-    # Postprocess with single threshold
-    thresholds = np.array([threshold])
-
-    # Build detections for this class only
-    from postprocess import stitch_segments, smooth_probabilities, threshold_to_detections, merge_and_filter
+    # Reimplement the post-processing pipeline here because the shared
+    # helper assumes a multi-class model and uses cfg.class_names() to
+    # label detections; we need single-class output labelled with the
+    # target class name.
+    from postprocess import (
+        stitch_segments, smooth_probabilities, merge_and_filter,
+    )
 
     file_probs = stitch_segments(all_probs)
     all_dets = []
     for (ds, fn), probs in file_probs.items():
         probs = smooth_probabilities(probs)
-        # Single class: relabel as target_class
-        for c in range(probs.shape[1]):
-            active = probs[:, c] > threshold
-            diffs = np.diff(active.astype(int), prepend=0, append=0)
-            starts = np.where(diffs == 1)[0]
-            ends = np.where(diffs == -1)[0]
-            for s, e in zip(starts, ends):
-                all_dets.append(Detection(
-                    dataset=ds, filename=fn, label=target_class,
-                    start_s=s * cfg.FRAME_STRIDE_S, end_s=e * cfg.FRAME_STRIDE_S,
-                    confidence=float(probs[s:e, c].mean()),
-                ))
+        # Single-class model: only one probability channel to threshold.
+        active = probs[:, 0] > threshold
+        diffs = np.diff(active.astype(int), prepend=0, append=0)
+        starts = np.where(diffs == 1)[0]
+        ends = np.where(diffs == -1)[0]
+        for s, e in zip(starts, ends):
+            all_dets.append(Detection(
+                dataset=ds, filename=fn, label=target_class,
+                start_s=s * cfg.FRAME_STRIDE_S, end_s=e * cfg.FRAME_STRIDE_S,
+                confidence=float(probs[s:e, 0].mean()),
+            ))
 
-    # Apply merge + duration filter
-    from postprocess import merge_and_filter
     pred_events = merge_and_filter(all_dets)
 
-    # Ground truth for this class only
+    # Ground-truth events, filtered to target class only.
     gt_events = []
     for _, row in val_annotations.iterrows():
         key = (row["dataset"], row["filename"])
@@ -228,7 +354,7 @@ def validate_binary(model, spec_extractor, loader, criterion, device,
         gt_events.append(Detection(
             dataset=row["dataset"], filename=row["filename"], label=target_class,
             start_s=(row["start_datetime"] - fsd).total_seconds(),
-            end_s=(row["end_datetime"]   - fsd).total_seconds(),
+            end_s=(row["end_datetime"] - fsd).total_seconds(),
         ))
 
     metrics = compute_metrics(pred_events, gt_events, iou_threshold=0.3)
@@ -248,11 +374,16 @@ def validate_binary(model, spec_extractor, loader, criterion, device,
     }
 
 
-# ----------------------------------------------------------------------
-# Train epoch
-# ----------------------------------------------------------------------
+# ======================================================================
+# Training loop (one epoch)
+# ======================================================================
 
-def train_epoch(model, spec_extractor, loader, criterion, optimizer, device, epoch, total_epochs):
+def train_epoch(model, spec_extractor, loader, criterion, optimizer, device,
+                epoch, total_epochs):
+    """
+    Run one training epoch. Same semantics as ``train.train_epoch`` but
+    works with the single-class binary targets.
+    """
     model.train()
     total_loss, n = 0.0, 0
     pbar = tqdm(loader, desc=f"Epoch {epoch}/{total_epochs}", leave=False)
@@ -269,6 +400,8 @@ def train_epoch(model, spec_extractor, loader, criterion, optimizer, device, epo
         targets, mask = align_lengths(logits, targets, mask)
         loss = criterion(logits, targets, mask)
 
+        # Skip bad batches instead of crashing; occasional NaN from the
+        # BiLSTM is a rare but recoverable event.
         if torch.isnan(loss) or torch.isinf(loss):
             continue
 
@@ -283,9 +416,12 @@ def train_epoch(model, spec_extractor, loader, criterion, optimizer, device, epo
     return total_loss / max(n, 1)
 
 
-# ----------------------------------------------------------------------
+# ======================================================================
+# Main
+# ======================================================================
 
 def main():
+    """End-to-end binary training driver."""
     args = parse_args()
     set_seed()
     target_class = args.target_class
@@ -294,25 +430,34 @@ def main():
     print(f"Device: {device}")
     print(f"Target class: {target_class}")
 
-    run_dir = Path(cfg.OUTPUT_DIR) / f"binary_{target_class}_{time.strftime('%Y%m%d_%H%M%S')}"
+    # Class-named run directory so the three binary runs are easy to tell
+    # apart on disk.
+    run_dir = Path(cfg.OUTPUT_DIR) / (
+        f"binary_{target_class}_{time.strftime('%Y%m%d_%H%M%S')}"
+    )
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir: {run_dir}")
 
-    # ── Build data ────────────────────────────────────────────────
-    print(f"\nLoading train datasets...")
+    # ------------------------------------------------------------------
+    # Training data
+    # ------------------------------------------------------------------
+    print("\nLoading train datasets...")
     train_annotations_all = load_annotations(cfg.TRAIN_DATASETS)
     train_manifest = get_file_manifest(cfg.TRAIN_DATASETS)
 
-    # Only positives for this class
-    train_annotations_class = filter_segments_for_class(train_annotations_all, target_class)
+    # Filter to target-class positives only. The full annotation set is
+    # still kept around for negative sampling.
+    train_annotations_class = filter_segments_for_class(train_annotations_all,
+                                                         target_class)
     print(f"  Total annotations: {len(train_annotations_all)}")
     print(f"  {target_class} annotations: {len(train_annotations_class)}")
 
-    # Positive segments for this class
     pos_segs = build_positive_segments(train_annotations_class, train_manifest)
     print(f"  Positive segments: {len(pos_segs)}")
 
-    # Training dataset — negatives are "no calls of ANY type" so we use full annotations for overlap check
+    # Negative sampler uses the full annotations dataframe so that windows
+    # overlapping any call (including non-target classes) are excluded —
+    # we want negatives to be real silence, not other-class events.
     train_ds = BinaryTrainingDataset(
         pos_segs, train_manifest, train_annotations_all, target_class,
     )
@@ -323,10 +468,14 @@ def main():
         num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
     )
 
-    # Validation (full val set, but binary targets)
-    print(f"\nLoading val datasets...")
+    # ------------------------------------------------------------------
+    # Validation data
+    # ------------------------------------------------------------------
+    print("\nLoading val datasets...")
     val_annotations = load_annotations(cfg.VAL_DATASETS)
     val_manifest = get_file_manifest(cfg.VAL_DATASETS)
+    # Full fixed-window tiling; the binary dataset will filter to target
+    # class targets internally.
     val_segs = build_val_segments(val_manifest, val_annotations)
     val_ds = BinaryWhaleDataset(val_segs, target_class)
     print(f"  Val segments: {len(val_segs)}")
@@ -340,10 +489,14 @@ def main():
         (r.dataset, r.filename): r.start_dt for _, r in val_manifest.iterrows()
     }
 
-    # ── Model ─────────────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Model
+    # ------------------------------------------------------------------
     spec_extractor = SpectrogramExtractor().to(device)
+    # num_classes=1 → binary model with a single output channel.
     model = WhaleVAD(num_classes=1).to(device)
 
+    # Initialize the lazy projection layer.
     with torch.no_grad():
         dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
         model(spec_extractor(dummy))
@@ -355,10 +508,15 @@ def main():
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Parameters: {n_params:,}")
 
-    # ── Loss (no pos_weight — binary, 1:1 sampling handles it) ────
+    # ------------------------------------------------------------------
+    # Loss and optimizer
+    # ------------------------------------------------------------------
+    # No positive weight is needed for the binary model: the 1:1 positive/
+    # negative segment ratio (from NEG_RATIO=1.0) already balances the
+    # segment-level label distribution, and the frame-level imbalance
+    # within positive segments is moderate enough that plain BCE works.
     criterion = WhaleVADLoss(pos_weight=None).to(device)
 
-    # ── Optimizer ─────────────────────────────────────────────────
     optimizer = AdamW(
         model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY,
         betas=(cfg.BETA1, cfg.BETA2),
@@ -368,21 +526,25 @@ def main():
         patience=LR_PATIENCE, min_lr=MIN_LR,
     )
 
-    # ── Training loop ─────────────────────────────────────────────
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
     best_f1 = 0.0
     no_improve = 0
-    threshold = 0.5
+    threshold = 0.5  # default threshold; tuned after training
 
     for epoch in range(1, args.epochs + 1):
         lr = optimizer.param_groups[0]["lr"]
-        print(f"\n{'='*60}\nEpoch {epoch}/{args.epochs}  LR={lr:.2e}\n{'='*60}")
+        print(f"\n{'=' * 60}\nEpoch {epoch}/{args.epochs}  "
+              f"LR={lr:.2e}\n{'=' * 60}")
 
         if (epoch - 1) % RESAMPLE_EVERY == 0:
-            print(f"  Resampling negatives")
+            print("  Resampling negatives")
             train_ds.resample_negatives()
             train_loader = DataLoader(
                 train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,
-                num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
+                num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn,
+                pin_memory=True,
             )
 
         train_loss = train_epoch(
@@ -403,8 +565,10 @@ def main():
         model_state = (model.module.state_dict() if isinstance(model, nn.DataParallel)
                        else model.state_dict())
         ckpt = {
-            "epoch": epoch, "model_state_dict": model_state,
-            "best_f1": best_f1, "target_class": target_class,
+            "epoch": epoch,
+            "model_state_dict": model_state,
+            "best_f1": best_f1,
+            "target_class": target_class,
             "threshold": threshold,
         }
 
@@ -421,17 +585,24 @@ def main():
         torch.save(ckpt, run_dir / "latest_model.pt")
 
         if no_improve >= EARLY_STOP_PATIENCE:
-            print(f"\n  Early stopping")
+            print("\n  Early stopping")
             break
 
-    # ── Threshold tuning ──────────────────────────────────────────
-    print(f"\n{'='*60}\nTuning threshold for {target_class}\n{'='*60}")
-    best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device, weights_only=False)
+    # ------------------------------------------------------------------
+    # Threshold tuning
+    # ------------------------------------------------------------------
+    # Per-class grid chosen empirically: bmabz scores are well-separated
+    # so a coarse 0.05 grid suffices; d and bp have flatter score
+    # distributions (rare positives), so we use a finer low-threshold
+    # grid to find the sensitivity sweet spot.
+    print(f"\n{'=' * 60}\nTuning threshold for {target_class}\n{'=' * 60}")
+    best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device,
+                           weights_only=False)
     model_to_load = model.module if isinstance(model, nn.DataParallel) else model
     model_to_load.load_state_dict(best_ckpt["model_state_dict"])
     model_to_load.eval()
 
-    # Collect probs once
+    # Collect per-window probabilities once; re-use for all threshold trials.
     all_probs = {}
     hop = spec_extractor.hop_length
     with torch.no_grad():
@@ -445,7 +616,7 @@ def main():
                 n_frames = min(n_samp // hop, probs[j].shape[0])
                 all_probs[key] = probs[j, :n_frames, :]
 
-    # GT events for this class
+    # GT events for the target class.
     gt_events = []
     for _, row in val_annotations.iterrows():
         key = (row["dataset"], row["filename"])
@@ -458,20 +629,28 @@ def main():
         gt_events.append(Detection(
             dataset=row["dataset"], filename=row["filename"], label=target_class,
             start_s=(row["start_datetime"] - fsd).total_seconds(),
-            end_s=(row["end_datetime"]   - fsd).total_seconds(),
+            end_s=(row["end_datetime"] - fsd).total_seconds(),
         ))
 
-    # Try thresholds (finer for rare classes)
+    # Class-specific threshold candidate grids.
     if target_class == "bmabz":
+        # Common class: coarse grid is fine.
         candidates = np.arange(0.2, 0.8, 0.05)
     else:
-        candidates = np.concatenate([np.arange(0.02, 0.4, 0.02), np.arange(0.4, 0.8, 0.05)])
+        # Rare classes: finer grid near the low end where the optimum
+        # typically lies due to reduced prior probability.
+        candidates = np.concatenate([
+            np.arange(0.02, 0.4, 0.02),
+            np.arange(0.4, 0.8, 0.05),
+        ])
 
     from postprocess import stitch_segments, smooth_probabilities
 
     best_thresh = 0.5
     best_f1_tuned = 0.0
 
+    # Smooth once outside the threshold loop (smoothing is independent
+    # of the threshold, and is expensive enough to hoist).
     file_probs = stitch_segments(all_probs)
     smoothed = {k: smooth_probabilities(v) for k, v in file_probs.items()}
 
@@ -485,7 +664,8 @@ def main():
             for s, e in zip(starts, ends):
                 all_dets.append(Detection(
                     dataset=ds, filename=fn, label=target_class,
-                    start_s=s * cfg.FRAME_STRIDE_S, end_s=e * cfg.FRAME_STRIDE_S,
+                    start_s=s * cfg.FRAME_STRIDE_S,
+                    end_s=e * cfg.FRAME_STRIDE_S,
                     confidence=float(probs[s:e, 0].mean()),
                 ))
         from postprocess import merge_and_filter
@@ -499,7 +679,7 @@ def main():
     print(f"\nBest threshold: {best_thresh:.3f}")
     print(f"Tuned F1: {best_f1_tuned:.3f}")
 
-    # Save final
+    # Save the final bundle: best weights + tuned threshold + metadata.
     final_state = model_to_load.state_dict()
     torch.save({
         "model_state_dict": final_state,
