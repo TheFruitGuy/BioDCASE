@@ -155,8 +155,8 @@ CALL_TYPES_3 = ["bmabz", "d", "bp"]
 #: Maps fine-grained to coarse labels.
 COLLAPSE_MAP = {
     "bma": "bmabz", "bmb": "bmabz", "bmz": "bmabz",
-    "bmd": "d",
-    "bpd": "bp", "bp20": "bp", "bp20plus": "bp",
+    "bmd": "d",  "bpd": "d",
+    "bp20": "bp", "bp20plus": "bp",               
 }
 
 #: If True, train and evaluate on the 3-class task (paper's best setting).
