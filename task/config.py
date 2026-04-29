@@ -267,7 +267,7 @@ BATCH_SIZE = 48
 #: is kept fixed at 0.001". This is 100× higher than what we previously assumed
 #: (1e-5 was a guess based on instability in our early experiments — the paper
 #: explicitly states 1e-3).
-LR = 1e-3
+LR = 5e-4
 
 #: AdamW weight decay. WhaleVAD-BPN paper Section V.B.5: "weight decay factor of
 #: 0.01" (10× our previous value).
@@ -299,7 +299,7 @@ USE_WEIGHTED_BCE = True
 #: If True, apply focal modulation on top of the BCE loss. WhaleVAD-BPN paper
 #: Section V.B.5 explicitly uses Focal loss (Lin et al. 2018), so this is now
 #: enabled to match the paper.
-USE_FOCAL_LOSS = True
+USE_FOCAL_LOSS = False
 
 #: Class-imbalance parameter for focal loss. Default value from Lin et al. 2018,
 #: which the paper cites without overriding.

@@ -389,6 +389,7 @@ def main():
         optimizer, mode="max", factor=LR_FACTOR,
         patience=LR_PATIENCE, min_lr=MIN_LR,
     )
+    print(f"DEBUG class weights: {pos_weight.tolist()}")
     print(f"Scheduler: ReduceLROnPlateau (patience={LR_PATIENCE}, factor={LR_FACTOR})")
     print(f"Early stopping: patience={EARLY_STOP_PATIENCE}")
     print(f"Negative resampling: every {RESAMPLE_EVERY} epochs")
