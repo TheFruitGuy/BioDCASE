@@ -59,7 +59,7 @@ from dataset import (
 )
 from postprocess import (
     postprocess_predictions, compute_metrics, Detection,
-    tune_thresholds_event_level,
+    tune_thresholds_event_level, collapse_probs_to_3class,
 )
 
 
@@ -219,20 +219,26 @@ def validate(model, spec_extractor, loader, criterion, device,
             n_frames = min(n_samp // hop, probs[j].shape[0])
             all_probs[key] = probs[j, :n_frames, :]
 
+    # Collapse 7-class outputs to 3-class for evaluation. No-op when the
+    # model is already in 3-class mode. After this point the probability
+    # axis is always 3-class, regardless of the model's classifier width.
+    all_probs = collapse_probs_to_3class(all_probs)
+
     # Run the standard post-processing pipeline end-to-end.
     pred_events = postprocess_predictions(all_probs, thresholds.cpu().numpy())
 
     # Build ground-truth Detection objects in the same format for matching.
+    # Always use label_3class because predictions are now on the 3-class
+    # axis (after the collapse above), regardless of the training mode.
     gt_events = []
     for _, row in val_annotations.iterrows():
         key = (row["dataset"], row["filename"])
         fsd = file_start_dts.get(key)
         if fsd is None:
             continue
-        label = row["label_3class"] if cfg.USE_3CLASS else row["annotation"]
         gt_events.append(Detection(
             dataset=row["dataset"], filename=row["filename"],
-            label=label,
+            label=row["label_3class"],
             start_s=(row["start_datetime"] - fsd).total_seconds(),
             end_s=(row["end_datetime"] - fsd).total_seconds(),
         ))
@@ -399,7 +405,15 @@ def main():
     # ------------------------------------------------------------------
     best_f1 = 0.0
     no_improve_epochs = 0
-    thresholds = torch.tensor(cfg.DEFAULT_THRESHOLDS, device=device)
+    # Thresholds are always sized to the 3 coarse classes, regardless of
+    # whether the model itself outputs 3 or 7 classes. validate() collapses
+    # 7-class probabilities to 3-class before postprocessing, so the
+    # threshold array consumed by postprocess_predictions is always 3-long.
+    thresholds = torch.tensor(
+        cfg.DEFAULT_THRESHOLDS[:3] if len(cfg.DEFAULT_THRESHOLDS) >= 3
+        else [0.5, 0.5, 0.5],
+        device=device,
+    )
 
     for epoch in range(1, cfg.EPOCHS + 1):
         current_lr = optimizer.param_groups[0]["lr"]

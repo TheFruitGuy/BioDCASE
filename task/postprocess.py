@@ -43,6 +43,65 @@ import config as cfg
 
 
 # ======================================================================
+# 7-class → 3-class probability collapse
+# ======================================================================
+# Used when the model outputs the full 7-class label space but evaluation
+# is performed against the coarse 3-class labels. Per the DCASE 2025 tech
+# report Section 2.9, the 7-class output is "collapsed into the 3-class
+# variant" for evaluation. We use max-pooling within each coarse group:
+# a frame is positive for the coarse class if any of its constituent
+# fine-grained outputs fired strongly. This is the same reduction used
+# by load_official_checkpoint.py.
+#
+# Built once at module load time; the index lists are tiny but cached
+# anyway because they're referenced inside hot inner loops.
+_SEVEN_TO_THREE = {
+    "bmabz": [cfg.CALL_TYPES_7.index(x) for x in ("bma", "bmb", "bmz")],
+    "d":     [cfg.CALL_TYPES_7.index(x) for x in ("bmd", "bpd")],
+    "bp":    [cfg.CALL_TYPES_7.index(x) for x in ("bp20", "bp20plus")],
+}
+
+
+def collapse_probs_to_3class(all_probs: dict) -> dict:
+    """
+    Collapse a dict of per-window 7-class probabilities to 3-class.
+
+    Operates only when ``cfg.USE_3CLASS`` is False (i.e. we have a
+    7-class model) AND the probability arrays really do have 7 channels.
+    Otherwise returns the input unchanged, which makes this safe to call
+    unconditionally from validation paths.
+
+    Parameters
+    ----------
+    all_probs : dict
+        Maps ``(dataset, filename, start_sample)`` keys to per-window
+        probability arrays of shape ``(n_frames, n_classes)``.
+
+    Returns
+    -------
+    dict
+        Same key structure, but with shape ``(n_frames, 3)`` arrays.
+        Channel order matches ``cfg.CALL_TYPES_3`` (``[bmabz, d, bp]``).
+    """
+    if cfg.USE_3CLASS or not all_probs:
+        return all_probs
+
+    # Sample one entry to check actual array width — defensive against
+    # being called accidentally on already-3-class arrays.
+    sample = next(iter(all_probs.values()))
+    if sample.shape[1] != 7:
+        return all_probs
+
+    out = {}
+    for key, p7 in all_probs.items():
+        p3 = np.zeros((p7.shape[0], 3), dtype=p7.dtype)
+        for i, name in enumerate(cfg.CALL_TYPES_3):
+            p3[:, i] = p7[:, _SEVEN_TO_THREE[name]].max(axis=1)
+        out[key] = p3
+    return out
+
+
+# ======================================================================
 # Detection dataclass
 # ======================================================================
 
@@ -568,6 +627,11 @@ def tune_thresholds_event_level(
             n_frames = min(n_samp // hop, probs[j].shape[0])
             all_probs[key] = probs[j, :n_frames, :]
 
+    # If the model outputs 7-class probabilities, collapse to 3-class so
+    # the rest of the pipeline (and the GT below, which uses label_3class)
+    # is on a consistent axis. No-op when cfg.USE_3CLASS is True.
+    all_probs = collapse_probs_to_3class(all_probs)
+
     # Build ground-truth Detections for the validation set.
     gt_events = []
     for _, row in val_annotations.iterrows():
@@ -575,19 +639,24 @@ def tune_thresholds_event_level(
         fsd = file_start_dts.get(key)
         if fsd is None:
             continue
-        label = row["label_3class"] if cfg.USE_3CLASS else row["annotation"]
+        # Always use label_3class for evaluation. After the collapse above,
+        # the probability axis is 3-class regardless of training mode, so
+        # mixing 7-class GT with 3-class predictions would never match.
         gt_events.append(Detection(
             dataset=row["dataset"],
             filename=row["filename"],
-            label=label,
+            label=row["label_3class"],
             start_s=(row["start_datetime"] - fsd).total_seconds(),
             end_s=(row["end_datetime"] - fsd).total_seconds(),
         ))
 
     # Grid search per class, one class at a time. Other classes stay at
-    # their previous best thresholds.
+    # their previous best thresholds. After the collapse above, the
+    # probability axis is always 3-class — even when the model itself
+    # has a 7-class head — so we sweep over the 3 coarse classes only.
     candidates = np.linspace(0.1, 0.9, 17)
-    n_classes = cfg.n_classes()
+    coarse_names = cfg.CALL_TYPES_3
+    n_classes = len(coarse_names)
     best_thresholds = np.full(n_classes, 0.5)
 
     for c in range(n_classes):
@@ -597,12 +666,12 @@ def tune_thresholds_event_level(
             thresholds[c] = t_try
             preds = postprocess_predictions(all_probs, thresholds)
             metrics = compute_metrics(preds, gt_events, iou_threshold=0.3)
-            cls_name = cfg.class_names()[c]
+            cls_name = coarse_names[c]
             f1 = metrics.get(cls_name, {}).get("f1", 0.0)
             if f1 > best_f1:
                 best_f1 = f1
                 best_thresholds[c] = t_try
-        print(f"  class {cfg.class_names()[c]}: "
+        print(f"  class {coarse_names[c]}: "
               f"threshold={best_thresholds[c]:.3f}  F1={best_f1:.3f}")
 
     return best_thresholds
