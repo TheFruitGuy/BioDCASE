@@ -294,7 +294,7 @@ GRAD_CLIP = 1.0
 #: minority-class recall collapses, try re-enabling — focal + weighted BCE is a
 #: common combo despite our earlier stability issues at LR=1e-5 (which no longer
 #: apply at LR=1e-3).
-USE_WEIGHTED_BCE = False
+USE_WEIGHTED_BCE = True
 
 #: If True, apply focal modulation on top of the BCE loss. WhaleVAD-BPN paper
 #: Section V.B.5 explicitly uses Focal loss (Lin et al. 2018), so this is now
