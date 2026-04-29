@@ -240,24 +240,38 @@ BOTTLENECK_DROPOUT = 0.1
 #: aggregation block.
 AGG_DROPOUT = 0.2
 
+#: Per-layer dilations within the depthwise aggregation block. WhaleVAD-BPN
+#: paper Section V.A: "adding residual connections between each of the layers
+#: with increasing dilation of 2, 4 and 8. The increase in dilation factor
+#: provides a wider receptive field, thus allowing the network to utilise
+#: features that are further away in time."
+DEPTHWISE_DILATIONS = (2, 4, 8)
+
 
 # ======================================================================
 # Training hyperparameters (Section 5.6)
 # ======================================================================
 
-#: Maximum number of training epochs. In practice, early stopping terminates
-#: training well before this is reached (typically around epoch 20-40).
-EPOCHS = 150
+#: Maximum number of training epochs. The WhaleVAD-BPN paper (arXiv 2510.21280v2,
+#: Section V.B.5) specifies "Training is halted once the training loss has
+#: converged or after 32 epochs over the entire training set." Early stopping in
+#: train.py acts as a safety net but should rarely fire below this cap.
+EPOCHS = 32
 
-#: Mini-batch size (segments per gradient step).
-BATCH_SIZE = 32
+#: Mini-batch size (segments per gradient step). WhaleVAD-BPN paper Section V.B.5:
+#: "mini-batches of 48 segments per batch, each consisting of approximately 30
+#: seconds long."
+BATCH_SIZE = 48
 
-#: Learning rate for AdamW. The paper's value of 1e-5 is small but necessary:
-#: larger learning rates produced unstable training in our reproduction.
-LR = 1e-5
+#: Learning rate for AdamW. WhaleVAD-BPN paper Section V.B.5: "The learning rate
+#: is kept fixed at 0.001". This is 100× higher than what we previously assumed
+#: (1e-5 was a guess based on instability in our early experiments — the paper
+#: explicitly states 1e-3).
+LR = 1e-3
 
-#: AdamW weight decay. Paper value.
-WEIGHT_DECAY = 0.001
+#: AdamW weight decay. WhaleVAD-BPN paper Section V.B.5: "weight decay factor of
+#: 0.01" (10× our previous value).
+WEIGHT_DECAY = 0.01
 
 #: AdamW first moment decay (β1).
 BETA1 = 0.9
@@ -274,21 +288,25 @@ GRAD_CLIP = 1.0
 # Loss function (Section 5.6)
 # ======================================================================
 
-#: If True, apply per-class positive weights in the BCE loss. Weights are
-#: computed as ``w_c = N / P_c`` where ``N`` is the number of negative
-#: segments and ``P_c`` is the number of positive segments for class c; see
-#: ``model.compute_class_weights``.
-USE_WEIGHTED_BCE = True
+#: If True, apply per-class positive weights in the BCE loss. The WhaleVAD-BPN
+#: paper specifies "Focal loss" as the loss function with no mention of class
+#: weighting on top, so this is now disabled to match the paper literally. If
+#: minority-class recall collapses, try re-enabling — focal + weighted BCE is a
+#: common combo despite our earlier stability issues at LR=1e-5 (which no longer
+#: apply at LR=1e-3).
+USE_WEIGHTED_BCE = False
 
-#: If True, apply focal modulation on top of the BCE loss. Ablation showed
-#: combining focal with weighted BCE produced unstable training in our
-#: reproduction, so this is disabled by default.
-USE_FOCAL_LOSS = False
+#: If True, apply focal modulation on top of the BCE loss. WhaleVAD-BPN paper
+#: Section V.B.5 explicitly uses Focal loss (Lin et al. 2018), so this is now
+#: enabled to match the paper.
+USE_FOCAL_LOSS = True
 
-#: Class-imbalance parameter for focal loss. Paper value.
+#: Class-imbalance parameter for focal loss. Default value from Lin et al. 2018,
+#: which the paper cites without overriding.
 FOCAL_ALPHA = 0.25
 
-#: Focusing parameter (down-weights easy examples) for focal loss. Paper value.
+#: Focusing parameter (down-weights easy examples) for focal loss. Default value
+#: from Lin et al. 2018.
 FOCAL_GAMMA = 2.0
 
 

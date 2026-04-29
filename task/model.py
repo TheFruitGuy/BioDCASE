@@ -73,6 +73,52 @@ class ResidualBlock(nn.Module):
         return x
 
 
+class DepthwiseConvBlock(nn.Module):
+    """
+    A single dilated depthwise convolution layer with residual connection.
+
+    Implements one "row" of the updated depthwise aggregation block from the
+    WhaleVAD-BPN paper (arXiv 2510.21280v2, Section V.A): spatial dropout →
+    depthwise dilated 3×3 conv → BatchNorm2d → GELU, all wrapped with an
+    additive residual to the input. The dilation parameter widens the
+    temporal receptive field without reducing resolution, which the paper
+    motivates by citing Luo et al. 2016 on effective receptive fields.
+
+    Parameters
+    ----------
+    channels : int
+        Number of input/output channels (depthwise so groups=channels).
+    dilation : int
+        Dilation factor along both spatial axes. Padding is set to
+        ``dilation`` so that 3×3 kernels remain "same"-padded regardless
+        of dilation factor.
+    dropout : float
+        Spatial (Dropout2d) probability applied at the block entry.
+    """
+
+    def __init__(self, channels: int, dilation: int, dropout: float):
+        super().__init__()
+        self.body = nn.Sequential(
+            # Spatial dropout (channel-wise) is more appropriate than vanilla
+            # dropout for convolutional layers per the paper's reference to
+            # Tompson et al. 2015.
+            nn.Dropout2d(dropout),
+            nn.Conv2d(
+                channels, channels,
+                kernel_size=(3, 3),
+                stride=(1, 1),
+                padding=(dilation, dilation),       # "same" padding for k=3
+                dilation=(dilation, dilation),
+                groups=channels,                    # depthwise
+            ),
+            nn.BatchNorm2d(channels),
+            nn.GELU(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x + self.body(x)
+
+
 # ======================================================================
 # Main classifier
 # ======================================================================
@@ -165,48 +211,45 @@ class WhaleVAD(nn.Module):
         # Squeeze-expand pattern: 128 → 64 → 64 → 128 with 1×1, 3×3, 1×1
         # convolutions. Reduces parameter count and acts as an information
         # bottleneck that forces the network to compact its spectral
-        # representation.
+        # representation. WhaleVAD-BPN paper Section V.A: "the conventional
+        # dropout has been replaced with spatial dropout [Tompson et al. 2015],
+        # which has been shown to improve the effective regularisation for
+        # convolutional layers" — so we use Dropout2d throughout.
         self.bottleneck = nn.Sequential(
             nn.Conv2d(cfg.FEAT_EXTRACTOR_CH, cfg.BOTTLENECK_CH,
                       kernel_size=(1, 1), stride=(1, 1), padding=0),
             nn.GELU(),
-            nn.Dropout(cfg.BOTTLENECK_DROPOUT),
+            nn.Dropout2d(cfg.BOTTLENECK_DROPOUT),
             nn.Conv2d(cfg.BOTTLENECK_CH, cfg.BOTTLENECK_CH,
                       kernel_size=(3, 3), stride=(1, 1), padding=1),
             nn.GELU(),
-            nn.Dropout(cfg.BOTTLENECK_DROPOUT),
+            nn.Dropout2d(cfg.BOTTLENECK_DROPOUT),
             nn.Conv2d(cfg.BOTTLENECK_CH, cfg.FEAT_EXTRACTOR_CH,
                       kernel_size=(1, 1), stride=(1, 1), padding=0),
             nn.BatchNorm2d(cfg.FEAT_EXTRACTOR_CH),
             nn.GELU(),
-            nn.Dropout(cfg.BOTTLENECK_DROPOUT),
+            nn.Dropout2d(cfg.BOTTLENECK_DROPOUT),
         )
 
         # ------------------------------------------------------------------
-        # 4. Depthwise convolutional aggregation (Table 2, rows 7-9)
+        # 4. Depthwise convolutional aggregation (Table 2, rows 7-9; updated
+        #    per WhaleVAD-BPN paper Section V.A)
         # ------------------------------------------------------------------
-        # Three consecutive depthwise 3×3 convolutions (groups=channels).
-        # Each channel processes its own spatial context independently,
-        # which dramatically reduces parameters relative to a full Conv2d
-        # while still enlarging the temporal receptive field.
-        self.aggregation = nn.Sequential(
-            nn.Dropout2d(cfg.AGG_DROPOUT),  # spatial (channel-wise) dropout
-            nn.Conv2d(cfg.FEAT_EXTRACTOR_CH, cfg.FEAT_EXTRACTOR_CH,
-                      kernel_size=(3, 3), stride=(1, 1), padding=1,
-                      groups=cfg.FEAT_EXTRACTOR_CH),
-            nn.BatchNorm2d(cfg.FEAT_EXTRACTOR_CH),
-            nn.GELU(),
-            nn.Conv2d(cfg.FEAT_EXTRACTOR_CH, cfg.FEAT_EXTRACTOR_CH,
-                      kernel_size=(3, 3), stride=(1, 1), padding=1,
-                      groups=cfg.FEAT_EXTRACTOR_CH),
-            nn.BatchNorm2d(cfg.FEAT_EXTRACTOR_CH),
-            nn.GELU(),
-            nn.Conv2d(cfg.FEAT_EXTRACTOR_CH, cfg.FEAT_EXTRACTOR_CH,
-                      kernel_size=(3, 3), stride=(1, 1), padding=1,
-                      groups=cfg.FEAT_EXTRACTOR_CH),
-            nn.BatchNorm2d(cfg.FEAT_EXTRACTOR_CH),
-            nn.GELU(),
-        )
+        # Three depthwise 3×3 conv layers in series with INCREASING DILATION
+        # (2, 4, 8) and a residual connection inside each layer. The dilation
+        # progression widens the temporal receptive field exponentially while
+        # keeping the parameter count constant. Per-layer residuals (rather
+        # than a single skip around the whole block) preserve gradient flow
+        # through the deeper stack and make each dilated layer learn a
+        # refinement of the previous one.
+        self.aggregation = nn.Sequential(*[
+            DepthwiseConvBlock(
+                channels=cfg.FEAT_EXTRACTOR_CH,
+                dilation=d,
+                dropout=cfg.AGG_DROPOUT,
+            )
+            for d in cfg.DEPTHWISE_DILATIONS
+        ])
 
         # Chain bottleneck and aggregation with skip connections.
         self.residual_stack = ResidualBlock(self.bottleneck, self.aggregation)
