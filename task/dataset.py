@@ -53,7 +53,6 @@ manually::
 """
 
 import hashlib
-import pickle
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -70,53 +69,87 @@ import config as cfg
 # ======================================================================
 # Disk cache
 # ======================================================================
-# Pickle-based cache for the two startup-heavy functions. The cache key
+# Parquet-based cache for the two startup-heavy functions. The cache key
 # is a hash of the sorted dataset list, so different splits / ablations
 # get different cache files and don't trample each other.
+#
+# We use parquet (via pyarrow if available, fastparquet otherwise) instead
+# of pickle because pickled DataFrames break across pandas versions — e.g.
+# pandas' StringDtype constructor signature changed, and a pickle written
+# by one env can't be loaded by another. Parquet is a stable, on-disk
+# columnar format that survives pandas upgrades.
+#
+# Catch is that parquet doesn't accept arbitrary Python objects — only
+# DataFrames. The two things we cache here are both DataFrames, so this is
+# fine. If you ever need to cache something else, add a separate code path.
 
 _CACHE_DIR = Path("./.cache")
+_CACHE_EXT = ".parquet"
 
 
 def _cache_path(name: str, datasets: list[str]) -> Path:
     """Return the cache file path for a (name, datasets) pair."""
     _CACHE_DIR.mkdir(exist_ok=True)
     key = hashlib.md5(",".join(sorted(datasets)).encode()).hexdigest()[:8]
+    return _CACHE_DIR / f"{name}_{key}{_CACHE_EXT}"
+
+
+def _legacy_cache_path(name: str, datasets: list[str]) -> Path:
+    """Path of the old pickle cache, used only for cleanup of stale files."""
+    key = hashlib.md5(",".join(sorted(datasets)).encode()).hexdigest()[:8]
     return _CACHE_DIR / f"{name}_{key}.pkl"
 
 
-def _cache_load(path: Path):
-    """Load a cache file or return None if it doesn't exist or is corrupt."""
+def _cache_load(path: Path) -> pd.DataFrame | None:
+    """
+    Load a cached DataFrame, or return None on miss / corruption.
+
+    Reads parquet via pandas. If the file exists but can't be read
+    (corrupt, partially written, wrong format), we delete it and return
+    None so the caller rebuilds.
+    """
     if not path.exists():
         return None
     try:
-        with path.open("rb") as f:
-            return pickle.load(f)
-    except (pickle.PickleError, EOFError, AttributeError) as e:
-        # Corrupt or schema-mismatched cache: treat as miss and let the
-        # caller rebuild from scratch.
-        print(f"  Cache miss (corrupt): {path.name} ({e})")
+        return pd.read_parquet(path)
+    except Exception as e:
+        # Corrupt or schema-mismatched cache: log, delete, treat as miss.
+        # We catch broadly because parquet-engine errors come in many
+        # flavours depending on whether pyarrow or fastparquet is in use.
+        print(f"  Cache miss (corrupt): {path.name} ({e}); rebuilding")
+        try:
+            path.unlink()
+        except OSError:
+            pass
         return None
 
 
-def _cache_save(path: Path, obj):
-    """Atomically write a cache file."""
+def _cache_save(path: Path, df: pd.DataFrame) -> None:
+    """
+    Atomically write a DataFrame to parquet.
+
+    Writes to a ``.tmp`` sibling first, then renames; this means a Ctrl-C
+    mid-write never leaves a half-written cache file behind.
+    """
     tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("wb") as f:
-        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    df.to_parquet(tmp, index=False)
     tmp.replace(path)
 
 
-def clear_cache():
+def clear_cache() -> None:
     """
     Remove all cached manifests and annotations.
 
     Call this after adding new audio files or modifying annotation CSVs.
     The next call to ``get_file_manifest`` or ``load_annotations`` will
-    rebuild from scratch.
+    rebuild from scratch. Removes both the current parquet caches and
+    any leftover ``.pkl`` files from the previous (deprecated) cache
+    format.
     """
     if _CACHE_DIR.exists():
-        for f in _CACHE_DIR.glob("*.pkl"):
-            f.unlink()
+        for pattern in ("*.parquet", "*.pkl"):
+            for f in _CACHE_DIR.glob(pattern):
+                f.unlink()
         print(f"Cleared cache directory: {_CACHE_DIR}")
 
 
@@ -516,7 +549,10 @@ def _build_annotations_by_file(
     for _, a in annotations.iterrows():
         key = (a["dataset"], a["filename"])
         fsd = file_starts.get(key)
-        if fsd is None:
+        # Skip files with unparseable start times. Use pd.isna() rather
+        # than `is None` because the manifest may come from the parquet
+        # cache, which converts None datetimes to pandas NaT.
+        if fsd is None or pd.isna(fsd):
             continue
         out.setdefault(key, []).append({
             "start_s": (a["start_datetime"] - fsd).total_seconds(),
@@ -582,7 +618,8 @@ def build_positive_segments(
             continue
         file_row = manifest_idx.loc[key]
         file_start_dt = file_row["start_dt"]
-        if file_start_dt is None:
+        # See note above: NaT vs None depending on manifest source.
+        if file_start_dt is None or pd.isna(file_start_dt):
             continue
 
         # Convert absolute datetime annotations to file-relative seconds.
