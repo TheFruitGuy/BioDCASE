@@ -159,9 +159,15 @@ COLLAPSE_MAP = {
     "bp20": "bp", "bp20plus": "bp",               
 }
 
-#: If True, train and evaluate on the 3-class task (paper's best setting).
-#: If False, the 7-class task is used; the model simply outputs 7 logits and
-#: no collapsing is applied.
+#: If True, train and evaluate on the 3-class task. If False, the model
+#: outputs 7 fine-grained call-type logits which can be collapsed at
+#: evaluation time via COLLAPSE_MAP.
+#:
+#: NOTE: The official Geldenhuys checkpoint (WhaleVAD_ATBFL_3P-c6f6a07a.pt)
+#: outputs 7 classes despite the "3P" in its filename — the "3-class problem"
+#: in the DCASE Table 2 ablation refers to *evaluating* in the 3-class space,
+#: not to training a 3-class head. To match the official checkpoint exactly,
+#: set this to False and use post-hoc collapse during evaluation.
 USE_3CLASS = True
 
 
@@ -240,38 +246,31 @@ BOTTLENECK_DROPOUT = 0.1
 #: aggregation block.
 AGG_DROPOUT = 0.2
 
-#: Per-layer dilations within the depthwise aggregation block. WhaleVAD-BPN
-#: paper Section V.A: "adding residual connections between each of the layers
-#: with increasing dilation of 2, 4 and 8. The increase in dilation factor
-#: provides a wider receptive field, thus allowing the network to utilise
-#: features that are further away in time."
-DEPTHWISE_DILATIONS = (2, 4, 8)
-
 
 # ======================================================================
 # Training hyperparameters (Section 5.6)
 # ======================================================================
 
-#: Maximum number of training epochs. The WhaleVAD-BPN paper (arXiv 2510.21280v2,
-#: Section V.B.5) specifies "Training is halted once the training loss has
-#: converged or after 32 epochs over the entire training set." Early stopping in
-#: train.py acts as a safety net but should rarely fire below this cap.
-EPOCHS = 32
+#: Maximum number of training epochs. The DCASE 2025 tech report does not
+#: specify a fixed epoch count; training is stopped via best-val-loss model
+#: selection. We use a generous cap and rely on early stopping in train.py.
+EPOCHS = 150
 
-#: Mini-batch size (segments per gradient step). WhaleVAD-BPN paper Section V.B.5:
-#: "mini-batches of 48 segments per batch, each consisting of approximately 30
-#: seconds long."
-BATCH_SIZE = 48
+#: Mini-batch size (segments per gradient step). The DCASE tech report does
+#: not specify a batch size; 32 is a safe default that fits comfortably on
+#: a single GPU at this model scale.
+BATCH_SIZE = 32
 
-#: Learning rate for AdamW. WhaleVAD-BPN paper Section V.B.5: "The learning rate
-#: is kept fixed at 0.001". This is 100× higher than what we previously assumed
-#: (1e-5 was a guess based on instability in our early experiments — the paper
-#: explicitly states 1e-3).
-LR = 5e-4
+#: Learning rate for AdamW. DCASE 2025 tech report Section 2.6: "the optimiser
+#: was configured with an initial learning rate of 1 × 10^-5, momentum terms
+#: of 0.9 and 0.999, and a weight decay factor of 0.001." This is the recipe
+#: that produced their reported F1=0.440 baseline. The arXiv WhaleVAD-BPN
+#: paper uses LR=1e-3 with a different (BPN-augmented) architecture and
+#: should NOT be confused with the DCASE baseline recipe.
+LR = 1e-5
 
-#: AdamW weight decay. WhaleVAD-BPN paper Section V.B.5: "weight decay factor of
-#: 0.01" (10× our previous value).
-WEIGHT_DECAY = 0.01
+#: AdamW weight decay. DCASE tech report value (0.001).
+WEIGHT_DECAY = 0.001
 
 #: AdamW first moment decay (β1).
 BETA1 = 0.9
@@ -288,25 +287,26 @@ GRAD_CLIP = 1.0
 # Loss function (Section 5.6)
 # ======================================================================
 
-#: If True, apply per-class positive weights in the BCE loss. The WhaleVAD-BPN
-#: paper specifies "Focal loss" as the loss function with no mention of class
-#: weighting on top, so this is now disabled to match the paper literally. If
-#: minority-class recall collapses, try re-enabling — focal + weighted BCE is a
-#: common combo despite our earlier stability issues at LR=1e-5 (which no longer
-#: apply at LR=1e-3).
+#: If True, apply per-class positive weights in the BCE loss. Weights are
+#: computed as ``w_c = N / P_c`` where ``N`` is the number of negative
+#: segments and ``P_c`` is the number of positive segments for class c; see
+#: ``model.compute_class_weights``. The DCASE tech report Section 2.6 uses
+#: weighted BCE.
 USE_WEIGHTED_BCE = True
 
-#: If True, apply focal modulation on top of the BCE loss. WhaleVAD-BPN paper
-#: Section V.B.5 explicitly uses Focal loss (Lin et al. 2018), so this is now
-#: enabled to match the paper.
-USE_FOCAL_LOSS = False
+#: If True, apply focal modulation on top of the BCE loss. The DCASE tech
+#: report Table 2 shows that adding focal loss on top of weighted BCE gave
+#: a +8.0% F1 improvement, taking the model from 0.375 to 0.405 (before the
+#: 3-class evaluation step that finally got to 0.440). So both are enabled
+#: together to match the DCASE recipe.
+USE_FOCAL_LOSS = True
 
-#: Class-imbalance parameter for focal loss. Default value from Lin et al. 2018,
-#: which the paper cites without overriding.
+#: Class-imbalance parameter for focal loss. DCASE tech report Section 2.6:
+#: "we set the class imbalance term to 0.25 and focus term to 2, following
+#: the recommendations in the original paper [Lin et al. 2018]."
 FOCAL_ALPHA = 0.25
 
-#: Focusing parameter (down-weights easy examples) for focal loss. Default value
-#: from Lin et al. 2018.
+#: Focusing parameter for focal loss. Same source as FOCAL_ALPHA above.
 FOCAL_GAMMA = 2.0
 
 
