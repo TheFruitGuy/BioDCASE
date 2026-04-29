@@ -73,7 +73,7 @@ from postprocess import (
 #: Resample negative segments every N epochs. Lower values match the paper
 #: more closely but increase validation noise; higher values (e.g. 10) risk
 #: overfitting to the same negative distribution.
-RESAMPLE_EVERY = 5
+RESAMPLE_EVERY = 1
 
 #: Stop training if validation F1 does not improve for this many epochs.
 EARLY_STOP_PATIENCE = 15
@@ -392,7 +392,7 @@ def main():
     )
 
     scheduler = ReduceLROnPlateau(
-        optimizer, mode="max", factor=LR_FACTOR,
+        optimizer, mode="min", factor=LR_FACTOR,
         patience=LR_PATIENCE, min_lr=MIN_LR,
     )
     print(f"DEBUG class weights: {pos_weight.tolist()}")
@@ -404,6 +404,7 @@ def main():
     # Training loop
     # ------------------------------------------------------------------
     best_f1 = 0.0
+    best_val_loss = float("inf")
     no_improve_epochs = 0
     # Thresholds are always sized to the 3 coarse classes, regardless of
     # whether the model itself outputs 3 or 7 classes. validate() collapses
@@ -456,7 +457,7 @@ def main():
             thresholds, val_annotations, file_start_dts,
         )
 
-        scheduler.step(val["mean_f1"])
+        scheduler.step(val["loss"])
 
         print(f"\n  Train loss: {train_loss:.4f}  Val loss: {val['loss']:.4f}")
         print(f"  Mean F1: {val['mean_f1']:.3f}  Best F1: {best_f1:.3f}")
@@ -472,15 +473,22 @@ def main():
             "thresholds": thresholds.cpu(),
         }
 
-        if val["mean_f1"] > best_f1:
-            best_f1 = val["mean_f1"]
+        # Best-model criterion: lowest validation loss, per DCASE tech
+        # report Section 2.9 ("the best model is chosen based on the
+        # lowest BCE validation loss"). We still print F1 because it's
+        # the human-readable headline metric, but the saved best_model.pt
+        # is selected by val loss.
+        if val["loss"] < best_val_loss:
+            best_val_loss = val["loss"]
+            best_f1 = val["mean_f1"]  # informational, not the criterion
+            ckpt["best_val_loss"] = best_val_loss
             ckpt["best_f1"] = best_f1
             torch.save(ckpt, run_dir / "best_model.pt")
-            print(f"  *** New best F1: {best_f1:.3f}")
+            print(f"  *** New best val loss: {best_val_loss:.4f}  (F1 at this epoch: {best_f1:.3f})")
             no_improve_epochs = 0
         else:
             no_improve_epochs += 1
-            print(f"  No improvement for {no_improve_epochs}/{EARLY_STOP_PATIENCE} epochs")
+            print(f"  No improvement (val loss) for {no_improve_epochs}/{EARLY_STOP_PATIENCE} epochs")
 
         # Always save the latest checkpoint so training can be resumed
         # from the very last state if a run is killed.
