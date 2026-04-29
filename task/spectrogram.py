@@ -109,20 +109,34 @@ class SpectrogramExtractor(nn.Module):
             window=self.window,
             center=False,
             return_complex=True,
-        )  # shape: (B, n_freq, n_frames)
+        )  # shape: (B, n_freq, n_frames), complex
 
-        # Decompose the complex spectrum into magnitude and phase components.
+        # Per-frequency mean subtraction (Section 5.2). The official
+        # Geldenhuys reference implementation
+        # (whalevad/spectrogram.py: SpectrogramExtractor.forward) subtracts
+        # the mean of the COMPLEX STFT values along the time axis, BEFORE
+        # taking magnitude and phase:
+        #
+        #     feat = stft - stft.mean(time_axis)
+        #     mag, angle = feat.abs(), feat.angle()
+        #
+        # This is mathematically distinct from subtracting the mean of the
+        # magnitudes (our previous behaviour). Differences:
+        #   1. Their magnitude is always >= 0, ours could go negative
+        #   2. Their phase reflects the demeaned signal; ours kept the
+        #      raw STFT phase
+        #
+        # The official trained checkpoint was fitted to inputs produced by
+        # this complex-demean pipeline, so any deviation here yields
+        # silently-degraded inference even with correct model weights —
+        # which was the root cause of our reproduction gap.
+        if cfg.NORM_FEATURES == "demean":
+            stft = stft - stft.mean(dim=-1, keepdim=True)
+
+        # Decompose the (possibly demeaned) complex spectrum into
+        # magnitude and phase components.
         mag = stft.abs()
         angle = stft.angle()
-
-        # Per-frequency mean subtraction (Section 5.2). For each frequency
-        # bin, subtract the mean energy over time within this segment. This
-        # removes stationary noise (e.g. electrical hum, flow noise) while
-        # preserving transient events. Critically, the subtraction uses
-        # segment-local statistics rather than global means, so the output
-        # is invariant to absolute signal level across recordings.
-        if cfg.NORM_FEATURES == "demean":
-            mag = mag - mag.mean(dim=-1, keepdim=True)
 
         # Trigonometric phase encoding (Section 5.4). Using (cos, sin) rather
         # than raw phase angles avoids the 2π discontinuity that confuses
