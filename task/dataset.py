@@ -40,8 +40,20 @@ If ``filename`` is missing, it is inferred by matching ``start_datetime``
 against the datetime range covered by each WAV file in the same dataset.
 Filenames are expected to encode their start time, e.g.
 ``2014-06-29T23-00-00_000.wav``.
+
+Caching
+-------
+Both ``get_file_manifest`` and ``load_annotations`` cache their results to
+disk under ``./.cache/`` keyed on the sorted dataset list. First call after
+a clean checkout takes the original ~30 s; subsequent calls are ~100 ms.
+If the underlying audio files or annotation CSVs change, delete the cache
+manually::
+
+    rm -rf .cache/
 """
 
+import hashlib
+import pickle
 import random
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -53,6 +65,59 @@ import torch
 from torch.utils.data import Dataset, DataLoader
 
 import config as cfg
+
+
+# ======================================================================
+# Disk cache
+# ======================================================================
+# Pickle-based cache for the two startup-heavy functions. The cache key
+# is a hash of the sorted dataset list, so different splits / ablations
+# get different cache files and don't trample each other.
+
+_CACHE_DIR = Path("./.cache")
+
+
+def _cache_path(name: str, datasets: list[str]) -> Path:
+    """Return the cache file path for a (name, datasets) pair."""
+    _CACHE_DIR.mkdir(exist_ok=True)
+    key = hashlib.md5(",".join(sorted(datasets)).encode()).hexdigest()[:8]
+    return _CACHE_DIR / f"{name}_{key}.pkl"
+
+
+def _cache_load(path: Path):
+    """Load a cache file or return None if it doesn't exist or is corrupt."""
+    if not path.exists():
+        return None
+    try:
+        with path.open("rb") as f:
+            return pickle.load(f)
+    except (pickle.PickleError, EOFError, AttributeError) as e:
+        # Corrupt or schema-mismatched cache: treat as miss and let the
+        # caller rebuild from scratch.
+        print(f"  Cache miss (corrupt): {path.name} ({e})")
+        return None
+
+
+def _cache_save(path: Path, obj):
+    """Atomically write a cache file."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with tmp.open("wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+
+
+def clear_cache():
+    """
+    Remove all cached manifests and annotations.
+
+    Call this after adding new audio files or modifying annotation CSVs.
+    The next call to ``get_file_manifest`` or ``load_annotations`` will
+    rebuild from scratch.
+    """
+    if _CACHE_DIR.exists():
+        for f in _CACHE_DIR.glob("*.pkl"):
+            f.unlink()
+        print(f"Cleared cache directory: {_CACHE_DIR}")
 
 
 # ======================================================================
@@ -124,10 +189,50 @@ def _parse_file_start_dt(filename: str):
 # File manifest
 # ======================================================================
 
+def _build_file_manifest_uncached(datasets: list[str]) -> pd.DataFrame:
+    """
+    Slow path for ``get_file_manifest``: scans the filesystem and reads
+    each WAV header to determine duration. Used to populate the disk
+    cache; do not call directly.
+    """
+    rows = []
+    for ds in datasets:
+        try:
+            split = _split_for_dataset(ds)
+        except FileNotFoundError:
+            print(f"Warning: cannot locate {ds}")
+            continue
+
+        audio_dir = cfg.DATA_ROOT / split / "audio" / ds
+        if not audio_dir.exists():
+            print(f"Warning: audio directory missing for {ds}: {audio_dir}")
+            continue
+
+        for wav in sorted(audio_dir.glob("*.wav")):
+            # sf.info reads only the WAV header (~1 ms per file regardless
+            # of file size), so this is fast even for thousands of files.
+            info = sf.info(str(wav))
+            start_dt = _parse_file_start_dt(wav.name)
+            end_dt = start_dt + timedelta(seconds=info.duration) if start_dt else None
+            rows.append({
+                "dataset": ds,
+                "filename": wav.name,
+                "path": str(wav),
+                "duration_s": info.duration,
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+            })
+
+    return pd.DataFrame(rows)
+
+
 def get_file_manifest(datasets: list[str]) -> pd.DataFrame:
     """
     Scan the filesystem and return a DataFrame of all audio files in
     the requested datasets.
+
+    Cached to disk under ``.cache/manifest_<hash>.pkl``; subsequent calls
+    with the same dataset list complete in ~100 ms.
 
     Parameters
     ----------
@@ -145,77 +250,97 @@ def get_file_manifest(datasets: list[str]) -> pd.DataFrame:
         - ``duration_s``  (float) duration in seconds
         - ``start_dt``    (datetime) UTC start time parsed from filename
         - ``end_dt``      (datetime) ``start_dt + duration_s``
-
-    Notes
-    -----
-    Uses ``soundfile.info`` to read duration from each file's header,
-    which is fast (no full decode needed).
     """
-    rows = []
-    for ds in datasets:
-        try:
-            split = _split_for_dataset(ds)
-        except FileNotFoundError:
-            print(f"Warning: cannot locate {ds}")
-            continue
+    cp = _cache_path("manifest", datasets)
+    cached = _cache_load(cp)
+    if cached is not None:
+        return cached
 
-        audio_dir = cfg.DATA_ROOT / split / "audio" / ds
-        if not audio_dir.exists():
-            print(f"Warning: audio directory missing for {ds}: {audio_dir}")
-            continue
-
-        for wav in sorted(audio_dir.glob("*.wav")):
-            info = sf.info(str(wav))
-            start_dt = _parse_file_start_dt(wav.name)
-            end_dt = start_dt + timedelta(seconds=info.duration) if start_dt else None
-            rows.append({
-                "dataset": ds,
-                "filename": wav.name,
-                "path": str(wav),
-                "duration_s": info.duration,
-                "start_dt": start_dt,
-                "end_dt": end_dt,
-            })
-
-    return pd.DataFrame(rows)
+    print(f"  Building file manifest for {len(datasets)} dataset(s)...")
+    df = _build_file_manifest_uncached(datasets)
+    _cache_save(cp, df)
+    print(f"  Manifest cached to {cp}")
+    return df
 
 
 # ======================================================================
 # Annotation loading
 # ======================================================================
 
-def load_annotations(datasets: list[str]) -> pd.DataFrame:
+def _infer_filenames_vectorized(
+    df: pd.DataFrame, ds_files: pd.DataFrame
+) -> pd.Series:
     """
-    Load and concatenate boundary annotations for the requested datasets.
+    Vectorized filename inference using ``pd.merge_asof``.
 
-    Handles the common case where the CSV does not contain a ``filename``
-    column by inferring it from ``start_datetime``: the annotation is
-    attributed to the audio file whose recording interval contains the
-    annotation's start time.
+    Replaces a per-row pandas filter (O(N×M), ~30 s on the full training
+    set) with a sorted-merge (O(N+M), <1 s).
+
+    For each annotation, finds the audio file whose start time is the
+    largest value not exceeding the annotation's start time, then verifies
+    that the annotation also begins before the file ends. Files in a
+    single dataset are non-overlapping in time, so this uniquely
+    identifies the matching file.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Annotations with a ``start_datetime`` column.
+    ds_files : pd.DataFrame
+        Files in the same dataset, with ``start_dt``, ``end_dt``,
+        ``filename`` columns.
+
+    Returns
+    -------
+    pd.Series
+        ``filename`` per annotation, indexed identically to ``df``. Rows
+        with no matching file get ``pd.NA``.
+    """
+    if df.empty or ds_files.empty:
+        return pd.Series([pd.NA] * len(df), index=df.index, dtype="object")
+
+    # merge_asof requires both sides sorted by the merge key. We preserve
+    # the original index so callers can still rely on row alignment.
+    df_sorted = df.sort_values("start_datetime").copy()
+    files_sorted = (
+        ds_files[["start_dt", "end_dt", "filename"]]
+        .sort_values("start_dt")
+        .reset_index(drop=True)
+    )
+
+    merged = pd.merge_asof(
+        df_sorted, files_sorted,
+        left_on="start_datetime", right_on="start_dt",
+        direction="backward",
+    )
+
+    # Annotation must also start before the file ends, otherwise it falls
+    # in a gap between recordings.
+    out_of_range = merged["start_datetime"] >= merged["end_dt"]
+    merged.loc[out_of_range, "filename"] = pd.NA
+
+    # Restore original DataFrame ordering.
+    merged.index = df_sorted.index
+    return merged.sort_index()["filename"]
+
+
+def _load_annotations_uncached(
+    datasets: list[str], manifest: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """
+    Slow path for ``load_annotations``: reads CSVs and infers filenames.
+    Used to populate the disk cache; do not call directly.
 
     Parameters
     ----------
     datasets : list of str
-        Dataset identifiers to load.
-
-    Returns
-    -------
-    pd.DataFrame
-        Concatenated annotations with columns:
-
-        - ``dataset``         (str)
-        - ``filename``        (str) inferred if not present in CSV
-        - ``start_datetime``  (datetime, UTC)
-        - ``end_datetime``    (datetime, UTC)
-        - ``annotation``      (str) fine-grained 7-class label
-        - ``label_3class``    (str) coarse 3-class label from COLLAPSE_MAP
-
-        Annotations with no matching audio file (possible when some files
-        are missing from disk) are silently dropped, with a count printed
-        for transparency.
+    manifest : pd.DataFrame, optional
+        Pre-built manifest. If provided, avoids rebuilding for filename
+        inference. If None, calls ``get_file_manifest`` internally.
     """
     all_rows = []
-    manifest = get_file_manifest(datasets)  # needed for filename inference
+    if manifest is None:
+        manifest = get_file_manifest(datasets)
 
     for ds in datasets:
         try:
@@ -236,21 +361,10 @@ def load_annotations(datasets: list[str]) -> pd.DataFrame:
 
         # If the CSV does not identify which file each annotation belongs to,
         # infer it by finding the audio file whose time range contains the
-        # annotation's start time. Because files in a dataset don't overlap
-        # in time, there is at most one match.
+        # annotation's start time. Vectorized via merge_asof; see the helper.
         if "filename" not in df.columns:
-            ds_files = (manifest[manifest["dataset"] == ds]
-                        .sort_values("start_dt")
-                        .reset_index(drop=True))
-            filenames = []
-            for _, row in df.iterrows():
-                ann_start = row["start_datetime"]
-                match = ds_files[
-                    (ds_files["start_dt"] <= ann_start) &
-                    (ds_files["end_dt"] > ann_start)
-                ]
-                filenames.append(match.iloc[0]["filename"] if len(match) else None)
-            df["filename"] = filenames
+            ds_files = manifest[manifest["dataset"] == ds]
+            df["filename"] = _infer_filenames_vectorized(df, ds_files)
 
             # Drop orphan annotations (file not on disk, or time gap).
             n_before = len(df)
@@ -270,6 +384,58 @@ def load_annotations(datasets: list[str]) -> pd.DataFrame:
     # in COLLAPSE_MAP pass through unchanged (shouldn't happen in practice).
     ann["label_3class"] = ann["annotation"].map(cfg.COLLAPSE_MAP).fillna(ann["annotation"])
     return ann
+
+
+def load_annotations(
+    datasets: list[str], manifest: pd.DataFrame | None = None
+) -> pd.DataFrame:
+    """
+    Load and concatenate boundary annotations for the requested datasets.
+
+    Cached to disk under ``.cache/annotations_<hash>.pkl``; subsequent
+    calls with the same dataset list complete in ~100 ms.
+
+    Handles the common case where the CSV does not contain a ``filename``
+    column by inferring it from ``start_datetime``: the annotation is
+    attributed to the audio file whose recording interval contains the
+    annotation's start time.
+
+    Parameters
+    ----------
+    datasets : list of str
+        Dataset identifiers to load.
+    manifest : pd.DataFrame, optional
+        Pre-built file manifest. Pass this when you already have one in
+        hand to avoid an extra (cached) lookup. The manifest is *not* part
+        of the cache key, since the same datasets always produce the same
+        manifest.
+
+    Returns
+    -------
+    pd.DataFrame
+        Concatenated annotations with columns:
+
+        - ``dataset``         (str)
+        - ``filename``        (str) inferred if not present in CSV
+        - ``start_datetime``  (datetime, UTC)
+        - ``end_datetime``    (datetime, UTC)
+        - ``annotation``      (str) fine-grained 7-class label
+        - ``label_3class``    (str) coarse 3-class label from COLLAPSE_MAP
+
+        Annotations with no matching audio file (possible when some files
+        are missing from disk) are silently dropped, with a count printed
+        for transparency.
+    """
+    cp = _cache_path("annotations", datasets)
+    cached = _cache_load(cp)
+    if cached is not None:
+        return cached
+
+    print(f"  Loading annotations for {len(datasets)} dataset(s)...")
+    df = _load_annotations_uncached(datasets, manifest=manifest)
+    _cache_save(cp, df)
+    print(f"  Annotations cached to {cp}")
+    return df
 
 
 # ======================================================================
@@ -312,6 +478,56 @@ class Segment:
 
 
 # ======================================================================
+# Per-file annotation index helper
+# ======================================================================
+
+def _build_annotations_by_file(
+    annotations: pd.DataFrame, manifest: pd.DataFrame
+) -> dict:
+    """
+    Group annotations by ``(dataset, filename)`` for O(1) lookup.
+
+    Returns a dict mapping ``(dataset, filename)`` keys to lists of dicts
+    with file-relative ``start_s``, ``end_s``, ``label``, ``label_3class``
+    fields. Building this once and reusing it across segment-construction
+    loops avoids the O(N²) blow-up of filtering the full annotations
+    DataFrame for every annotation row.
+
+    Parameters
+    ----------
+    annotations : pd.DataFrame
+    manifest : pd.DataFrame
+
+    Returns
+    -------
+    dict
+    """
+    if annotations.empty or manifest.empty:
+        return {}
+
+    # Per-file start_dt lookup for converting absolute timestamps to
+    # file-relative seconds.
+    file_starts = {
+        (r["dataset"], r["filename"]): r["start_dt"]
+        for _, r in manifest.iterrows()
+    }
+
+    out: dict = {}
+    for _, a in annotations.iterrows():
+        key = (a["dataset"], a["filename"])
+        fsd = file_starts.get(key)
+        if fsd is None:
+            continue
+        out.setdefault(key, []).append({
+            "start_s": (a["start_datetime"] - fsd).total_seconds(),
+            "end_s": (a["end_datetime"] - fsd).total_seconds(),
+            "label": a["annotation"],
+            "label_3class": a["label_3class"],
+        })
+    return out
+
+
+# ======================================================================
 # Training segment construction
 # ======================================================================
 
@@ -351,12 +567,14 @@ def build_positive_segments(
         durations (negative, zero, or exceeding ``MAX_CALL_DURATION_S``)
         are silently skipped.
     """
-    segments = []
+    segments: list[Segment] = []
     if manifest.empty or annotations.empty:
         return segments
 
-    # Build an indexed lookup once; per-row .loc is then O(1).
+    # Build per-file lookup tables once. Each row of the annotations
+    # DataFrame then becomes an O(1) operation rather than an O(N) filter.
     manifest_idx = manifest.set_index(["dataset", "filename"])
+    ann_by_file = _build_annotations_by_file(annotations, manifest)
 
     for _, row in annotations.iterrows():
         key = (row["dataset"], row["filename"])
@@ -387,24 +605,15 @@ def build_positive_segments(
         seg_start_s = max(0.0, call_start_s - pre)
         seg_end_s = min(file_row["duration_s"], call_end_s + post)
 
-        # Gather all annotations that intersect this segment. This matters
-        # when calls overlap or are closely spaced, so the frame-level
-        # targets cover every annotated event inside the segment.
-        file_anns = annotations[
-            (annotations["dataset"] == row["dataset"]) &
-            (annotations["filename"] == row["filename"])
+        # Gather all annotations that intersect this segment using the
+        # pre-built per-file lookup. This is the loop that used to be
+        # O(N²); now it is O(K) where K is the number of annotations in
+        # the same file (typically 1-50).
+        file_anns = ann_by_file.get(key, [])
+        inter_anns = [
+            a for a in file_anns
+            if a["end_s"] > seg_start_s and a["start_s"] < seg_end_s
         ]
-        inter_anns = []
-        for _, a in file_anns.iterrows():
-            a_start_s = (a["start_datetime"] - file_start_dt).total_seconds()
-            a_end_s = (a["end_datetime"] - file_start_dt).total_seconds()
-            if a_end_s > seg_start_s and a_start_s < seg_end_s:
-                inter_anns.append({
-                    "start_s": a_start_s,
-                    "end_s": a_end_s,
-                    "label": a["annotation"],
-                    "label_3class": a["label_3class"],
-                })
 
         segments.append(Segment(
             dataset=row["dataset"],
@@ -454,27 +663,19 @@ def build_negative_segments(
         Up to ``n_segments`` negative segments. Fewer may be returned if
         the rejection sampler hits its retry cap (20× ``n_segments``).
     """
-    segments = []
+    segments: list[Segment] = []
     if manifest.empty:
         return segments
 
     # Precompute, for each file, the list of call intervals as
-    # file-relative (start_s, end_s) tuples. Used to reject candidate
-    # windows that intersect any call.
-    call_intervals: dict[tuple, list[tuple[float, float]]] = {}
-    if not annotations.empty:
-        for _, a in annotations.iterrows():
-            key = (a["dataset"], a["filename"])
-            file_rows = manifest[(manifest["dataset"] == a["dataset"]) &
-                                 (manifest["filename"] == a["filename"])]
-            if file_rows.empty:
-                continue
-            fsd = file_rows.iloc[0]["start_dt"]
-            if fsd is None:
-                continue
-            s = (a["start_datetime"] - fsd).total_seconds()
-            e = (a["end_datetime"] - fsd).total_seconds()
-            call_intervals.setdefault(key, []).append((s, e))
+    # file-relative ``(start_s, end_s)`` tuples. Used to reject candidate
+    # windows that intersect any call. This used to do a per-annotation
+    # filter on the manifest (O(N×M)); now it's O(N).
+    ann_by_file = _build_annotations_by_file(annotations, manifest)
+    call_intervals: dict = {
+        key: [(a["start_s"], a["end_s"]) for a in anns]
+        for key, anns in ann_by_file.items()
+    }
 
     files = manifest.to_dict("records")
     tries, max_tries = 0, n_segments * 20
@@ -550,30 +751,14 @@ def build_val_segments(
     list of Segment
         One segment per window.
     """
-    segments = []
+    segments: list[Segment] = []
     if manifest.empty:
         return segments
 
     step_s = segment_s - overlap_s
 
-    # Precompute per-file list of annotations with file-relative times.
-    ann_by_file: dict[tuple, list[dict]] = {}
-    if not annotations.empty:
-        for _, a in annotations.iterrows():
-            key = (a["dataset"], a["filename"])
-            file_rows = manifest[(manifest["dataset"] == a["dataset"]) &
-                                 (manifest["filename"] == a["filename"])]
-            if file_rows.empty:
-                continue
-            fsd = file_rows.iloc[0]["start_dt"]
-            if fsd is None:
-                continue
-            ann_by_file.setdefault(key, []).append({
-                "start_s": (a["start_datetime"] - fsd).total_seconds(),
-                "end_s": (a["end_datetime"] - fsd).total_seconds(),
-                "label": a["annotation"],
-                "label_3class": a["label_3class"],
-            })
+    # Precompute per-file annotation lookup. O(N) instead of O(N×M).
+    ann_by_file = _build_annotations_by_file(annotations, manifest)
 
     # Tile each file with overlapping windows.
     for _, f in manifest.iterrows():
@@ -785,6 +970,10 @@ def build_dataloaders():
     """
     Construct train and validation DataLoaders.
 
+    Pre-builds and reuses the manifest for each split so that the
+    expensive filesystem scan happens at most once per split (cached
+    afterwards).
+
     Returns
     -------
     train_ds : TrainingDatasetWithResample
@@ -796,8 +985,8 @@ def build_dataloaders():
         Yields unshuffled validation batches.
     """
     print(f"Loading train datasets: {cfg.TRAIN_DATASETS}")
-    train_annotations = load_annotations(cfg.TRAIN_DATASETS)
     train_manifest = get_file_manifest(cfg.TRAIN_DATASETS)
+    train_annotations = load_annotations(cfg.TRAIN_DATASETS, manifest=train_manifest)
     print(f"  Found {len(train_manifest)} audio files, "
           f"{len(train_annotations)} annotations")
 
@@ -812,8 +1001,8 @@ def build_dataloaders():
     )
 
     print(f"Loading val datasets: {cfg.VAL_DATASETS}")
-    val_annotations = load_annotations(cfg.VAL_DATASETS)
     val_manifest = get_file_manifest(cfg.VAL_DATASETS)
+    val_annotations = load_annotations(cfg.VAL_DATASETS, manifest=val_manifest)
     print(f"  Found {len(val_manifest)} audio files, "
           f"{len(val_annotations)} annotations")
 
