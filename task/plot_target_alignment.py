@@ -129,17 +129,10 @@ def plot_segment(idx, seg, ds, spec_ext, out_path):
     # like coloured noise here.
     spec = spec_ext(audio.unsqueeze(0))[0, 0].numpy()
 
-    # Time axes for the two panels. Spectrogram uses its own frame count
-    # (slightly less than n_samples / hop because of center=False); targets
-    # use cfg.FRAME_STRIDE_S exactly.
+    # Segment duration in seconds — used as the x-axis extent for both
+    # panels so they share a consistent time axis without per-frame
+    # coordinate arrays.
     seg_dur_s = (seg.end_sample - seg.start_sample) / cfg.SAMPLE_RATE
-    n_spec_frames = spec.shape[1]
-    spec_t = np.linspace(0, seg_dur_s, n_spec_frames, endpoint=False)
-    n_target_frames = targets.shape[0]
-    target_t = np.linspace(0, seg_dur_s, n_target_frames, endpoint=False)
-
-    # Frequency axis: 0 to Nyquist over n_fft//2 + 1 bins.
-    freqs = np.linspace(0, cfg.SAMPLE_RATE / 2, spec.shape[0])
 
     fig, (ax1, ax2) = plt.subplots(
         2, 1, figsize=(14, 7), sharex=True,
@@ -147,9 +140,13 @@ def plot_segment(idx, seg, ds, spec_ext, out_path):
     )
 
     # --- Spectrogram (top) ----------------------------------------------
-    ax1.pcolormesh(
-        spec_t, freqs, spec,
-        shading="auto", cmap="viridis",
+    # imshow with extent= places the image in data coordinates so it lines
+    # up correctly with the time axis we share with the targets panel.
+    # Avoids the dimension-mismatch quirk older matplotlib has with
+    # pcolormesh and exact-size coordinate arrays.
+    ax1.imshow(
+        spec, aspect="auto", origin="lower", cmap="viridis",
+        extent=(0.0, seg_dur_s, 0.0, cfg.SAMPLE_RATE / 2),
     )
     ax1.set_ylabel("Frequency (Hz)")
     labels = [a[("label_3class" if cfg.USE_3CLASS else "label")]
@@ -176,10 +173,12 @@ def plot_segment(idx, seg, ds, spec_ext, out_path):
     # on the y-axis so it's instantly clear which class the model would
     # be trained against.
     class_names = cfg.class_names()
-    ax2.pcolormesh(
-        target_t, np.arange(len(class_names) + 1), targets.T.numpy(),
-        shading="auto", cmap="Reds", vmin=0, vmax=1,
+    ax2.imshow(
+        targets.T.numpy(), aspect="auto", origin="lower", cmap="Reds",
+        vmin=0, vmax=1,
+        extent=(0.0, seg_dur_s, 0.0, len(class_names)),
     )
+    # Tick at the centre of each row.
     ax2.set_yticks(np.arange(len(class_names)) + 0.5)
     ax2.set_yticklabels(class_names)
     ax2.set_ylabel("Class")
