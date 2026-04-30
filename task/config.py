@@ -168,7 +168,7 @@ COLLAPSE_MAP = {
 #: in the DCASE Table 2 ablation refers to *evaluating* in the 3-class space,
 #: not to training a 3-class head. To match the official checkpoint exactly,
 #: set this to False and use post-hoc collapse during evaluation.
-USE_3CLASS = False
+USE_3CLASS = True
 
 
 # ======================================================================
@@ -261,13 +261,23 @@ EPOCHS = 150
 #: a single GPU at this model scale.
 BATCH_SIZE = 32
 
-#: Learning rate for AdamW. DCASE 2025 tech report Section 2.6: "the optimiser
-#: was configured with an initial learning rate of 1 × 10^-5, momentum terms
-#: of 0.9 and 0.999, and a weight decay factor of 0.001." This is the recipe
-#: that produced their reported F1=0.440 baseline. The arXiv WhaleVAD-BPN
-#: paper uses LR=1e-3 with a different (BPN-augmented) architecture and
-#: should NOT be confused with the DCASE baseline recipe.
-LR = 1e-5
+#: Learning rate for AdamW.
+#:
+#: The DCASE 2025 tech report Section 2.6 specifies LR=1e-5. In our
+#: reproduction at LR=1e-5 we observed that the classifier weights
+#: barely moved across 21 epochs (verified by inspecting classifier.bias
+#: which stayed at -2.995 vs an init of -3.000). Per-step gradient
+#: magnitudes for the rare-class biases are on the order of 3e-5, so at
+#: LR=1e-5 the per-step update is 3e-10 — too small to learn within a
+#: practical epoch budget. We therefore deviate to 1e-4 (10x the paper)
+#: which produces visible weight movement.
+#:
+#: The paper's smaller LR may have been viable for them due to:
+#:   - Much longer training horizons (paper does not specify epoch count)
+#:   - The bounding-box auxiliary loss providing additional gradient signal
+#:   - Pack-padded LSTM excluding padded frames (different gradient flow)
+#: We don't have those, so a higher LR is the practical compromise.
+LR = 1e-4
 
 #: AdamW weight decay. DCASE tech report value (0.001).
 WEIGHT_DECAY = 0.001

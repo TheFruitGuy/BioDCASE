@@ -73,13 +73,21 @@ from postprocess import (
 #: Resample negative segments every N epochs. Lower values match the paper
 #: more closely but increase validation noise; higher values (e.g. 10) risk
 #: overfitting to the same negative distribution.
+#: Resample negative segments every N epochs. DCASE tech report Section 2.5:
+#: "after each epoch of training, a different subset of negative segments is
+#: sampled." Set to 1 to match the paper exactly.
 RESAMPLE_EVERY = 1
 
-#: Stop training if validation F1 does not improve for this many epochs.
-EARLY_STOP_PATIENCE = 15
+#: Stop training if validation F1 does not improve for this many epochs. The
+#: paper does not specify a patience; we use a generous value because the
+#: rare-class learning is slow and we don't want to bail before D and BP
+#: come online.
+EARLY_STOP_PATIENCE = 25
 
-#: Number of stagnant epochs before the LR scheduler fires.
-LR_PATIENCE = 5
+#: Number of stagnant epochs before the LR scheduler fires. Larger than
+#: EARLY_STOP_PATIENCE for the actual stop guard would be wrong, but enough
+#: room to let the LR drop once meaningfully before stopping.
+LR_PATIENCE = 8
 
 #: Multiplicative factor applied to the LR each time the scheduler fires.
 LR_FACTOR = 0.5
@@ -392,7 +400,7 @@ def main():
     )
 
     scheduler = ReduceLROnPlateau(
-        optimizer, mode="min", factor=LR_FACTOR,
+        optimizer, mode="max", factor=LR_FACTOR,
         patience=LR_PATIENCE, min_lr=MIN_LR,
     )
     print(f"DEBUG class weights: {pos_weight.tolist()}")
@@ -404,7 +412,6 @@ def main():
     # Training loop
     # ------------------------------------------------------------------
     best_f1 = 0.0
-    best_val_loss = float("inf")
     no_improve_epochs = 0
     # Thresholds are always sized to the 3 coarse classes, regardless of
     # whether the model itself outputs 3 or 7 classes. validate() collapses
@@ -457,10 +464,18 @@ def main():
             thresholds, val_annotations, file_start_dts,
         )
 
-        scheduler.step(val["loss"])
+        scheduler.step(val["mean_f1"])
 
         print(f"\n  Train loss: {train_loss:.4f}  Val loss: {val['loss']:.4f}")
         print(f"  Mean F1: {val['mean_f1']:.3f}  Best F1: {best_f1:.3f}")
+
+        # Diagnostic: dump classifier bias to track weight movement. If these
+        # stay stuck near their init (-3.0) for many epochs, the LR is too
+        # small or something is blocking gradient flow to the classifier head.
+        clf_module = (model.module.classifier if isinstance(model, nn.DataParallel)
+                      else model.classifier)
+        bias_str = ", ".join(f"{b:+.2f}" for b in clf_module.bias.detach().cpu().tolist())
+        print(f"  Classifier bias: [{bias_str}]")
 
         # Always unwrap DataParallel before saving, so checkpoints load
         # cleanly on any GPU count.
@@ -473,22 +488,15 @@ def main():
             "thresholds": thresholds.cpu(),
         }
 
-        # Best-model criterion: lowest validation loss, per DCASE tech
-        # report Section 2.9 ("the best model is chosen based on the
-        # lowest BCE validation loss"). We still print F1 because it's
-        # the human-readable headline metric, but the saved best_model.pt
-        # is selected by val loss.
-        if val["loss"] < best_val_loss:
-            best_val_loss = val["loss"]
-            best_f1 = val["mean_f1"]  # informational, not the criterion
-            ckpt["best_val_loss"] = best_val_loss
+        if val["mean_f1"] > best_f1:
+            best_f1 = val["mean_f1"]
             ckpt["best_f1"] = best_f1
             torch.save(ckpt, run_dir / "best_model.pt")
-            print(f"  *** New best val loss: {best_val_loss:.4f}  (F1 at this epoch: {best_f1:.3f})")
+            print(f"  *** New best F1: {best_f1:.3f}")
             no_improve_epochs = 0
         else:
             no_improve_epochs += 1
-            print(f"  No improvement (val loss) for {no_improve_epochs}/{EARLY_STOP_PATIENCE} epochs")
+            print(f"  No improvement for {no_improve_epochs}/{EARLY_STOP_PATIENCE} epochs")
 
         # Always save the latest checkpoint so training can be resumed
         # from the very last state if a run is killed.
