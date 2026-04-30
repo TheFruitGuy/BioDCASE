@@ -66,8 +66,8 @@ import wandb
 # Project-level config — set these once.
 # ---------------------------------------------------------------------------
 
-WANDB_ENTITY  = os.environ.get("WANDB_ENTITY",  "your-entity")
-WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "biodcase26-task2-whale-sed")
+WANDB_ENTITY  = os.environ.get("WANDB_ENTITY",  "the_fruit_guy")
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "biodcase26-task2-whale")
 WANDB_GROUP   = "phase0_ladder"
 
 
