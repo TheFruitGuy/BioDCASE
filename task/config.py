@@ -277,7 +277,7 @@ BATCH_SIZE = 32
 #:   - The bounding-box auxiliary loss providing additional gradient signal
 #:   - Pack-padded LSTM excluding padded frames (different gradient flow)
 #: We don't have those, so a higher LR is the practical compromise.
-LR = 1e-4
+LR = 5e-5
 
 #: AdamW weight decay. DCASE tech report value (0.001).
 WEIGHT_DECAY = 0.001
@@ -309,7 +309,7 @@ USE_WEIGHTED_BCE = True
 #: a +8.0% F1 improvement, taking the model from 0.375 to 0.405 (before the
 #: 3-class evaluation step that finally got to 0.440). So both are enabled
 #: together to match the DCASE recipe.
-USE_FOCAL_LOSS = True
+USE_FOCAL_LOSS = False
 
 #: Class-imbalance parameter for focal loss. DCASE tech report Section 2.6:
 #: "we set the class imbalance term to 0.25 and focus term to 2, following
