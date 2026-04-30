@@ -76,7 +76,7 @@ from postprocess import (
 #: Resample negative segments every N epochs. DCASE tech report Section 2.5:
 #: "after each epoch of training, a different subset of negative segments is
 #: sampled." Set to 1 to match the paper exactly.
-RESAMPLE_EVERY = 5
+RESAMPLE_EVERY = 1
 
 #: Stop training if validation F1 does not improve for this many epochs. The
 #: paper does not specify a patience; we use a generous value because the
@@ -165,7 +165,8 @@ def align_lengths(logits, targets, mask):
 
 @torch.no_grad()
 def validate(model, spec_extractor, loader, criterion, device,
-             thresholds, val_annotations, file_start_dts):
+             thresholds, val_annotations, file_start_dts,
+             tune_thresholds: bool = True):
     """
     Run the full event-level validation pipeline.
 
@@ -185,18 +186,35 @@ def validate(model, spec_extractor, loader, criterion, device,
         affect metrics.
     device : torch.device
     thresholds : torch.Tensor
-        Per-class confidence thresholds.
+        Per-class confidence thresholds. Used as a *starting point* for
+        the per-class threshold sweep when ``tune_thresholds=True``;
+        used as-is when ``tune_thresholds=False``.
     val_annotations : pd.DataFrame
         Ground-truth annotations.
     file_start_dts : dict
         Maps ``(dataset, filename)`` → file start datetime.
+    tune_thresholds : bool
+        If True (default), perform a coarse per-class threshold sweep
+        and report metrics at the best operating point. If False, use
+        ``thresholds`` directly. We tune by default because reporting F1
+        at a fixed ``0.5`` threshold is misleading: rare classes (d, bp)
+        often have peak F1 at thresholds well below 0.5, and the model
+        may be doing fine at those classes even when the 0.5-threshold
+        F1 is zero. The Geldenhuys evaluation protocol (DCASE Section
+        2.9) explicitly tunes per-class thresholds on a held-out set;
+        this is the same idea, but applied each epoch so that
+        best-checkpoint selection picks the model with the best
+        achievable F1, not the best F1-at-threshold-0.5.
 
     Returns
     -------
     dict with keys:
-        - ``loss``       : mean validation loss
-        - ``mean_f1``    : overall event-level F1
-        - ``per_class``  : full per-class metrics dict
+        - ``loss``        : mean validation loss
+        - ``mean_f1``     : overall event-level F1 (at tuned thresholds
+                            if ``tune_thresholds=True``)
+        - ``per_class``   : full per-class metrics dict
+        - ``thresholds``  : the per-class thresholds actually used
+                            (as a list of floats, in CALL_TYPES_3 order)
     """
     model.eval()
     total_loss, n_batches = 0.0, 0
@@ -232,9 +250,6 @@ def validate(model, spec_extractor, loader, criterion, device,
     # axis is always 3-class, regardless of the model's classifier width.
     all_probs = collapse_probs_to_3class(all_probs)
 
-    # Run the standard post-processing pipeline end-to-end.
-    pred_events = postprocess_predictions(all_probs, thresholds.cpu().numpy())
-
     # Build ground-truth Detection objects in the same format for matching.
     # Always use label_3class because predictions are now on the 3-class
     # axis (after the collapse above), regardless of the training mode.
@@ -251,15 +266,54 @@ def validate(model, spec_extractor, loader, criterion, device,
             end_s=(row["end_datetime"] - fsd).total_seconds(),
         ))
 
+    # ------------------------------------------------------------------
+    # Per-class threshold sweep (cheap: probabilities are already cached)
+    # ------------------------------------------------------------------
+    # We sweep one class at a time, holding the others at their current
+    # best. This is the same coordinate-descent strategy used in
+    # tune_thresholds.py, but with a coarser grid so the per-epoch cost
+    # stays low. Empirically the optimum stabilises after one pass when
+    # the grids are this size, so we don't iterate.
+    used_thresholds = np.asarray(thresholds.cpu().numpy(), dtype=np.float64).copy()
+    if tune_thresholds:
+        # Coarser grid for bmabz (common, peak F1 is broad), finer near
+        # the low end for d and bp (rare, optimum often well below 0.5).
+        grids = [
+            np.arange(0.20, 0.85, 0.05),                           # bmabz
+            np.concatenate([np.arange(0.05, 0.5, 0.05),
+                            np.arange(0.5, 0.85, 0.10)]),          # d
+            np.concatenate([np.arange(0.05, 0.5, 0.05),
+                            np.arange(0.5, 0.85, 0.10)]),          # bp
+        ]
+        for c, name in enumerate(cfg.CALL_TYPES_3):
+            best_f1, best_t = -1.0, used_thresholds[c]
+            for t in grids[c]:
+                trial = used_thresholds.copy()
+                trial[c] = t
+                preds = postprocess_predictions(all_probs, trial)
+                m = compute_metrics(preds, gt_events, iou_threshold=0.3)
+                f1 = m.get(name, {}).get("f1", 0.0)
+                if f1 > best_f1:
+                    best_f1 = f1
+                    best_t = t
+            used_thresholds[c] = best_t
+
+    # Final post-processing with the (tuned or fixed) thresholds.
+    pred_events = postprocess_predictions(all_probs, used_thresholds)
     metrics = compute_metrics(pred_events, gt_events, iou_threshold=0.3)
     overall_f1 = metrics.get("overall", {}).get("f1", 0.0)
 
-    # Pretty-print per-class metrics.
-    print("\n  Event-level 1D IoU validation:")
-    for cls, m in metrics.items():
-        if cls == "overall":
+    # Pretty-print per-class metrics. When thresholds were tuned, show
+    # the per-class threshold next to each class so it's obvious which
+    # operating point produced the reported F1.
+    label = "(tuned thresholds)" if tune_thresholds else "(fixed thresholds)"
+    print(f"\n  Event-level 1D IoU validation {label}:")
+    for c, name in enumerate(cfg.CALL_TYPES_3):
+        m = metrics.get(name)
+        if m is None:
             continue
-        print(f"    {cls.upper():6} TP={m['tp']:5} FP={m['fp']:6} FN={m['fn']:6}  "
+        print(f"    {name.upper():6} t={used_thresholds[c]:.2f}  "
+              f"TP={m['tp']:5} FP={m['fp']:6} FN={m['fn']:6}  "
               f"P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}")
     print(f"    OVERALL F1={overall_f1:.3f}")
 
@@ -267,6 +321,7 @@ def validate(model, spec_extractor, loader, criterion, device,
         "loss": total_loss / max(n_batches, 1),
         "mean_f1": overall_f1,
         "per_class": metrics,
+        "thresholds": used_thresholds.tolist(),
     }
 
 
@@ -462,16 +517,31 @@ def main():
         val = validate(
             model, spec_extractor, val_loader, criterion, device,
             thresholds, val_annotations, file_start_dts,
+            tune_thresholds=True,
         )
+
+        # Update the persistent threshold state with this epoch's tuned
+        # values. Using the previous epoch's tuned thresholds as the
+        # starting point for next epoch's sweep makes the per-class
+        # coordinate descent stable across epochs (the optimum drifts
+        # slowly as the model improves; restarting from 0.5 every time
+        # would waste sweep iterations).
+        thresholds = torch.tensor(val["thresholds"], device=device,
+                                  dtype=torch.float32)
 
         scheduler.step(val["mean_f1"])
 
         print(f"\n  Train loss: {train_loss:.4f}  Val loss: {val['loss']:.4f}")
         print(f"  Mean F1: {val['mean_f1']:.3f}  Best F1: {best_f1:.3f}")
+        print(f"  Tuned thresholds: "
+              f"{['%.2f' % t for t in val['thresholds']]}")
 
-        # Diagnostic: dump classifier bias to track weight movement. If these
-        # stay stuck near their init (-3.0) for many epochs, the LR is too
-        # small or something is blocking gradient flow to the classifier head.
+        # Diagnostic: dump classifier bias to track weight movement.
+        # An earlier version of model.py initialised this to -3.0 (5%
+        # prevalence prior); we now use the PyTorch default near zero,
+        # matching the trained Geldenhuys checkpoint. If you see
+        # biases stuck at exactly -3.0 across many epochs, your local
+        # model.py is out of sync with the repo.
         clf_module = (model.module.classifier if isinstance(model, nn.DataParallel)
                       else model.classifier)
         bias_str = ", ".join(f"{b:+.2f}" for b in clf_module.bias.detach().cpu().tolist())
@@ -485,6 +555,9 @@ def main():
             "epoch": epoch,
             "model_state_dict": model_state,
             "best_f1": best_f1,
+            # Persist the tuned thresholds alongside the weights so that
+            # downstream tools (eval_only, inference) can reproduce the
+            # exact F1 we logged here without rerunning the sweep.
             "thresholds": thresholds.cpu(),
         }
 

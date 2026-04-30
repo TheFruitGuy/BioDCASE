@@ -277,7 +277,7 @@ BATCH_SIZE = 32
 #:   - The bounding-box auxiliary loss providing additional gradient signal
 #:   - Pack-padded LSTM excluding padded frames (different gradient flow)
 #: We don't have those, so a higher LR is the practical compromise.
-LR = 1e-6
+LR = 1e-4
 
 #: AdamW weight decay. DCASE tech report value (0.001).
 WEIGHT_DECAY = 0.001
