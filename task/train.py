@@ -76,7 +76,7 @@ from postprocess import (
 #: Resample negative segments every N epochs. DCASE tech report Section 2.5:
 #: "after each epoch of training, a different subset of negative segments is
 #: sampled." Set to 1 to match the paper exactly.
-RESAMPLE_EVERY = 1
+RESAMPLE_EVERY = 5
 
 #: Stop training if validation F1 does not improve for this many epochs. The
 #: paper does not specify a patience; we use a generous value because the
