@@ -254,7 +254,7 @@ class WhaleVAD(nn.Module):
         # learning to predict "no call most of the time" before it can
         # start learning useful features. This trick is not in the paper
         # but is standard practice for imbalanced binary classification.
-        nn.init.constant_(self.classifier.bias, -3.0)
+        # nn.init.constant_(self.classifier.bias, -3.0)
 
     def _init_projection(self, in_dim: int, device: torch.device):
         """
