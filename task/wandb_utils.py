@@ -54,20 +54,89 @@ Usage
 from __future__ import annotations
 
 import os
+import random
 import time
 import subprocess
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+import torch
 import wandb
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility
+# ---------------------------------------------------------------------------
+
+def seed_everything(seed: int = 42, deterministic: bool = False) -> int:
+    """
+    Seed Python, NumPy, and PyTorch (CPU + CUDA) so a phase script
+    produces the same F1 trajectory across runs.
+
+    Call this once at the very top of ``main()``, before any model,
+    dataset, or DataLoader is constructed — DataLoader workers inherit
+    the RNG state at construction time, so order matters.
+
+    Parameters
+    ----------
+    seed : int
+        Master seed. The same value drives Python ``random``, NumPy,
+        and torch CPU + CUDA generators.
+    deterministic : bool
+        If True, also forces cuDNN into deterministic mode. This makes
+        runs bit-identical at the cost of ~10-30% throughput. Leave
+        False for development; turn on for the final report run.
+
+    Returns
+    -------
+    int
+        The seed that was set, so you can stuff it straight into the
+        wandb config: ``seed = wbu.seed_everything(42)``.
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    if deterministic:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+    return seed
+
+
+def seeded_dataloader_kwargs(seed: int) -> dict:
+    """
+    Returns kwargs to pass to ``DataLoader(...)`` so that shuffle order
+    and worker RNG state are reproducible.
+
+    Usage::
+
+        train_loader = DataLoader(
+            train_ds, batch_size=..., shuffle=True,
+            num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn,
+            pin_memory=True,
+            **wbu.seeded_dataloader_kwargs(seed),
+        )
+    """
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    def _worker_init(worker_id: int) -> None:
+        # Each worker gets a different but deterministic seed.
+        worker_seed = (seed + worker_id) % 2**32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    return {"generator": g, "worker_init_fn": _worker_init}
 
 
 # ---------------------------------------------------------------------------
 # Project-level config — set these once.
 # ---------------------------------------------------------------------------
 
-WANDB_ENTITY  = os.environ.get("WANDB_ENTITY",  "the_fruit_guy")
-WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "biodcase26-task2-whale")
+WANDB_ENTITY  = os.environ.get("WANDB_ENTITY",  "your-entity")
+WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "biodcase26-task2-whale-sed")
 WANDB_GROUP   = "phase0_ladder"
 
 
