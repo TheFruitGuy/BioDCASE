@@ -211,6 +211,13 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "(common class) gains from doubling annotation count."),
         interventions=["all_8_train_sites"],
     ),
+    "0l": dict(
+        parent="0g",
+        hypothesis=("Scale LSTM 32→128 hidden, 1→2 layers (paper config) "
+                    "with 0g's 4-site data. Tests whether model capacity is "
+                    "the bottleneck closing the gap to F1=0.443."),
+        interventions=["paper_lstm"],
+    ),
 }
 
 
