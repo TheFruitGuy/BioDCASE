@@ -204,6 +204,13 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "DCASE protocol: pick θ_c per class from the PR curve."),
         interventions=["tuned_thresholds"],
     ),
+    "0k": dict(
+        parent="0g",
+        hypothesis=("Scale training data from 4 → 8 Antarctic sites with "
+                    "the same plain-BCE 3-class recipe. Tests whether bmabz "
+                    "(common class) gains from doubling annotation count."),
+        interventions=["all_8_train_sites"],
+    ),
 }
 
 
