@@ -218,6 +218,14 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "the bottleneck closing the gap to F1=0.443."),
         interventions=["paper_lstm"],
     ),
+    "0m": dict(
+        parent="0k",
+        hypothesis=("Full paper recipe: 8 sites + paper LSTM + 7-class "
+                    "training collapsed to 3 at eval. Combines 0k's data "
+                    "with 0l's capacity, then adds finer-grained training "
+                    "supervision."),
+        interventions=["paper_lstm", "seven_class_train"],
+    ),
 }
 
 
