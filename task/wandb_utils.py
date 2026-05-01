@@ -190,6 +190,13 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "push rare-class F1. Test for destabilisation."),
         interventions=["weighted_bce"],
     ),
+    "0i": dict(
+        parent="0h",
+        hypothesis=("Focal loss (α=0.25, γ=2) on top of weighted BCE to "
+                    "dampen overconfident FPs and stabilise the rare-class "
+                    "swings introduced in 0h."),
+        interventions=["focal_loss"],
+    ),
 }
 
 
