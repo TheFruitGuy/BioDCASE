@@ -197,6 +197,13 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "swings introduced in 0h."),
         interventions=["focal_loss"],
     ),
+    "0j": dict(
+        parent="0g",  # default; --parent_override at the call site picks the
+                      # actual source phase based on which checkpoint is tuned
+        hypothesis=("Per-class threshold tuning on the official val split. "
+                    "DCASE protocol: pick θ_c per class from the PR curve."),
+        interventions=["tuned_thresholds"],
+    ),
 }
 
 
@@ -204,14 +211,22 @@ PHASE_REGISTRY: dict[str, dict] = {
 # Internals
 # ---------------------------------------------------------------------------
 
-def cumulative_interventions(phase: str) -> list[str]:
-    """Walk the parent chain and collect every intervention up to ``phase``."""
-    out: list[str] = []
-    p: Optional[str] = phase
+def _walk_chain(phase: str, parent: Optional[str]) -> list[str]:
+    """
+    Walk a parent chain explicitly, so an override can be used without
+    mutating the registry.
+    """
+    out = list(PHASE_REGISTRY[phase]["interventions"])
+    p = parent
     while p is not None:
         out = PHASE_REGISTRY[p]["interventions"] + out
         p = PHASE_REGISTRY[p]["parent"]
     return out
+
+
+def cumulative_interventions(phase: str) -> list[str]:
+    """Walk the parent chain and collect every intervention up to ``phase``."""
+    return _walk_chain(phase, PHASE_REGISTRY[phase]["parent"])
 
 
 def _git_sha() -> str:
@@ -235,6 +250,8 @@ def _git_dirty() -> bool:
 def init_phase(phase: str, config: dict,
                name_suffix: str = "",
                extra_tags: Optional[list[str]] = None,
+               parent_override: Optional[str] = None,
+               job_type: Optional[str] = None,
                mode: str = "online"):
     """
     Start a wandb run for one phase of the ablation ladder.
@@ -242,6 +259,28 @@ def init_phase(phase: str, config: dict,
     Call this once at the top of ``main()``. Everything the prof needs
     to understand the run — phase id, parent, hypothesis, full
     intervention chain, git sha — lands on the run automatically.
+
+    Parameters
+    ----------
+    phase : str
+        Phase identifier (must exist in ``PHASE_REGISTRY``).
+    config : dict
+        Hyperparameters / data choices to log to wandb config.
+    name_suffix : str
+        Optional suffix appended to the auto-generated run name.
+    extra_tags : list of str, optional
+        Additional tags beyond the auto-generated phase + intervention
+        ones. Useful for marking, e.g., ``"leaderboard_submission"``.
+    parent_override : str, optional
+        Override the registry parent for this run. Used by phase 0j
+        (threshold tuning), which can attach to any of 0g/0h/0i
+        depending on which checkpoint is being tuned. The cumulative
+        intervention chain is rebuilt from the override.
+    job_type : str, optional
+        Wandb job type (``"train"``, ``"eval"``, ``"sweep"``, ...).
+        Defaults to ``"phase<phase>"``.
+    mode : str
+        Wandb run mode. ``"disabled"`` for smoke tests.
     """
     if phase not in PHASE_REGISTRY:
         raise KeyError(
@@ -249,8 +288,14 @@ def init_phase(phase: str, config: dict,
             f"Add it to wandb_utils.py before launching the run."
         )
 
-    meta = PHASE_REGISTRY[phase]
-    cumulative = cumulative_interventions(phase)
+    meta = dict(PHASE_REGISTRY[phase])
+    if parent_override is not None:
+        if parent_override not in PHASE_REGISTRY:
+            raise KeyError(
+                f"parent_override {parent_override!r} is not in PHASE_REGISTRY."
+            )
+        meta["parent"] = parent_override
+    cumulative = _walk_chain(phase, parent=meta["parent"])
 
     seed = config.get("seed", "noseed")
     timestamp = time.strftime("%m%d-%H%M")
@@ -277,7 +322,7 @@ def init_phase(phase: str, config: dict,
         entity=WANDB_ENTITY,
         project=WANDB_PROJECT,
         group=WANDB_GROUP,
-        job_type=f"phase{phase}",
+        job_type=job_type or f"phase{phase}",
         name=name,
         tags=tags,
         notes=meta["hypothesis"],
@@ -395,5 +440,71 @@ def finalize_phase(history: list[dict],
             )
         except Exception:
             pass
+
+    wandb.finish()
+
+
+def finalize_eval_phase(summary: dict,
+                        verdict: str = "",
+                        artifact_path: Optional[Path | str] = None,
+                        artifact_type: str = "evaluation",
+                        artifact_metadata: Optional[dict] = None) -> None:
+    """
+    Stamp evaluation-run results onto wandb and finish.
+
+    Phase 0j (and any future eval-only phases) doesn't have an epoch
+    loop, so the regular ``finalize_phase`` doesn't fit. Instead, the
+    caller passes a flat ``summary`` dict (which becomes
+    ``wandb.summary`` directly) and optionally an artifact to log.
+
+    Parameters
+    ----------
+    summary : dict
+        Key/value pairs to write to ``wandb.summary``. Nested dicts are
+        flattened by joining keys with ``/`` so they render cleanly in
+        the wandb UI.
+    verdict : str
+        Plain-English outcome stamped onto ``summary.verdict``.
+    artifact_path : Path or str, optional
+        File to upload (e.g. ``tuned_thresholds.pt``).
+    artifact_type : str
+        Wandb artifact type. ``"evaluation"`` is a sensible catch-all;
+        threshold-tuning runs can pass ``"thresholds"`` for clarity.
+    artifact_metadata : dict, optional
+        Extra metadata to attach to the artifact (source checkpoint,
+        baseline F1, tuned F1, etc).
+    """
+    if wandb.run is None:
+        return
+
+    def _flatten(d: dict, prefix: str = "") -> dict:
+        out = {}
+        for k, v in d.items():
+            key = f"{prefix}{k}"
+            if isinstance(v, dict):
+                out.update(_flatten(v, prefix=f"{key}/"))
+            else:
+                out[key] = v
+        return out
+
+    for k, v in _flatten(summary).items():
+        wandb.summary[k] = v
+    if verdict:
+        wandb.summary["verdict"] = verdict
+
+    if artifact_path is not None:
+        ap = Path(artifact_path)
+        if ap.exists():
+            run = wandb.run
+            art = wandb.Artifact(
+                f"{artifact_type}-{run.name}",
+                type=artifact_type,
+                metadata=artifact_metadata or {},
+            )
+            art.add_file(str(ap))
+            run.log_artifact(
+                art,
+                aliases=["latest", f"phase{run.config['phase']}"],
+            )
 
     wandb.finish()
