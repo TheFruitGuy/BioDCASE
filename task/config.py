@@ -309,7 +309,7 @@ USE_WEIGHTED_BCE = True
 #: a +8.0% F1 improvement, taking the model from 0.375 to 0.405 (before the
 #: 3-class evaluation step that finally got to 0.440). So both are enabled
 #: together to match the DCASE recipe.
-USE_FOCAL_LOSS = False
+USE_FOCAL_LOSS = True
 
 #: Class-imbalance parameter for focal loss. DCASE tech report Section 2.6:
 #: "we set the class imbalance term to 0.25 and focus term to 2, following
