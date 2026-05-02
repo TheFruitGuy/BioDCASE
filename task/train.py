@@ -404,7 +404,16 @@ def main():
     # actually loaded, so the wandb UI separates from-scratch runs from
     # SSL-fine-tuned ones.
     # ------------------------------------------------------------------
-    extra_tags = ["pretrained"] if args.pretrained else ["from_scratch"]
+    # Tags reflecting which loss variant is active. Visible at the
+    # project level without opening the run, so two runs that only
+    # differ in their loss flags are immediately distinguishable.
+    extra_tags = ["pretrained" if args.pretrained else "from_scratch"]
+    if cfg.USE_WEIGHTED_BCE:
+        extra_tags.append("weighted_bce")
+    if getattr(cfg, "USE_FOCAL_LOSS", False):
+        extra_tags.append("focal_loss")
+    if not cfg.USE_WEIGHTED_BCE and not getattr(cfg, "USE_FOCAL_LOSS", False):
+        extra_tags.append("plain_bce")
     run = wbu.init_phase(
         "baseline",
         extra_tags=extra_tags,
@@ -418,6 +427,9 @@ def main():
             "use_3class":       cfg.USE_3CLASS,
             "n_classes":        cfg.n_classes(),
             "use_weighted_bce": cfg.USE_WEIGHTED_BCE,
+            "use_focal_loss":   getattr(cfg, "USE_FOCAL_LOSS", False),
+            "focal_alpha":      getattr(cfg, "FOCAL_ALPHA", None),
+            "focal_gamma":      getattr(cfg, "FOCAL_GAMMA", None),
             "lstm_hidden":      cfg.LSTM_HIDDEN,
             "lstm_layers":      cfg.LSTM_LAYERS,
             "train_sites":      list(cfg.TRAIN_DATASETS),
