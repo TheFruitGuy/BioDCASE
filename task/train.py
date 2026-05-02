@@ -51,6 +51,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import config as cfg
+import wandb_utils as wbu
 from spectrogram import SpectrogramExtractor
 from model import WhaleVAD, WhaleVADLoss, compute_class_weights
 from dataset import (
@@ -114,12 +115,18 @@ def parse_args():
 
 
 def set_seed(seed: int = cfg.SEED):
-    """Seed all stochastic sources for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+    """
+    Seed all stochastic sources for reproducibility.
+
+    Routes through ``wandb_utils.seed_everything`` so the same seeding
+    semantics apply across every phase script. Sets ``PYTHONHASHSEED``,
+    Python ``random``, NumPy, and torch CPU + CUDA generators.
+
+    Pass ``deterministic=True`` here for the final-report run if you
+    want bit-identical results at the cost of ~10–30% throughput;
+    development runs leave it off.
+    """
+    wbu.seed_everything(seed, deterministic=False)
 
 
 def align_lengths(logits, targets, mask):
@@ -390,6 +397,44 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    # ------------------------------------------------------------------
+    # Wandb run setup. Top-of-ladder baseline run; tags inherit from
+    # phase 0m's parent chain plus the production-recipe interventions.
+    # ``extra_tags=["pretrained"]`` only when the pretrained encoder is
+    # actually loaded, so the wandb UI separates from-scratch runs from
+    # SSL-fine-tuned ones.
+    # ------------------------------------------------------------------
+    extra_tags = ["pretrained"] if args.pretrained else ["from_scratch"]
+    run = wbu.init_phase(
+        "baseline",
+        extra_tags=extra_tags,
+        config={
+            "lr":               cfg.LR,
+            "weight_decay":     cfg.WEIGHT_DECAY,
+            "batch_size":       cfg.BATCH_SIZE,
+            "epochs":           cfg.EPOCHS,
+            "seed":             cfg.SEED,
+            "neg_ratio":        cfg.NEG_RATIO,
+            "use_3class":       cfg.USE_3CLASS,
+            "n_classes":        cfg.n_classes(),
+            "use_weighted_bce": cfg.USE_WEIGHTED_BCE,
+            "lstm_hidden":      cfg.LSTM_HIDDEN,
+            "lstm_layers":      cfg.LSTM_LAYERS,
+            "train_sites":      list(cfg.TRAIN_DATASETS),
+            "val_sites":        list(cfg.VAL_DATASETS),
+            "grad_clip":        cfg.GRAD_CLIP,
+            # production-recipe knobs
+            "resample_every":   RESAMPLE_EVERY,
+            "early_stop_patience": EARLY_STOP_PATIENCE,
+            "lr_patience":      LR_PATIENCE,
+            "lr_factor":        LR_FACTOR,
+            "min_lr":           MIN_LR,
+            # SSL-pretrain knobs
+            "pretrained":       args.pretrained,
+            "freeze_epochs":    args.freeze_epochs,
+        },
+    )
+
     # Timestamped run directory keeps artifacts from different runs isolated.
     run_dir = Path(cfg.OUTPUT_DIR) / f"whalevad_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -488,10 +533,16 @@ def main():
         if (epoch - 1) % RESAMPLE_EVERY == 0:
             print("  Resampling negatives")
             train_ds.resample_negatives()
+            # Re-seed the loader's RNG each rebuild, derived from the
+            # master seed and the epoch index. Without this the rebuilt
+            # loader would silently inherit the global torch RNG state
+            # (which depends on every random op since startup), making
+            # post-resample shuffle order non-deterministic across runs.
             train_loader = DataLoader(
                 train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,
                 num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn,
                 pin_memory=True,
+                **wbu.seeded_dataloader_kwargs(cfg.SEED + epoch),
             )
 
         # Encoder freeze schedule (only active with --pretrained).
@@ -535,6 +586,32 @@ def main():
         print(f"  Mean F1: {val['mean_f1']:.3f}  Best F1: {best_f1:.3f}")
         print(f"  Tuned thresholds: "
               f"{['%.2f' % t for t in val['thresholds']]}")
+
+        # ------------------------------------------------------------------
+        # Wandb per-epoch log. The validate() in this file returns
+        # ``mean_f1`` instead of ``f1``, plus a ``thresholds`` list that
+        # the phase-script logger doesn't know about — so we construct
+        # the log payload directly here rather than going through
+        # wbu.log_epoch_3class.
+        # ------------------------------------------------------------------
+        import wandb
+        wandb_payload = {
+            "epoch":         epoch,
+            "lr":            current_lr,
+            "train/loss":    train_loss,
+            "val/loss":      val["loss"],
+            "val/f1_macro":  val["mean_f1"],
+        }
+        for ci, cname in enumerate(cfg.CALL_TYPES_3):
+            pc = val["per_class"].get(cname, {})
+            wandb_payload[f"val/f1/{cname}"]        = pc.get("f1", 0.0)
+            wandb_payload[f"val/precision/{cname}"] = pc.get("precision", 0.0)
+            wandb_payload[f"val/recall/{cname}"]    = pc.get("recall", 0.0)
+            wandb_payload[f"val/tp/{cname}"]        = pc.get("tp", 0)
+            wandb_payload[f"val/fp/{cname}"]        = pc.get("fp", 0)
+            wandb_payload[f"val/fn/{cname}"]        = pc.get("fn", 0)
+            wandb_payload[f"val/threshold/{cname}"] = float(val["thresholds"][ci])
+        wandb.log(wandb_payload, step=epoch)
 
         # Diagnostic: dump classifier bias to track weight movement.
         # An earlier version of model.py initialised this to -3.0 (5%
@@ -607,6 +684,45 @@ def main():
     print(f"Run dir: {run_dir}")
     print(f"Next: python tune_thresholds.py --checkpoint "
           f"{run_dir}/best_model.pt")
+
+    # ------------------------------------------------------------------
+    # Wandb: stamp final summary, log both checkpoints as artifacts,
+    # and finish the run. We use ``finalize_eval_phase`` (rather than
+    # ``finalize_phase``) because the per-epoch dict shape used here
+    # differs from the phase-script convention — we don't have a tidy
+    # ``history`` list, so we hand-build the summary instead.
+    # ------------------------------------------------------------------
+    import wandb
+    wandb.summary["best_f1"]              = float(best_f1)
+    wandb.summary["best_f1_post_tuning"]  = float(best_ckpt.get("best_f1", best_f1))
+    wandb.summary["final_thresholds"]     = list(map(float, tuned))
+    wandb.summary["epochs_run"]           = epoch
+    wandb.summary["early_stopped"]        = no_improve_epochs >= EARLY_STOP_PATIENCE
+    wandb.summary["verdict"] = (
+        f"Production baseline finished at best F1 {best_f1:.3f} "
+        f"(epoch {best_ckpt.get('epoch', '?')} of {epoch} run; "
+        f"final tuned thresholds {[round(float(t),2) for t in tuned]})."
+    )
+
+    # Best-by-val-F1 checkpoint (mid-training threshold-tuned) +
+    # final post-training-tuned bundle. Both go to the same artifact
+    # so they're versioned together — the prof can pull one or the
+    # other by alias.
+    art = wandb.Artifact(
+        f"model-{run.name}", type="model",
+        metadata={
+            "best_f1":         float(best_f1),
+            "best_epoch":      int(best_ckpt.get("epoch", 0)),
+            "epochs_run":      int(epoch),
+            "tuned_thresholds": list(map(float, tuned)),
+            "pretrained":      args.pretrained,
+        },
+    )
+    art.add_file(str(run_dir / "best_model.pt"))
+    art.add_file(str(run_dir / "final_model.pt"))
+    run.log_artifact(art, aliases=["best", "baseline"])
+
+    wandb.finish()
 
 
 if __name__ == "__main__":

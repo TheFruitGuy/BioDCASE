@@ -226,6 +226,22 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "supervision."),
         interventions=["paper_lstm", "seven_class_train"],
     ),
+    "baseline": dict(
+        parent=None,
+        hypothesis=("Production training baseline. Paper recipe (8 sites, "
+                    "paper LSTM, 7→3 collapse) plus the production-grade "
+                    "stability extensions: early stopping, ReduceLROnPlateau, "
+                    "periodic negative resampling, per-epoch threshold "
+                    "tuning. Optional contrastive-pretrained encoder. "
+                    "Starting point for the next round of experiments."),
+        interventions=[
+            "paper_recipe",
+            "early_stopping",
+            "lr_scheduler",
+            "periodic_resample",
+            "per_epoch_threshold_tuning",
+        ],
+    ),
 }
 
 

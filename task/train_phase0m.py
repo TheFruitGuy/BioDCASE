@@ -166,17 +166,28 @@ def validate_7to3(model, spec_extractor, loader, criterion, device,
             all_probs_7[key] = probs7[j, :n_frames, :]
 
     # Collapse 7→3 via max-over-subclasses. cfg.USE_3CLASS is False
-    # at this point so the collapse activates; we don't toggle the
-    # flag back (that would only matter if downstream code
-    # re-checked it, and we don't).
+    # at this point so the collapse activates and produces 3-channel
+    # probability arrays.
     all_probs_3 = collapse_probs_to_3class(all_probs_7)
 
-    # Postprocessing operates on the 3-class probabilities, but
-    # cfg.class_names() and cfg.n_classes() return 7 right now —
-    # postprocess_predictions reads ``cfg.CALL_TYPES_3`` directly
-    # for label naming, so this works regardless of the flag.
-    thresholds = np.array([threshold] * 3)
-    pred_events = postprocess_predictions(all_probs_3, thresholds)
+    # Postprocessing reads channel labels from ``cfg.class_names()``,
+    # which returns CALL_TYPES_7 = [bma, bmb, bmz, bmd, bpd, bp20,
+    # bp20plus] when USE_3CLASS is False. After the collapse our
+    # arrays only have 3 channels, so postprocess would label them
+    # [bma, bmb, bmz] — the first three names — and then merge_and_filter
+    # would collapse all three to "bmabz" via COLLAPSE_MAP, dropping
+    # all d/bp predictions.
+    #
+    # The fix: flip USE_3CLASS to True for the duration of the
+    # postprocess call so class_names() returns CALL_TYPES_3 =
+    # [bmabz, d, bp]. Restored in the finally block so the next
+    # epoch's training still sees 7-channel targets.
+    cfg.USE_3CLASS = True
+    try:
+        thresholds = np.array([threshold] * 3)
+        pred_events = postprocess_predictions(all_probs_3, thresholds)
+    finally:
+        cfg.USE_3CLASS = False
 
     # 3-class GT (built from label_3class, unchanged regardless of
     # USE_3CLASS flag).
