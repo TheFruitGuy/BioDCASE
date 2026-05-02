@@ -233,6 +233,31 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "with 7→3 collapse before the sweep."),
         interventions=["tuned_thresholds"],
     ),
+    "0o": dict(
+        parent="0m",
+        hypothesis=("Add weighted BCE + focal loss (α=0.25, γ=2) to the "
+                    "0m recipe. Tests whether at full data/model scale "
+                    "focal does the rare-class job it failed at in 0i."),
+        interventions=["weighted_bce", "focal_loss"],
+    ),
+    "0p": dict(
+        parent="0m",
+        hypothesis=("3-class direct training instead of 7-class collapse, "
+                    "everything else fixed at 0m. Tests whether fine-"
+                    "grained subclass supervision actually contributes."),
+        # Negation-of-parent intervention: 0p removes seven_class_train
+        # by reverting to direct 3-class output. Tag is descriptive
+        # (``three_class_direct``) so the chain reads coherently.
+        interventions=["three_class_direct"],
+    ),
+    "1a": dict(
+        parent="0m",
+        hypothesis=("Add time-masking augmentation to the 0m recipe. "
+                    "Tests whether SpecAugment-style time masking improves "
+                    "robustness on out-of-distribution val sites where 0m "
+                    "underperforms (notably bmabz on casey2017)."),
+        interventions=["time_mask"],
+    ),
     "baseline": dict(
         parent=None,
         hypothesis=("Production training baseline. Paper recipe (8 sites, "
