@@ -226,6 +226,13 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "supervision."),
         interventions=["paper_lstm", "seven_class_train"],
     ),
+    "0n": dict(
+        parent="0m",
+        hypothesis=("Per-class threshold tuning applied to the 0m "
+                    "7-class checkpoint. Same DCASE protocol as 0j but "
+                    "with 7→3 collapse before the sweep."),
+        interventions=["tuned_thresholds"],
+    ),
     "baseline": dict(
         parent=None,
         hypothesis=("Production training baseline. Paper recipe (8 sites, "
