@@ -35,10 +35,10 @@ Architecture choices
 --------------------
 - ``num_layers=4``: matches the typical "small transformer" depth for
   audio tasks. Going deeper without more data risks overfitting.
-- ``d_model=128`` matches ``cfg.PROJECTION_DIM``, so the CNN→temporal
+- ``d_model=64`` matches ``cfg.PROJECTION_DIM``, so the CNN→temporal
   interface is dimension-preserving (no extra projection needed).
-- ``nhead=4``: 32 dim per head, a reasonable sweet spot.
-- ``dim_feedforward=512``: 4× ``d_model``, the canonical ratio.
+- ``nhead=4``: 16 dim per head, a reasonable sweet spot for d=64.
+- ``dim_feedforward=256``: 4× ``d_model``, the canonical ratio.
 - Sinusoidal absolute positional encoding (added to the projected
   features before the encoder). Learned positional embeddings are
   riskier for sequences this long without careful initialization.

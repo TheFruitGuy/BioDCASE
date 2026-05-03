@@ -4,7 +4,7 @@ Phase 2b: Transformer Encoder Replacement for the BiLSTM
 
 Single-axis change to the F1=0.474 baseline (``train.py``):
 the 2-layer BiLSTM is replaced by a 4-layer Transformer encoder
-(d_model=128, nhead=4, dim_feedforward=512) with sinusoidal
+(d_model=64, nhead=4, dim_feedforward=256) with sinusoidal
 positional encoding. Same data, same loss, same CNN frontend, no
 augmentation.
 
@@ -18,27 +18,28 @@ the win is from attention specifically, not from raw capacity.
 Architecture summary
 --------------------
   CNN frontend (unchanged from WhaleVAD)
-    ↓ (B, T, 128)
+    ↓ (B, T, 64)        ← matches cfg.PROJECTION_DIM
   Sinusoidal PE
     ↓
   TransformerEncoder × 4 layers
-    - d_model = 128
-    - nhead = 4
-    - dim_feedforward = 512  (4× d_model, canonical)
+    - d_model = 64
+    - nhead = 4              (16 dim per head)
+    - dim_feedforward = 256  (4× d_model, canonical)
     - dropout = 0.1
     - GELU activation
     - pre-norm (more stable than post-norm for deep transformers)
-    ↓ (B, T, 128)
+    ↓ (B, T, 64)
   Linear classifier → (B, T, num_classes)
 
 Parameter accounting (rough)
 ----------------------------
 - CNN frontend (shared): ~750k
-- Transformer (4 × ~80k): ~320k
-- Classifier: ~390 (3-class) or ~900 (7-class)
-- Total: ~1.07M
-  vs. WhaleVAD BiLSTM (~1.03M) — comparable size, different
-  computation pattern.
+- Transformer (4 × ~50k): ~200k
+- Classifier: ~200 (3-class) or ~450 (7-class)
+- Total: ~950k
+  vs. WhaleVAD BiLSTM (~1.03M) — slightly smaller, different
+  computation pattern. If 2b matches 2a's F1 with fewer parameters,
+  attention is more efficient than recurrence here.
 
 Implementation note
 -------------------
@@ -65,10 +66,10 @@ from phase1_baseline import run_phase1_training
 
 PHASE2B_CONFIG = {
     "arch_change": "transformer_encoder",
-    "tx_d_model": 128,
-    "tx_nhead": 4,
+    "tx_d_model": 64,           # matches cfg.PROJECTION_DIM
+    "tx_nhead": 4,              # 16 dim per head
     "tx_num_layers": 4,
-    "tx_dim_feedforward": 512,
+    "tx_dim_feedforward": 256,  # 4× d_model
     "tx_dropout": 0.1,
     "tx_norm_first": True,  # pre-norm
     "tx_pos_encoding": "sinusoidal_absolute",
