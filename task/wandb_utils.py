@@ -135,7 +135,7 @@ def seeded_dataloader_kwargs(seed: int) -> dict:
 # Project-level config — set these once.
 # ---------------------------------------------------------------------------
 
-WANDB_ENTITY  = os.environ.get("WANDB_ENTITY",  "your-entity")
+WANDB_ENTITY  = os.environ.get("WANDB_ENTITY",  "bio-dcase")
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "biodcase26-task2-whale-sed")
 WANDB_GROUP   = "phase0_ladder"
 
