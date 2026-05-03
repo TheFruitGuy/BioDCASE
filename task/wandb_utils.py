@@ -288,6 +288,23 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "Phase 0a."),
         interventions=["cross_site_mix"],
     ),
+    "2a": dict(
+        parent="baseline",
+        hypothesis=("Bigger BiLSTM on the baseline: hidden 128→256, "
+                    "layers 2→3 (~2.7× the recurrent param count). "
+                    "Tests whether the existing temporal model is "
+                    "capacity-limited before swapping to attention."),
+        interventions=["bigger_bilstm"],
+    ),
+    "2b": dict(
+        parent="baseline",
+        hypothesis=("Replace the BiLSTM with a 4-layer Transformer "
+                    "encoder (d_model=128, nhead=4, sinusoidal PE) at "
+                    "matched parameter count. Tests whether self-"
+                    "attention beats recurrence on 30s/1500-frame "
+                    "sequences."),
+        interventions=["transformer_encoder"],
+    ),
     "baseline": dict(
         parent=None,
         hypothesis=("Production training baseline. Paper recipe (8 sites, "
