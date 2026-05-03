@@ -251,12 +251,42 @@ PHASE_REGISTRY: dict[str, dict] = {
         interventions=["three_class_direct"],
     ),
     "1a": dict(
-        parent="0m",
-        hypothesis=("Add time-masking augmentation to the 0m recipe. "
-                    "Tests whether SpecAugment-style time masking improves "
-                    "robustness on out-of-distribution val sites where 0m "
-                    "underperforms (notably bmabz on casey2017)."),
+        parent="baseline",
+        hypothesis=("Time-mask augmentation on the F1=0.474 baseline. "
+                    "Zero a random 0.2-1.5s window of the spectrogram "
+                    "during training; loss mask zeroed in the same range "
+                    "so erased frames don't contribute. Tests whether "
+                    "SpecAugment-style time masking improves cross-site "
+                    "generalisation."),
         interventions=["time_mask"],
+    ),
+    "1b": dict(
+        parent="baseline",
+        hypothesis=("Narrowband freq-mask augmentation on the baseline, "
+                    "deliberately avoiding the protected 12-52 Hz call "
+                    "band. Tests whether erasing random non-call "
+                    "frequency bands improves robustness to unseen "
+                    "ambient noise textures (notably casey2017's ice)."),
+        interventions=["freq_mask_safe"],
+    ),
+    "1c": dict(
+        parent="baseline",
+        hypothesis=("Whole-segment volume scaling on the baseline. "
+                    "Multiply each training sample's audio by a "
+                    "log-uniform factor in [0.5, 2.0]. Tests whether "
+                    "exposing the model to gain variation improves "
+                    "invariance across hydrophones and recording "
+                    "distances."),
+        interventions=["volume_scaling"],
+    ),
+    "1e": dict(
+        parent="baseline",
+        hypothesis=("Cross-site noise mixing on the baseline. For each "
+                    "positive sample, mix in a no-call clip from a "
+                    "different training site at controlled SNR. Directly "
+                    "addresses the cross-site failure mode diagnosed in "
+                    "Phase 0a."),
+        interventions=["cross_site_mix"],
     ),
     "baseline": dict(
         parent=None,
