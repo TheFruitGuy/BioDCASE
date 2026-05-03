@@ -186,8 +186,8 @@ def set_seed(seed: int = cfg.SEED):
 
     Routes through ``wandb_utils.seed_everything`` so the same seeding
     semantics apply across baseline (``train.py``) and every phase
-    1 augmentation experiment. Sets ``PYTHONHASHSEED``, Python
-    ``random``, NumPy, and torch CPU + CUDA generators.
+    1/2 augmentation/architecture experiment. Sets ``PYTHONHASHSEED``,
+    Python ``random``, NumPy, and torch CPU + CUDA generators.
     """
     wbu.seed_everything(seed, deterministic=False)
 
@@ -377,9 +377,11 @@ def train_epoch_with_aug(
 def run_phase1_training(
     *,
     phase_name: str,
-    augmentation_fn: Callable,
-    augmentation_config: dict,
+    augmentation_fn: Optional[Callable] = None,
+    augmentation_config: Optional[dict] = None,
     augmentation_state: Optional[Any] = None,
+    model_factory: Optional[Callable] = None,
+    model_factory_config: Optional[dict] = None,
     pretrained: Optional[str] = None,
     freeze_epochs: int = 0,
 ):
@@ -389,38 +391,61 @@ def run_phase1_training(
     Parameters
     ----------
     phase_name : str
-        Short identifier like ``"1a"``, ``"1b"``, ``"1c"``, ``"1e"``.
-        Used in the run name (``phase{phase_name}__seed...``) and the
-        run-directory path (``runs/phase{phase_name}_{timestamp}/``).
-    augmentation_fn : callable
+        Short identifier like ``"1a"``, ``"1b"``, ``"1c"``, ``"1e"``,
+        ``"2a"``, ``"2b"``. Used in the run name
+        (``phase{phase_name}__seed...``) and the run-directory path
+        (``runs/phase{phase_name}_{timestamp}/``).
+    augmentation_fn : callable, optional
         One of the functions from ``augmentations.py``. Must have a
         ``DOMAIN`` attribute equal to ``"audio"`` or ``"spectrogram"``.
-    augmentation_config : dict
-        Augmentation hyperparameters to log to wandb config (e.g.
-        ``{"mask_prob": 0.5, "max_frames": 75}``). Merged with the
-        baseline config; will appear under each run's W&B config.
+        Pass ``None`` for phases that don't apply augmentation
+        (e.g. Phase 2a/2b architecture experiments).
+    augmentation_config : dict, optional
+        Augmentation hyperparameters to log to wandb config.
+        Required if ``augmentation_fn`` is not None.
     augmentation_state : object, optional
         Auxiliary state the augmentation needs (e.g. the
         ``NoCallPool`` for Phase 1e). Passed through to the hook.
+    model_factory : callable, optional
+        Factory ``f(num_classes) -> nn.Module`` that constructs the
+        model. Defaults to the standard ``WhaleVAD`` constructor.
+        Phase 2 architecture experiments override this to swap in
+        e.g. the Transformer variant.
+    model_factory_config : dict, optional
+        Dict of model-construction kwargs to log to wandb so the run's
+        architecture is identifiable from the dashboard. Not passed to
+        the factory itself — the factory is expected to be a closure
+        over its hyperparameters (or read them from cfg).
     pretrained, freeze_epochs : passed through to model init
         Same semantics as ``train.py``'s CLI flags. Default: from
         scratch, no freezing.
     """
-    if not hasattr(augmentation_fn, "DOMAIN"):
-        raise ValueError(
-            f"{augmentation_fn} has no DOMAIN attribute. Add "
-            f"`apply_xxx.DOMAIN = 'audio'` or `'spectrogram'` to your "
-            f"augmentation function."
-        )
-    aug_domain = augmentation_fn.DOMAIN
-    assert aug_domain in {"audio", "spectrogram"}, \
-        f"DOMAIN must be 'audio' or 'spectrogram', got {aug_domain!r}"
+    if augmentation_fn is not None:
+        if not hasattr(augmentation_fn, "DOMAIN"):
+            raise ValueError(
+                f"{augmentation_fn} has no DOMAIN attribute. Add "
+                f"`apply_xxx.DOMAIN = 'audio'` or `'spectrogram'` to "
+                f"your augmentation function."
+            )
+        aug_domain = augmentation_fn.DOMAIN
+        assert aug_domain in {"audio", "spectrogram"}, \
+            f"DOMAIN must be 'audio' or 'spectrogram', got {aug_domain!r}"
+        if augmentation_config is None:
+            augmentation_config = {}
+    else:
+        aug_domain = None
+        augmentation_config = augmentation_config or {}
 
     set_seed()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    print(f"Phase: {phase_name}  Augmentation: {augmentation_fn.__name__}  "
-          f"Domain: {aug_domain}")
+    if augmentation_fn is not None:
+        print(f"Phase: {phase_name}  "
+              f"Augmentation: {augmentation_fn.__name__}  "
+              f"Domain: {aug_domain}")
+    else:
+        print(f"Phase: {phase_name}  Augmentation: none "
+              f"(architecture experiment)")
 
     # ------------------------------------------------------------------
     # W&B run setup. We use wbu.init_phase exactly as train.py does so
@@ -434,7 +459,12 @@ def run_phase1_training(
         extra_tags.append("focal_loss")
     if not cfg.USE_WEIGHTED_BCE and not getattr(cfg, "USE_FOCAL_LOSS", False):
         extra_tags.append("plain_bce")
-    extra_tags.append(f"aug_{augmentation_fn.__name__}")
+    if augmentation_fn is not None:
+        extra_tags.append(f"aug_{augmentation_fn.__name__}")
+    else:
+        extra_tags.append("no_aug")
+    if model_factory is not None:
+        extra_tags.append("custom_arch")
 
     config_payload = {
         "lr":               cfg.LR,
@@ -461,12 +491,18 @@ def run_phase1_training(
         "min_lr":           MIN_LR,
         "pretrained":       pretrained,
         "freeze_epochs":    freeze_epochs,
-        # Phase-1 specific:
+        # Phase-1 / Phase-2 specific:
         "phase":            phase_name,
-        "augmentation":     augmentation_fn.__name__,
+        "augmentation":     (augmentation_fn.__name__
+                             if augmentation_fn is not None else "none"),
         "aug_domain":       aug_domain,
+        "model_factory":    (model_factory.__name__
+                             if model_factory is not None
+                             else "WhaleVAD_default"),
     }
     config_payload.update(augmentation_config)
+    if model_factory_config is not None:
+        config_payload.update(model_factory_config)
 
     run = wbu.init_phase(
         phase_name,
@@ -496,7 +532,11 @@ def run_phase1_training(
     # Model
     # ------------------------------------------------------------------
     spec_extractor = SpectrogramExtractor().to(device)
-    model = WhaleVAD(num_classes=cfg.n_classes()).to(device)
+    if model_factory is not None:
+        print(f"Using custom model factory: {model_factory.__name__}")
+        model = model_factory(num_classes=cfg.n_classes()).to(device)
+    else:
+        model = WhaleVAD(num_classes=cfg.n_classes()).to(device)
     with torch.no_grad():
         dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
         model(spec_extractor(dummy))
@@ -619,11 +659,12 @@ def run_phase1_training(
 
         clf_module = (model.module.classifier
                       if isinstance(model, nn.DataParallel)
-                      else model.classifier)
-        bias_str = ", ".join(
-            f"{b:+.2f}" for b in clf_module.bias.detach().cpu().tolist()
-        )
-        print(f"  Classifier bias: [{bias_str}]")
+                      else getattr(model, "classifier", None))
+        if clf_module is not None and hasattr(clf_module, "bias"):
+            bias_str = ", ".join(
+                f"{b:+.2f}" for b in clf_module.bias.detach().cpu().tolist()
+            )
+            print(f"  Classifier bias: [{bias_str}]")
 
         # Checkpoint, unwrapping DataParallel for portability.
         model_state = (model.module.state_dict()
@@ -686,11 +727,21 @@ def run_phase1_training(
     wandb.summary["final_thresholds"]     = list(map(float, tuned))
     wandb.summary["epochs_run"]           = epoch
     wandb.summary["early_stopped"]        = no_improve_epochs >= EARLY_STOP_PATIENCE
+
+    # Build a label that reads either as "(time_mask)" for an aug run,
+    # "(WhaleVAD_Transformer_factory)" for an arch run, or "(no aug,
+    # default arch)" for an unmodified baseline replay.
+    if augmentation_fn is not None:
+        verdict_label = augmentation_fn.__name__
+    elif model_factory is not None:
+        verdict_label = model_factory.__name__
+    else:
+        verdict_label = "no aug, default arch"
     wandb.summary["verdict"] = (
-        f"Phase {phase_name} ({augmentation_fn.__name__}) finished at "
+        f"Phase {phase_name} ({verdict_label}) finished at "
         f"best F1 {best_f1:.3f} "
         f"(epoch {best_ckpt.get('epoch', '?')} of {epoch} run; "
         f"final tuned thresholds {[round(float(t), 2) for t in tuned]}). "
-        f"Reference baseline F1=0.474 (no augmentation)."
+        f"Reference baseline F1=0.474 (no augmentation, default arch)."
     )
     wandb.finish()
