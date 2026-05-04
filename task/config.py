@@ -353,7 +353,7 @@ NUM_WORKERS = 16
 
 #: Random seed, applied to ``random``, ``numpy``, and ``torch`` at the start
 #: of every entry point for reproducibility.
-SEED = 9999
+SEED = 1337
 
 
 # ======================================================================
