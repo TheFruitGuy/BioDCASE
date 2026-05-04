@@ -225,7 +225,7 @@ def process_one_file(client, key: str, out_path: Path, target_sr: int) -> str:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
     try:
-        sf.write(str(tmp_path), y, target_sr, subtype="PCM_16")
+        sf.write(str(tmp_path), y, target_sr, subtype="PCM_16", format="WAV")
         tmp_path.replace(out_path)
     except Exception as e:
         if tmp_path.exists():
