@@ -271,10 +271,15 @@ def pretrain(
             spec_a = cfg_pre.view_fn(audio, sites, cfg_pre.spec_extractor)
             spec_b = cfg_pre.view_fn(audio, sites, cfg_pre.spec_extractor)
 
-            z_a = encode_batch(model, projection, spec_a)
-            z_b = encode_batch(model, projection, spec_b)
-
-            loss, info = info_nce_loss(z_a, z_b, temperature=cfg_pre.temperature)
+            # BF16 mixed precision: halves activation memory, ~2x speed on
+            # L40S/A100/H100. STFT runs in FP32 above (precision sensitive);
+            # encoder + InfoNCE run in BF16 inside the autocast.
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                z_a = encode_batch(model, projection, spec_a)
+                z_b = encode_batch(model, projection, spec_b)
+                loss, info = info_nce_loss(
+                    z_a, z_b, temperature=cfg_pre.temperature,
+                )
 
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
