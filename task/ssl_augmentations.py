@@ -1,30 +1,22 @@
 """
-SSL Augmentations
-=================
+SSL Augmentations (v2 — aggressive, post-collapse)
+==================================================
 
-Positive-pair augmentations for contrastive pretraining. The supervised
-augmentations in ``augmentations.py`` are designed around a (spec, mask,
-audio, targets, metas) protocol that doesn't map cleanly to SSL — there
-are no labels, no padding mask, and we want two independent views per
-clip. The functions here are stripped-down equivalents that operate
-directly on tensors.
+Stronger positive-pair augmentations after the v1 augmentations
+(volume + small freq mask only) collapsed at top1=0.999. The encoder
+was memorizing waveform identities because the two views were ~95%
+identical.
 
-Three augmentations:
+This version applies four independent transformations with high
+probability, making the views genuinely different:
 
-- ``ssl_volume_scaling`` (audio domain)
-    Per-sample log-uniform volume scaling.
+- ssl_volume_scaling   (audio domain, log-uniform 0.3-3.0×, p=1.0)
+- ssl_time_mask        (audio domain, zero 5-12s of the 30s clip, p=1.0)
+- ssl_add_noise        (audio domain, Gaussian noise at SNR 5-20 dB, p=1.0)
+- ssl_freq_mask        (spec domain,  zero 8-20 bins outside [13,53], p=1.0)
 
-- ``ssl_freq_mask`` (spec domain)
-    Narrowband freq mask outside the protected [13, 53] bin range
-    (whale-call energy band — same band as ``apply_freq_mask_safe``).
-
-- ``ssl_cross_site_mix`` (audio domain)
-    Mix in a no-call clip from a different site at random SNR. Only
-    used in 3β. Treats every SSL clip as a "negative" for SNR purposes
-    (whole-segment energy reference) since labels are unavailable.
-
-All three are applied independently to each view, so the two views of
-the same source clip differ in their realised augmentation parameters.
+Plus, for 3β only:
+- ssl_cross_site_mix   (audio domain, no-call clip from different site)
 """
 
 from __future__ import annotations
@@ -34,10 +26,10 @@ from typing import Optional
 import torch
 
 
-# Constants — must match config.py / spectrogram.py. Hardcoded so this
-# module is independent of cfg.
+# Constants — must match config.py / spectrogram.py.
 HOP_LENGTH = 5
-N_FREQ = 129                  # n_fft // 2 + 1 with n_fft=256
+N_FREQ = 129
+SAMPLE_RATE = 250
 
 # Whale-call energy band (bin indices). Outside this range it's safe to
 # zero-mask without erasing discriminative content.
@@ -51,11 +43,11 @@ PROTECTED_FREQ_BIN_HI = 53
 
 def ssl_volume_scaling(
     audio: torch.Tensor,                # (B, n_samples)
-    p: float = 0.5,
-    scale_min: float = 0.5,
-    scale_max: float = 2.0,
+    p: float = 1.0,
+    scale_min: float = 0.3,
+    scale_max: float = 3.0,
 ) -> torch.Tensor:
-    """Per-sample log-uniform volume scaling, returns a new tensor."""
+    """Per-sample log-uniform volume scaling."""
     B = audio.size(0)
     out = audio.clone()
     log_min = torch.log(torch.tensor(scale_min))
@@ -68,20 +60,20 @@ def ssl_volume_scaling(
         out[b] = out[b] * factor
     return out
 
+
 def ssl_time_mask(
-    audio: torch.Tensor,                 # (B, n_samples)
-    p: float = 0.8,
-    min_seconds: float = 1.0,
-    max_seconds: float = 3.0,
-    sample_rate: int = 250,
+    audio: torch.Tensor,                # (B, n_samples)
+    p: float = 1.0,
+    min_seconds: float = 5.0,
+    max_seconds: float = 12.0,
+    sample_rate: int = SAMPLE_RATE,
 ) -> torch.Tensor:
     """
-    Per-sample audio-domain time masking: zero a random 1-3 second window.
+    Per-sample audio-domain time masking: zero a random 5-12s window.
 
-    This is the temporal analog of frequency masking, and the audio analog
-    of SimCLR's random crop. Critical for breaking the "memorize the
-    waveform" trivial solution that volume + freq mask alone are too weak
-    to prevent.
+    On a 30s clip this masks 17-40% of the duration — large enough to
+    force the encoder to reason about content rather than memorize the
+    waveform.
     """
     B, n_samples = audio.shape
     out = audio.clone()
@@ -98,32 +90,37 @@ def ssl_time_mask(
     return out
 
 
+def ssl_add_noise(
+    audio: torch.Tensor,                # (B, n_samples)
+    p: float = 1.0,
+    snr_min_db: float = 5.0,
+    snr_max_db: float = 20.0,
+) -> torch.Tensor:
+    """Add Gaussian noise at random per-sample SNR."""
+    B = audio.size(0)
+    out = audio.clone()
+    for b in range(B):
+        if torch.rand(1, device=audio.device).item() >= p:
+            continue
+        sig_energy = (out[b] ** 2).mean().clamp(min=1e-12)
+        snr_db = float(snr_min_db + torch.rand(1).item() * (snr_max_db - snr_min_db))
+        noise_energy = sig_energy / (10.0 ** (snr_db / 10.0))
+        noise = torch.randn_like(out[b]) * torch.sqrt(noise_energy)
+        out[b] = out[b] + noise
+    return out
+
+
 def ssl_cross_site_mix(
     audio: torch.Tensor,                # (B, n_samples)
     sites: list[str],
-    no_call_pool,                       # NoCallPool instance
+    no_call_pool,                       # NoCallPool / ExtendedNoCallPool
     p: float = 0.5,
     snr_min_db: float = -6.0,
     snr_max_db: float = 6.0,
 ) -> torch.Tensor:
-    """
-    Per-sample cross-site noise mixing.
-
-    For each sample with probability ``p``, draw a no-call clip from a
-    site other than ``sites[b]`` and mix it in at SNR ∈ [snr_min_db,
-    snr_max_db]. SNR is computed against whole-segment energy, since
-    we have no labels to identify "call frames" — equivalent to
-    treating each SSL clip as if it were a negative segment.
-
-    This is intentionally weaker than the supervised ``apply_cross_site_mix``
-    which uses call-frame energy. The encoder will see clips at a wider
-    range of effective SNRs, which is fine for pretraining: the goal is
-    to push the encoder toward site-noise invariance, not to perfectly
-    preserve call SNR.
-    """
+    """Per-sample cross-site noise mixing (3β only)."""
     B, n_samples = audio.shape
     out = audio.clone()
-
     for b in range(B):
         if torch.rand(1, device=audio.device).item() >= p:
             continue
@@ -137,13 +134,11 @@ def ssl_cross_site_mix(
             continue
         if noise is None or noise.numel() != n_samples:
             continue
-
         sig_energy = (out[b] ** 2).mean().clamp(min=1e-12)
         noise_energy = (noise ** 2).mean().clamp(min=1e-12)
         snr_db = float(snr_min_db + torch.rand(1).item() * (snr_max_db - snr_min_db))
         scale = torch.sqrt(sig_energy / (noise_energy * (10.0 ** (snr_db / 10.0))))
         out[b] = out[b] + scale * noise
-
     return out
 
 
@@ -153,20 +148,13 @@ def ssl_cross_site_mix(
 
 def ssl_freq_mask(
     spec: torch.Tensor,                  # (B, C, F, T)
-    p: float = 0.5,
-    min_bins: int = 5,
-    max_bins: int = 12,
+    p: float = 1.0,
+    min_bins: int = 8,
+    max_bins: int = 20,
     protected_lo: int = PROTECTED_FREQ_BIN_LO,
     protected_hi: int = PROTECTED_FREQ_BIN_HI,
 ) -> torch.Tensor:
-    """
-    Per-sample narrowband frequency masking, avoiding the protected
-    [protected_lo, protected_hi] bin range.
-
-    Two valid mask regions: below the protected band and above it. For
-    each masked sample we pick one region uniformly, then a random
-    band of width ``[min_bins, max_bins]`` within it.
-    """
+    """Per-sample narrowband freq mask outside the [13, 53] protected band."""
     B, _, F, _ = spec.shape
     out = spec.clone()
 
@@ -208,34 +196,46 @@ def make_view(
     spec_extractor,
     *,
     use_volume: bool = True,
-    use_time_mask: bool = True,        # NEW
+    use_time_mask: bool = True,
+    use_noise: bool = True,
     use_freq_mask: bool = True,
     use_cross_site: bool = False,
     no_call_pool=None,
-    volume_p: float = 0.8,             # was 0.5
-    time_mask_p: float = 0.8,          # NEW
-    freq_mask_p: float = 0.8,          # was 0.5
+    volume_p: float = 1.0,
+    time_mask_p: float = 1.0,
+    noise_p: float = 1.0,
+    freq_mask_p: float = 1.0,
     cross_site_p: float = 0.5,
 ) -> torch.Tensor:
     """
     Apply the SSL augmentation pipeline once to produce a single view.
 
-    Audio-domain augmentations (volume, optionally cross-site mix) run
-    before spectrogram extraction; spectrogram-domain augmentations
-    (freq mask) run after. Returns the augmented spectrogram of shape
-    ``(B, 3, F, T_spec)`` ready to feed into the encoder.
+    Order:
+        audio  →  volume  →  time_mask  →  noise  →  cross_site
+              →  STFT
+              →  freq_mask
+              →  spec
 
-    Call this twice (with different RNG state) per source batch to get
-    the (view_a, view_b) contrastive pair.
+    Call this twice per source batch to get the (view_a, view_b)
+    contrastive pair. Each call picks fresh random augmentation
+    parameters, so the two views differ in their realisations even
+    though they start from the same audio.
     """
     a = audio
     if use_volume:
         a = ssl_volume_scaling(a, p=volume_p)
+    if use_time_mask:
+        a = ssl_time_mask(a, p=time_mask_p)
+    if use_noise:
+        a = ssl_add_noise(a, p=noise_p)
     if use_cross_site:
         if no_call_pool is None:
             raise ValueError("use_cross_site=True requires no_call_pool")
         a = ssl_cross_site_mix(a, sites, no_call_pool, p=cross_site_p)
+
     spec = spec_extractor(a)
+
     if use_freq_mask:
         spec = ssl_freq_mask(spec, p=freq_mask_p)
+
     return spec
