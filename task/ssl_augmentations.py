@@ -68,6 +68,35 @@ def ssl_volume_scaling(
         out[b] = out[b] * factor
     return out
 
+def ssl_time_mask(
+    audio: torch.Tensor,                 # (B, n_samples)
+    p: float = 0.8,
+    min_seconds: float = 1.0,
+    max_seconds: float = 3.0,
+    sample_rate: int = 250,
+) -> torch.Tensor:
+    """
+    Per-sample audio-domain time masking: zero a random 1-3 second window.
+
+    This is the temporal analog of frequency masking, and the audio analog
+    of SimCLR's random crop. Critical for breaking the "memorize the
+    waveform" trivial solution that volume + freq mask alone are too weak
+    to prevent.
+    """
+    B, n_samples = audio.shape
+    out = audio.clone()
+    min_samp = int(min_seconds * sample_rate)
+    max_samp = int(max_seconds * sample_rate)
+    for b in range(B):
+        if torch.rand(1, device=audio.device).item() >= p:
+            continue
+        w = int(torch.randint(min_samp, max_samp + 1, (1,)).item())
+        if n_samples - w <= 0:
+            continue
+        s = int(torch.randint(0, n_samples - w + 1, (1,)).item())
+        out[b, s:s + w] = 0.0
+    return out
+
 
 def ssl_cross_site_mix(
     audio: torch.Tensor,                # (B, n_samples)
@@ -179,11 +208,13 @@ def make_view(
     spec_extractor,
     *,
     use_volume: bool = True,
+    use_time_mask: bool = True,        # NEW
     use_freq_mask: bool = True,
     use_cross_site: bool = False,
     no_call_pool=None,
-    volume_p: float = 0.5,
-    freq_mask_p: float = 0.5,
+    volume_p: float = 0.8,             # was 0.5
+    time_mask_p: float = 0.8,          # NEW
+    freq_mask_p: float = 0.8,          # was 0.5
     cross_site_p: float = 0.5,
 ) -> torch.Tensor:
     """
