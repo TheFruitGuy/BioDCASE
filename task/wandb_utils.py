@@ -305,6 +305,28 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "sequences."),
         interventions=["transformer_encoder"],
     ),
+    "3a": dict(
+        parent=None,
+        hypothesis=("SimCLR-style contrastive pretraining on diverse "
+                    "Antarctic PAM data: 8 BioDCASE training sites + 4 "
+                    "AADC sites. Augmentations per view: volume scaling "
+                    "+ narrowband freq mask outside the protected "
+                    "[13,53] call band. No cross-site noise mixing. "
+                    "Produces an encoder for fine-tuning via train.py "
+                    "--pretrained."),
+        interventions=["ssl_pretrain", "ssl_data_diversity"],
+    ),
+    "3b": dict(
+        parent=None,
+        hypothesis=("SimCLR-style contrastive pretraining + cross-site "
+                    "noise mixing on the second view. Forces the encoder "
+                    "to map together two clips that differ in their "
+                    "site-specific noise floor — pushes it toward "
+                    "site-invariant representations for cross-site "
+                    "generalisation."),
+        interventions=["ssl_pretrain", "ssl_data_diversity",
+                       "ssl_cross_site_mix"],
+    ),
     "baseline": dict(
         parent=None,
         hypothesis=("Production training baseline. Paper recipe (8 sites, "
