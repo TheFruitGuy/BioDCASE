@@ -46,7 +46,7 @@ from pathlib import Path
 #:       validation/
 #:         annotations/{dataset_name}.csv
 #:         audio/{dataset_name}/*.wav
-DATA_ROOT = Path("/home/matthias-nagl/BioDCASE/task/2026_BioDCASE_development_set/")
+DATA_ROOT = Path(__file__).resolve().parent / "2026_BioDCASE_development_set"
 
 #: Directory under which all training runs write their checkpoints and logs.
 #: Each run creates a timestamped subdirectory (e.g. ``runs/whalevad_20260419_085020/``).
