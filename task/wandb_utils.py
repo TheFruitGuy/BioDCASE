@@ -327,6 +327,23 @@ PHASE_REGISTRY: dict[str, dict] = {
         interventions=["ssl_pretrain", "ssl_data_diversity",
                        "ssl_cross_site_mix"],
     ),
+    "4a": dict(
+        parent="baseline",
+        hypothesis=("Fine-tune the supervised baseline starting from "
+                    "the Phase 3a encoder (data diversity only). Tests "
+                    "whether SSL pretraining on diverse Antarctic PAM "
+                    "data improves cross-site supervised performance."),
+        interventions=["pretrained_3a"],
+    ),
+    "4b": dict(
+        parent="baseline",
+        hypothesis=("Fine-tune the supervised baseline starting from "
+                    "the Phase 3b encoder (data diversity + cross-site "
+                    "noise mixing). Tests whether the explicit site-"
+                    "invariance objective in 3b transfers to cleaner "
+                    "supervised generalisation than 3a."),
+        interventions=["pretrained_3b"],
+    ),
     "baseline": dict(
         parent=None,
         hypothesis=("Production training baseline. Paper recipe (8 sites, "
