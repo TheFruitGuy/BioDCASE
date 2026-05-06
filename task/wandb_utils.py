@@ -344,6 +344,19 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "supervised generalisation than 3a."),
         interventions=["pretrained_3b"],
     ),
+    "5": dict(
+        parent="baseline",
+        hypothesis=("WhaleVAD-BPN reproduction and search. The paper "
+                    "(Geldenhuys et al. 2025) settles BPN-multi+BiLSTM "
+                    "as the architecture but doesn't fully specify "
+                    "every knob (R, pool mode, init, taps, dilation, "
+                    "auxiliary supervision). This phase searches that "
+                    "config space + the dilated-depthwise architecture "
+                    "change. The headline 'with-gate vs without-gate' "
+                    "comparison is recoverable via the bpn_enabled "
+                    "config field."),
+        interventions=["dilated_depthwise", "bpn_search"],
+    ),
     "baseline": dict(
         parent=None,
         hypothesis=("Production training baseline. Paper recipe (8 sites, "
