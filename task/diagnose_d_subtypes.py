@@ -1,21 +1,21 @@
 """
-diagnose_d_subtypes.py
-======================
+diagnose_d_subtypes.py  (v2 — fixed for actual schema)
+=======================================================
 
 Decomposes the 3-class "d" label into its underlying fine-grained labels
-(presumably distinguishing fin-whale and blue-whale D-calls if your
-annotation source did so) and prints distribution statistics across
-training and validation sites.
+(found in the `annotation` column) and summarises distribution and
+frequency-band statistics across train and validation sites.
 
-This script answers three questions:
-1. Does the annotation schema actually distinguish D subtypes?
-2. Is each subtype present in BOTH train and val? (If not, no architecture
-   change can rescue the missing subtype.)
-3. Do the subtypes have meaningfully different durations?
+Crucially, this script also looks at `low_frequency` / `high_frequency`
+columns. Even if all D-class rows happen to share the same `annotation`
+string, distinct call types often live in distinct frequency bands —
+e.g. fin-whale 20-Hz pulses (~15-30 Hz, ~1s) vs blue-whale D-calls
+(~30-100 Hz, ~1-4s). If the frequency distribution is bimodal, that's
+direct evidence of acoustic subtypes hidden inside a single label.
 
 Run from BioDCASE/task/:
 
-    python diagnose_d_subtypes.py
+    python diagnose_d_subtypes.py 2>&1 | tee d_diagnostics_stats.txt
 
 Output: prints to stdout. No PNGs.
 """
@@ -30,171 +30,250 @@ import config as cfg
 from dataset import load_annotations
 
 
+# Candidate column names for the "fine-grained label", in priority order.
+# 'annotation' is what your schema uses; the others are kept for
+# compatibility with possible future relabelings.
+FINE_LABEL_CANDIDATES = ["annotation", "label", "label_7class",
+                         "label_orig", "label_full"]
+
+
 def section(title: str) -> None:
-    """Print a clean header so output is scannable."""
     print()
     print("=" * 72)
     print(f"  {title}")
     print("=" * 72)
 
 
-def describe_subtypes(name: str, datasets: list[str]) -> pd.DataFrame:
-    """Load annotations for `datasets`, print subtype breakdown, return d-only frame."""
+def find_fine_col(df: pd.DataFrame) -> str | None:
+    for c in FINE_LABEL_CANDIDATES:
+        if c in df.columns and c != "label_3class":
+            return c
+    return None
+
+
+def add_duration(df: pd.DataFrame) -> pd.DataFrame:
+    """Add a `duration_s` column. Schema has `start_datetime` / `end_datetime`."""
+    if "duration" in df.columns:
+        # Val split has it precomputed
+        df = df.copy()
+        df["duration_s"] = pd.to_numeric(df["duration"], errors="coerce")
+        return df
+    if "start_datetime" in df.columns and "end_datetime" in df.columns:
+        df = df.copy()
+        s = pd.to_datetime(df["start_datetime"], utc=True, errors="coerce")
+        e = pd.to_datetime(df["end_datetime"], utc=True, errors="coerce")
+        df["duration_s"] = (e - s).dt.total_seconds()
+        return df
+    df = df.copy()
+    df["duration_s"] = float("nan")
+    return df
+
+
+def describe_split(name: str, datasets: list[str]) -> tuple[pd.DataFrame, str | None]:
+    """Print breakdown for a split, return (d-only frame, fine_col_name)."""
     section(f"{name.upper()}: subtype decomposition of 3-class 'd'")
 
     ann = load_annotations(datasets)
-
-    # Show what columns exist so user can adapt the script if their schema differs.
     print(f"\nAnnotation columns available: {list(ann.columns)}")
     print(f"Total annotations: {len(ann)}")
 
     if "label_3class" not in ann.columns:
-        print("\nERROR: no 'label_3class' column in annotations. Aborting.")
+        print("\nERROR: no 'label_3class' column. Aborting.")
         sys.exit(1)
 
-    # Some pipelines store the original label under 'label', others under
-    # 'label_orig' or 'label_7class'. Pick whichever exists; fall back to
-    # 'label_3class' itself (in which case there is no subtype distinction).
-    candidates = ["label", "label_7class", "label_orig", "label_full"]
-    fine_col = None
-    for c in candidates:
-        if c in ann.columns:
-            fine_col = c
-            break
-
-    if fine_col is None or fine_col == "label_3class":
-        print("\nNo fine-grained label column found. Subtype analysis impossible "
-              "without re-annotation. Stopping here.")
-        return pd.DataFrame()
-
+    fine_col = find_fine_col(ann)
+    if fine_col is None:
+        print(f"\nNo fine-label column found. Tried: {FINE_LABEL_CANDIDATES}")
+        return pd.DataFrame(), None
     print(f"Using '{fine_col}' as the fine-grained label column.\n")
 
     d_only = ann[ann["label_3class"] == "d"].copy()
+    d_only = add_duration(d_only)
     print(f"Rows with label_3class == 'd': {len(d_only)}")
+    if d_only.empty:
+        return d_only, fine_col
 
-    if len(d_only) == 0:
-        print("No D-class annotations found.")
-        return d_only
-
-    # Q1: what fine labels collapse into 3-class 'd'?
-    print(f"\nFine-grained labels that map to 'd':")
+    # Q1: which fine labels collapse into 'd'?
+    print(f"\nFine-grained labels mapping to 'd':")
     counts = d_only[fine_col].value_counts(dropna=False)
     for label, n in counts.items():
         pct = 100.0 * n / len(d_only)
-        print(f"  {str(label):20s}  n={n:6d}  ({pct:5.1f}%)")
+        print(f"  {str(label):24s}  n={n:6d}  ({pct:5.1f}%)")
 
     if len(counts) == 1:
-        print("\nOnly ONE fine label maps to 'd' — the annotations do not "
-              "distinguish D subtypes. Specialisation by retraining with "
-              "extra classes is impossible without re-annotation.")
-        return d_only
+        only_label = str(counts.index[0])
+        print(f"\nOnly ONE fine label ('{only_label}') maps to 'd'. The label "
+              f"column doesn't distinguish D subtypes, but the FREQUENCY band "
+              f"analysis below may still reveal acoustic subtypes.")
 
-    # Q2: per-site breakdown
+    # Q2: per-site × per-subtype counts
     print(f"\nPer-site × per-subtype counts:")
     pivot = d_only.groupby(["dataset", fine_col]).size().unstack(fill_value=0)
     print(pivot.to_string())
-    print(f"\nPer-site totals:")
-    print(pivot.sum(axis=1).sort_values(ascending=False).to_string())
 
-    # Q3: duration statistics per subtype
-    print(f"\nDuration (seconds) per subtype:")
-    if "start_s" in d_only.columns and "end_s" in d_only.columns:
-        d_only["duration_s"] = d_only["end_s"] - d_only["start_s"]
+    # Q3: duration per subtype
+    print(f"\nDuration (s) per subtype:")
+    for label in counts.index:
+        sub = d_only[d_only[fine_col] == label]["duration_s"].dropna()
+        if sub.empty:
+            print(f"  {str(label):24s}  (no duration data)")
+            continue
+        print(f"  {str(label):24s}  "
+              f"min={sub.min():.2f}  "
+              f"p25={sub.quantile(0.25):.2f}  "
+              f"median={sub.median():.2f}  "
+              f"p75={sub.quantile(0.75):.2f}  "
+              f"max={sub.max():.2f}  "
+              f"mean={sub.mean():.2f}  "
+              f"n={len(sub)}")
+
+    # Q4: frequency band per subtype — the killer feature
+    print(f"\nFrequency band (Hz) per subtype:")
+    if "low_frequency" in d_only.columns and "high_frequency" in d_only.columns:
+        lo = pd.to_numeric(d_only["low_frequency"], errors="coerce")
+        hi = pd.to_numeric(d_only["high_frequency"], errors="coerce")
+        d_only["lo_Hz"] = lo
+        d_only["hi_Hz"] = hi
+        d_only["bw_Hz"] = hi - lo
+
         for label in counts.index:
             sub = d_only[d_only[fine_col] == label]
-            durs = sub["duration_s"]
-            print(f"  {str(label):20s}  "
-                  f"min={durs.min():.2f}  "
-                  f"p25={durs.quantile(0.25):.2f}  "
-                  f"median={durs.median():.2f}  "
-                  f"p75={durs.quantile(0.75):.2f}  "
-                  f"max={durs.max():.2f}  "
-                  f"mean={durs.mean():.2f}")
+            valid = sub.dropna(subset=["lo_Hz", "hi_Hz"])
+            if valid.empty:
+                print(f"  {str(label):24s}  (no freq-band data)")
+                continue
+            print(f"  {str(label)}  (n={len(valid)})")
+            print(f"    low_Hz   "
+                  f"min={valid['lo_Hz'].min():6.1f}  "
+                  f"p25={valid['lo_Hz'].quantile(0.25):6.1f}  "
+                  f"med={valid['lo_Hz'].median():6.1f}  "
+                  f"p75={valid['lo_Hz'].quantile(0.75):6.1f}  "
+                  f"max={valid['lo_Hz'].max():6.1f}")
+            print(f"    high_Hz  "
+                  f"min={valid['hi_Hz'].min():6.1f}  "
+                  f"p25={valid['hi_Hz'].quantile(0.25):6.1f}  "
+                  f"med={valid['hi_Hz'].median():6.1f}  "
+                  f"p75={valid['hi_Hz'].quantile(0.75):6.1f}  "
+                  f"max={valid['hi_Hz'].max():6.1f}")
+            print(f"    bw_Hz    "
+                  f"min={valid['bw_Hz'].min():6.1f}  "
+                  f"p25={valid['bw_Hz'].quantile(0.25):6.1f}  "
+                  f"med={valid['bw_Hz'].median():6.1f}  "
+                  f"p75={valid['bw_Hz'].quantile(0.75):6.1f}  "
+                  f"max={valid['bw_Hz'].max():6.1f}")
     else:
-        print("  (no start_s/end_s columns — skipping)")
+        print("  (no low_frequency/high_frequency columns)")
 
-    return d_only
+    # Q5: bimodality check on low_frequency — direct test for "two D types"
+    if "low_frequency" in d_only.columns:
+        print(f"\nlow_frequency distribution (D-class only) — coarse histogram:")
+        lo_vals = pd.to_numeric(d_only["low_frequency"], errors="coerce").dropna()
+        if not lo_vals.empty:
+            # Bin in 5-Hz steps from 0 to 100, then 100+
+            edges = list(range(0, 105, 5)) + [float("inf")]
+            labels = [f"{edges[i]:>3.0f}-{edges[i+1]:>3.0f} Hz"
+                      for i in range(len(edges) - 1)]
+            cuts = pd.cut(lo_vals, bins=edges, labels=labels,
+                          include_lowest=True, right=False)
+            counts = cuts.value_counts().sort_index()
+            mx = counts.max()
+            for bin_label, n in counts.items():
+                bar = "#" * int(40 * n / mx) if mx > 0 else ""
+                print(f"  {bin_label:>14s}  {n:6d}  {bar}")
+            print(f"\n  Look for bimodality (two peaks). A bimodal distribution "
+                  f"is direct evidence of two acoustic subtypes.")
+
+    return d_only, fine_col
 
 
-def cross_split_comparison(d_train: pd.DataFrame, d_val: pd.DataFrame, fine_col: str) -> None:
-    """Compare which subtypes appear in train vs val — the key generalisation question."""
-    section("TRAIN vs VAL: subtype coverage")
-
+def cross_split(d_train: pd.DataFrame, d_val: pd.DataFrame, fine_col: str) -> None:
+    section("TRAIN vs VAL: fine-label coverage")
     if d_train.empty or d_val.empty:
-        print("One side empty, skipping comparison.")
+        print("One side empty, skipping.")
         return
 
     train_counts = d_train[fine_col].value_counts()
     val_counts = d_val[fine_col].value_counts()
-
     all_labels = sorted(set(train_counts.index) | set(val_counts.index),
-                        key=lambda x: -(train_counts.get(x, 0) + val_counts.get(x, 0)))
+                        key=lambda x: -(int(train_counts.get(x, 0))
+                                        + int(val_counts.get(x, 0))))
 
-    print(f"\n  {'subtype':20s}  {'train':>8}  {'val':>8}  {'val/train':>10}")
-    print(f"  {'-'*20}  {'-'*8}  {'-'*8}  {'-'*10}")
+    print(f"\n  {'subtype':24s}  {'train':>8}  {'val':>8}  {'val/train':>10}")
+    print(f"  {'-'*24}  {'-'*8}  {'-'*8}  {'-'*10}")
     for label in all_labels:
         n_t = int(train_counts.get(label, 0))
         n_v = int(val_counts.get(label, 0))
         ratio = "n/a" if n_t == 0 else f"{n_v/n_t:.3f}"
-        print(f"  {str(label):20s}  {n_t:>8d}  {n_v:>8d}  {ratio:>10}")
+        print(f"  {str(label):24s}  {n_t:>8d}  {n_v:>8d}  {ratio:>10}")
 
-    print()
     train_only = set(train_counts.index) - set(val_counts.index)
     val_only = set(val_counts.index) - set(train_counts.index)
     if train_only:
-        print(f"  WARNING: subtypes seen in TRAIN but not VAL: {train_only}")
-        print(f"           (model is wasting capacity learning these)")
+        print(f"\n  WARNING: in TRAIN but not VAL: {train_only}")
     if val_only:
-        print(f"  WARNING: subtypes seen in VAL but not TRAIN: {val_only}")
-        print(f"           (model literally cannot detect these — distribution shift)")
+        print(f"  WARNING: in VAL but not TRAIN: {val_only} "
+              f"(distribution shift, model literally cannot learn these)")
     if not train_only and not val_only:
-        print("  Both sides contain the same subtypes. Specialisation is feasible.")
+        print(f"\n  Both sides cover the same labels.")
+
+
+def cross_split_freqs(d_train: pd.DataFrame, d_val: pd.DataFrame) -> None:
+    section("TRAIN vs VAL: frequency-band statistics (D-class)")
+    for name, df in [("train", d_train), ("val", d_val)]:
+        if df.empty or "low_frequency" not in df.columns:
+            continue
+        lo = pd.to_numeric(df["low_frequency"], errors="coerce").dropna()
+        hi = pd.to_numeric(df["high_frequency"], errors="coerce").dropna()
+        if lo.empty or hi.empty:
+            continue
+        print(f"\n  {name}:")
+        print(f"    low_Hz   med={lo.median():6.1f}  "
+              f"p10={lo.quantile(0.1):6.1f}  p90={lo.quantile(0.9):6.1f}")
+        print(f"    high_Hz  med={hi.median():6.1f}  "
+              f"p10={hi.quantile(0.1):6.1f}  p90={hi.quantile(0.9):6.1f}")
 
 
 def main() -> None:
     print(textwrap.dedent(f"""
-        D-class subtype diagnostic
-        ==========================
+        D-class subtype diagnostic (v2)
+        ================================
         Train datasets: {cfg.TRAIN_DATASETS}
         Val   datasets: {cfg.VAL_DATASETS}
     """).strip())
 
-    d_train = describe_subtypes("train", cfg.TRAIN_DATASETS)
-    d_val = describe_subtypes("val", cfg.VAL_DATASETS)
+    d_train, fc_train = describe_split("train", cfg.TRAIN_DATASETS)
+    d_val, fc_val = describe_split("val", cfg.VAL_DATASETS)
 
-    # Pick the fine column from the train frame (must match val if both have it)
-    candidates = ["label", "label_7class", "label_orig", "label_full"]
-    fine_col = None
-    for c in candidates:
-        if c in d_train.columns:
-            fine_col = c
-            break
+    if fc_train and fc_val and fc_train == fc_val and not d_train.empty and not d_val.empty:
+        cross_split(d_train, d_val, fc_train)
 
-    if fine_col is not None and not d_train.empty and not d_val.empty:
-        cross_split_comparison(d_train, d_val, fine_col)
+    if not d_train.empty and not d_val.empty:
+        cross_split_freqs(d_train, d_val)
 
-    section("DECISION")
+    section("DECISION GUIDE")
     print(textwrap.dedent("""
-        Interpretation guide:
+        Read the histogram of low_frequency above.
 
-          - If only ONE subtype mapped to 'd':
-              No specialisation possible. Falls back to recipe changes
-              (oversampling, D-centred windowing, postprocessing tuning).
+          - SINGLE peak (e.g. one mode at 20-25 Hz):
+              D-class is acoustically homogeneous. No specialisation
+              possible. Pivot to recipe changes (oversampling, D-centred
+              training windows, postprocessing tuning).
 
-          - If MULTIPLE subtypes BUT one is missing from train OR val:
-              Distribution shift is the bottleneck. Architecture changes
-              will not help. Consider per-site evaluation, accept ceiling
-              for the missing subtype, focus elsewhere.
+          - TWO clear peaks (e.g. one at 15-30 Hz, another at 50-100 Hz):
+              Direct evidence of acoustic subtypes despite single label.
+              Specialisation is feasible by SYNTHETIC SUBTYPING:
+                1. Bin annotations by low_frequency threshold
+                2. Train with 4-class output (split d into d_lowband and
+                   d_highband)
+                3. At eval, sum the two D probabilities back into one D
+                   score before threshold tuning
 
-          - If MULTIPLE subtypes AND both sides have all of them:
-              Specialisation is feasible. Cheapest first move is 4-class
-              training (split d into d_subtype_a and d_subtype_b) with
-              3-class eval (sum the two D probabilities back). Run the
-              spectrogram visualisation to confirm the subtypes look
-              acoustically different before committing.
+          - TRAIN vs VAL frequency stats differ a lot:
+              Distribution shift on D itself. Architecture changes will
+              not bridge this. Consider per-site eval, or accept ceiling.
 
         Next: run `python visualize_d_subtypes.py` to see what the calls
-        actually look like.
+        actually look like — confirms or contradicts the histogram story.
     """).strip())
     print()
 
