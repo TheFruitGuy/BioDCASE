@@ -414,8 +414,33 @@ def main():
         extra_tags.append("focal_loss")
     if not cfg.USE_WEIGHTED_BCE and not getattr(cfg, "USE_FOCAL_LOSS", False):
         extra_tags.append("plain_bce")
+
+    # Phase dispatch. ``train.py`` is registered as ``baseline`` for
+    # from-scratch runs. When fine-tuning from an SSL encoder, we
+    # promote the run to its own phase id (``4a`` for 3a-pretrained,
+    # ``4b`` for 3b-pretrained) so the cumulative intervention chain
+    # correctly inherits baseline's recipe AND tags ``pretrained_3X``.
+    # If the pretrained path doesn't match a registered phase (e.g.
+    # ad-hoc encoder from an experiment we haven't formalised), we
+    # fall back to ``baseline`` with a tag — never crash.
+    pretrain_phase = None
+    phase_id = "baseline"
+    if args.pretrained:
+        import re
+        m = re.search(r"(3[a-z])", str(args.pretrained))
+        pretrain_phase = m.group(1) if m else "unknown"
+        candidate_phase = f"4{pretrain_phase[-1]}"
+        if candidate_phase in wbu.PHASE_REGISTRY:
+            phase_id = candidate_phase
+        else:
+            print(f"WARNING: pretrained source phase '{pretrain_phase}' "
+                  f"has no corresponding phase 4 entry "
+                  f"('{candidate_phase}'). Falling back to 'baseline'. "
+                  f"Add the phase to wandb_utils.PHASE_REGISTRY for "
+                  f"a fully-tagged run.")
+            extra_tags.append(f"pretrained_{pretrain_phase}")
     run = wbu.init_phase(
-        "baseline",
+        phase_id,
         extra_tags=extra_tags,
         config={
             "lr":               cfg.LR,
@@ -443,6 +468,7 @@ def main():
             "min_lr":           MIN_LR,
             # SSL-pretrain knobs
             "pretrained":       args.pretrained,
+            "pretrain_phase":   pretrain_phase,   # "3a" / "3b" / None
             "freeze_epochs":    args.freeze_epochs,
         },
     )
