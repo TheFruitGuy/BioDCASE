@@ -66,8 +66,13 @@ from dataset import (
 )
 from postprocess import (
     postprocess_predictions, compute_metrics, Detection,
-    tune_thresholds_event_level, collapse_probs_to_3class,
+    collapse_probs_to_3class,
 )
+# NOTE: We deliberately do NOT import ``tune_thresholds_event_level`` from
+# postprocess. That function expects ``model(spec)`` to return a Tensor of
+# logits and applies sigmoid internally — both wrong for the BPN model,
+# whose forward returns a dict and whose ``probs`` are already gated. We
+# define a BPN-aware replacement below in ``_tune_thresholds_bpn``.
 
 
 # ======================================================================
@@ -350,6 +355,94 @@ def train_epoch(model, spec_extractor, loader, criterion,
 
 
 # ======================================================================
+# Post-training threshold tuning (BPN-aware)
+# ======================================================================
+
+@torch.no_grad()
+def _tune_thresholds_bpn(
+    model, spec_extractor, val_loader, device,
+    val_annotations, file_start_dts,
+) -> np.ndarray:
+    """
+    BPN-aware replacement for ``postprocess.tune_thresholds_event_level``.
+
+    Differences from the original:
+      - Unpacks ``model(spec)`` as a dict and reads ``outputs["probs"]``
+        instead of expecting a logits Tensor.
+      - Does NOT apply sigmoid — the BPN model has already done sigmoid
+        and multiplied by the gate inside ``WhaleVADBPN.forward``.
+
+    Otherwise the algorithm is identical: cache validation probabilities
+    once, then sweep per-class thresholds on a fixed ``np.linspace`` grid
+    using one-pass coordinate descent (other classes held at their
+    current best).
+
+    This duplicates ~40 lines from postprocess.py but keeps the BPN
+    runtime fully self-contained and avoids monkey-patching the shared
+    postprocess module.
+    """
+    model.eval()
+    all_probs: dict[tuple[str, str, int], np.ndarray] = {}
+
+    for audio, _, _, metas in val_loader:
+        audio = audio.to(device)
+        spec = spec_extractor(audio)
+        outputs = model(spec)
+        # outputs["probs"] are already in [0, 1] (sigmoid + gate applied
+        # inside the model). DO NOT sigmoid again.
+        probs = outputs["probs"].cpu().numpy()
+
+        hop = spec_extractor.hop_length
+        for j, meta in enumerate(metas):
+            key = (meta["dataset"], meta["filename"], meta["start_sample"])
+            n_samp = meta["end_sample"] - meta["start_sample"]
+            n_frames = min(n_samp // hop, probs[j].shape[0])
+            all_probs[key] = probs[j, :n_frames, :]
+
+    # Collapse 4-class to 3-class for evaluation when --4class-d-split is on.
+    # No-op in plain 3-class mode.
+    all_probs = collapse_probs_to_3class(all_probs)
+
+    # Build ground-truth events (always 3-class via label_3class).
+    gt_events = []
+    for _, row in val_annotations.iterrows():
+        key = (row["dataset"], row["filename"])
+        fsd = file_start_dts.get(key)
+        if fsd is None:
+            continue
+        gt_events.append(Detection(
+            dataset=row["dataset"],
+            filename=row["filename"],
+            label=row["label_3class"],
+            start_s=(row["start_datetime"] - fsd).total_seconds(),
+            end_s=(row["end_datetime"] - fsd).total_seconds(),
+        ))
+
+    # Coordinate-descent threshold sweep, one class at a time.
+    candidates = np.linspace(0.1, 0.9, 17)
+    coarse_names = cfg.CALL_TYPES_3
+    n_classes = len(coarse_names)
+    best_thresholds = np.full(n_classes, 0.5)
+
+    for c in range(n_classes):
+        best_f1 = 0.0
+        for t_try in candidates:
+            thresholds = best_thresholds.copy()
+            thresholds[c] = t_try
+            preds = postprocess_predictions(all_probs, thresholds)
+            metrics = compute_metrics(preds, gt_events, iou_threshold=0.3)
+            cls_name = coarse_names[c]
+            f1 = metrics.get(cls_name, {}).get("f1", 0.0)
+            if f1 > best_f1:
+                best_f1 = f1
+                best_thresholds[c] = t_try
+        print(f"  class {coarse_names[c]}: "
+              f"threshold={best_thresholds[c]:.3f}  F1={best_f1:.3f}")
+
+    return best_thresholds
+
+
+# ======================================================================
 # Main
 # ======================================================================
 
@@ -370,23 +463,21 @@ def main():
     print(f"BPN config: {bpn_cfg.to_dict()}")
 
     # ------------------------------------------------------------------
-    # Single phase id "5" — this whole effort is a search over the BPN
-    # configuration space, not a sequence of decided ablations. Axes
-    # that vary across runs (gate on/off, R, pool mode, init, taps,
-    # dilations, aux loss) are stamped as tags + config fields so the
-    # wandb runs table becomes the search log: filter and sort to find
-    # which combination wins.
+    # ------------------------------------------------------------------
+    # Wandb run setup. Single phase id "5" — this whole effort is a
+    # search over the BPN configuration space, not a sequence of
+    # decided ablations. Axes that vary across runs (gate on/off, R,
+    # pool mode, init, taps, dilations, aux loss) are stamped as tags
+    # + config fields so the wandb runs table becomes the search log:
+    # filter and sort to find which combination wins.
     # ------------------------------------------------------------------
     phase_id = "5"
 
-    # Tags. The per-axis discriminators that change across the search
-    # run table — these are how the prof navigates the search log.
+    # Per-axis discriminators visible in the wandb runs table without
+    # opening any individual run.
     extra_tags: list[str] = []
-
-    # Architectural axis (paper Section V-B): with vs without gate.
     extra_tags.append("with_gate" if bpn_cfg.enabled else "no_gate")
 
-    # Loss flags.
     if cfg.USE_WEIGHTED_BCE:
         extra_tags.append("weighted_bce")
     if getattr(cfg, "USE_FOCAL_LOSS", False):
@@ -394,12 +485,11 @@ def main():
     if not cfg.USE_WEIGHTED_BCE and not getattr(cfg, "USE_FOCAL_LOSS", False):
         extra_tags.append("plain_bce")
 
-    # Class taxonomy.
     if getattr(cfg, "USE_4CLASS_D_SPLIT", False):
         extra_tags.append("4class_d_split")
 
-    # BPN-axis tags — only stamped when the gate is on, so 'no_gate'
-    # runs aren't polluted with irrelevant config tags.
+    # BPN-axis tags only when the gate is on; no-gate runs aren't
+    # polluted with irrelevant config tags.
     if bpn_cfg.enabled:
         extra_tags.extend([
             f"R{bpn_cfg.n_rois}",
@@ -670,6 +760,14 @@ def main():
 
     # ------------------------------------------------------------------
     # Post-training threshold tuning on best checkpoint.
+    #
+    # The per-epoch tuning already produces solid thresholds saved with
+    # best_model.pt; this final pass is a finer sweep on the frozen best
+    # weights. We wrap it in try/except so that any failure here does
+    # NOT lose the run's artifacts — best_model.pt is already on disk
+    # with usable per-epoch tuned thresholds, and we still want
+    # final_model.pt + the wandb summary to be written even if the
+    # final-tune step itself fails.
     # ------------------------------------------------------------------
     print(f"\n{'=' * 60}\nTuning thresholds on best model\n{'=' * 60}")
     best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device,
@@ -678,11 +776,29 @@ def main():
                      else model)
     model_to_load.load_state_dict(best_ckpt["model_state_dict"])
 
-    tuned = tune_thresholds_event_level(
-        model_to_load, spec_extractor, val_loader, device,
-        val_annotations, file_start_dts,
+    fallback_thresholds = best_ckpt.get(
+        "thresholds",
+        torch.tensor([0.5, 0.5, 0.5]),
     )
-    print(f"Tuned thresholds: {tuned.tolist()}")
+    if isinstance(fallback_thresholds, torch.Tensor):
+        fallback_thresholds = fallback_thresholds.cpu().numpy()
+    fallback_thresholds = np.asarray(fallback_thresholds, dtype=np.float64)
+
+    try:
+        tuned = _tune_thresholds_bpn(
+            model_to_load, spec_extractor, val_loader, device,
+            val_annotations, file_start_dts,
+        )
+        print(f"Tuned thresholds: {tuned.tolist()}")
+        tune_succeeded = True
+    except Exception as e:
+        # Don't crash the whole run over a final-tune failure. Fall back
+        # to the per-epoch tuned thresholds, which are already saved
+        # with best_model.pt and gave us our reported best_f1.
+        print(f"  WARNING: post-training tuning failed ({type(e).__name__}: "
+              f"{e}). Falling back to per-epoch tuned thresholds.")
+        tuned = fallback_thresholds
+        tune_succeeded = False
 
     final_state = model_to_load.state_dict()
     torch.save({
@@ -701,6 +817,7 @@ def main():
     wandb.summary["best_f1"] = float(best_f1)
     wandb.summary["best_f1_post_tuning"] = float(best_ckpt.get("best_f1", best_f1))
     wandb.summary["final_thresholds"] = list(map(float, tuned))
+    wandb.summary["final_tune_succeeded"] = tune_succeeded
     wandb.summary["epochs_run"] = epoch
     wandb.summary["early_stopped"] = no_improve_epochs >= EARLY_STOP_PATIENCE
     wandb.summary["bpn_enabled"] = bpn_cfg.enabled
@@ -708,6 +825,7 @@ def main():
         f"Phase {phase_id} run finished at best F1 {best_f1:.3f} "
         f"(epoch {best_ckpt.get('epoch', '?')} of {epoch}; "
         f"tuned thresholds {[round(float(t),2) for t in tuned]}; "
+        f"final-tune {'OK' if tune_succeeded else 'FAILED, used per-epoch'}; "
         f"BPN config: enabled={bpn_cfg.enabled}, taps={bpn_cfg.n_taps}, "
         f"R={bpn_cfg.n_rois}, pool={bpn_cfg.pool_mode}, "
         f"init={bpn_cfg.init_mode}, aux_loss={bpn_cfg.aux_loss}). "
