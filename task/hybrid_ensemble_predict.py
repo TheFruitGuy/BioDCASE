@@ -79,6 +79,9 @@ from postprocess import (
     postprocess_predictions, compute_metrics, Detection,
     collapse_probs_to_3class,
 )
+from postprocess_per_class import (
+    load_postprocess_config, postprocess_predictions_per_class,
+)
 from model import WhaleVAD
 from model_bpn import WhaleVADBPN, BPNConfig
 
@@ -311,6 +314,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--per-model-eval", action="store_true",
                    help="Also score each model individually for reference. "
                         "Ignored in test mode (no GT to score against).")
+    p.add_argument("--postprocess-config", type=str,
+                   default=str(cfg.POSTPROCESS_CONFIG_PATH),
+                   help="Path to the per-class post-processing config "
+                        "JSON written by tune_postprocess_optuna.py. "
+                        "When the file exists, the per-class pipeline "
+                        "is used (and --thresholds is ignored — the "
+                        "config carries its own per-class thresholds). "
+                        "Otherwise the script silently falls back to "
+                        "the default postprocessing with the threshold "
+                        "tuning step.")
+    p.add_argument("--no-postprocess-config", action="store_true",
+                   help="Disable per-class post-processing even if a "
+                        "config file is present. Useful for "
+                        "before/after comparisons.")
     return p.parse_args()
 
 
@@ -439,23 +456,52 @@ def main() -> None:
     print(f"  combined probs for {len(hybrid_probs)} segments")
 
     # ------------------------------------------------------------------
-    # Threshold tuning or use frozen
+    # Per-class post-processing config (auto-loaded if present).
+    # When loaded, it overrides the threshold-tuning + default
+    # postprocessing path entirely — its own per-class thresholds and
+    # frame/event-level kernels are what get applied.
     # ------------------------------------------------------------------
-    if args.thresholds is not None:
-        thresholds = np.array(args.thresholds, dtype=np.float64)
-        print(f"\nUsing frozen thresholds: {list(thresholds)}")
+    pp_config = None
+    if not args.no_postprocess_config and args.postprocess_config:
+        pp_config = load_postprocess_config(args.postprocess_config)
+    if pp_config is not None:
+        print(f"\nPer-class postprocessing config loaded from "
+              f"{args.postprocess_config}")
+        print(f"  --thresholds (if any) will be IGNORED — config "
+              f"carries its own.")
+
+    # ------------------------------------------------------------------
+    # Threshold tuning or use frozen (only used when pp_config is None)
+    # ------------------------------------------------------------------
+    if pp_config is None:
+        if args.thresholds is not None:
+            thresholds = np.array(args.thresholds, dtype=np.float64)
+            print(f"\nUsing frozen thresholds: {list(thresholds)}")
+        else:
+            print("\nThreshold tuning on hybrid probabilities:")
+            thresholds = tune_thresholds_on_probs(hybrid_probs, gt_events)
     else:
-        print("\nThreshold tuning on hybrid probabilities:")
-        thresholds = tune_thresholds_on_probs(hybrid_probs, gt_events)
+        # Sentinel; the per-class path doesn't use this array.
+        thresholds = np.array([0.5, 0.5, 0.5], dtype=np.float64)
 
     # ------------------------------------------------------------------
     # Score (if GT available) and print
     # ------------------------------------------------------------------
     if not test_mode:
-        final_metrics = evaluate_with_thresholds(
-            hybrid_probs, gt_events, thresholds,
-        )
-        print_metrics(final_metrics, thresholds, "HYBRID RESULT")
+        if pp_config is not None:
+            pred_events_for_score = postprocess_predictions_per_class(
+                hybrid_probs, pp_config,
+            )
+            final_metrics = compute_metrics(
+                pred_events_for_score, gt_events, iou_threshold=0.3,
+            )
+        else:
+            final_metrics = evaluate_with_thresholds(
+                hybrid_probs, gt_events, thresholds,
+            )
+        title = ("HYBRID RESULT (per-class postprocessing)" if pp_config
+                 else "HYBRID RESULT")
+        print_metrics(final_metrics, thresholds, title)
 
         if args.per_model_eval:
             print("\n" + "=" * 64)
@@ -475,7 +521,12 @@ def main() -> None:
     # ------------------------------------------------------------------
     if args.output_csv is not None:
         print(f"\nWriting predictions CSV...")
-        pred_events = postprocess_predictions(hybrid_probs, thresholds)
+        if pp_config is not None:
+            pred_events = postprocess_predictions_per_class(
+                hybrid_probs, pp_config,
+            )
+        else:
+            pred_events = postprocess_predictions(hybrid_probs, thresholds)
         args.output_csv.parent.mkdir(parents=True, exist_ok=True)
         save_predictions_csv(pred_events, args.output_csv)
 
