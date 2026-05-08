@@ -318,7 +318,7 @@ def print_comparison(stage1_res: dict, combined_res: dict, header: str):
     print(f"  {'class':<7} | "
           f"{'stage-1 F1':>11}  {'thr':>5}  {'P':>6}  {'R':>6}  | "
           f"{'two-stage F1':>13}  {'thr':>5}  {'P':>6}  {'R':>6}  | "
-          f"{'Δ F1':>+8}")
+          f"{'Δ F1':>8}")
     for cls in cfg.CALL_TYPES_3:
         s1 = stage1_res[cls]
         cb = combined_res[cls]
