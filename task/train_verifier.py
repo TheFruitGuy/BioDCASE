@@ -77,6 +77,7 @@ from dataset_verifier import (
 )
 from model_verifier import WhaleVerifier, count_parameters
 from spectrogram import SpectrogramExtractor
+from supcon import supcon_loss
 
 
 # ======================================================================
@@ -124,6 +125,15 @@ def parse_args():
                    help="v2 default 0.5 (v1 was 0.3).")
     p.add_argument("--head_dropout", type=float, default=0.3,
                    help="v2 default 0.3 (v1 was 0.2).")
+
+    # v3 contrastive options. Set --supcon_weight > 0 to enable.
+    p.add_argument("--supcon_weight", type=float, default=0.0,
+                   help="Weight on supervised contrastive auxiliary "
+                        "loss. 0 = disabled (v2 behaviour); 0.5 is a "
+                        "reasonable starting point.")
+    p.add_argument("--supcon_temperature", type=float, default=0.1,
+                   help="SupCon temperature τ. Lower → harder contrast. "
+                        "0.1 is the standard default.")
 
     p.add_argument("--no_wandb", action="store_true")
     return p.parse_args()
@@ -195,10 +205,13 @@ def summarise_split(name: str, records: list[CandidateRecord]):
 
 def train_one_epoch(
     model, spec_extractor, loader, optimizer, scheduler, device, epoch,
+    supcon_weight: float = 0.0, supcon_temperature: float = 0.1,
 ):
     model.train()
     bce = nn.BCEWithLogitsLoss()
-    losses = []
+    losses_total = []
+    losses_bce = []
+    losses_supcon = []
 
     pbar = tqdm(loader, desc=f"Epoch {epoch} train", leave=False)
     for audio, class_idx, label, metas in pbar:
@@ -211,8 +224,21 @@ def train_one_epoch(
         ).unsqueeze(-1)
 
         spec = spec_extractor(audio)
-        logits = model(spec, class_idx, aux)
-        loss = bce(logits, label)
+        if supcon_weight > 0:
+            logits, feats = model(spec, class_idx, aux,
+                                  return_features=True)
+            l_bce = bce(logits, label)
+            # Group id = class_idx * 2 + label.long(), so 6 cells:
+            # bmabz-FP, bmabz-TP, d-FP, d-TP, bp-FP, bp-TP.
+            group_ids = class_idx * 2 + label.long()
+            l_sup = supcon_loss(feats, group_ids,
+                                temperature=supcon_temperature)
+            loss = l_bce + supcon_weight * l_sup
+            losses_supcon.append(l_sup.item())
+        else:
+            logits = model(spec, class_idx, aux)
+            l_bce = bce(logits, label)
+            loss = l_bce
 
         optimizer.zero_grad(set_to_none=True)
         loss.backward()
@@ -221,10 +247,23 @@ def train_one_epoch(
         if scheduler is not None:
             scheduler.step()
 
-        losses.append(loss.item())
-        pbar.set_postfix(loss=f"{loss.item():.4f}")
+        losses_total.append(loss.item())
+        losses_bce.append(l_bce.item())
+        if supcon_weight > 0:
+            pbar.set_postfix(
+                tot=f"{loss.item():.3f}",
+                bce=f"{l_bce.item():.3f}",
+                sup=f"{losses_supcon[-1]:.3f}",
+            )
+        else:
+            pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-    return float(np.mean(losses)) if losses else 0.0
+    return {
+        "total": float(np.mean(losses_total)) if losses_total else 0.0,
+        "bce":   float(np.mean(losses_bce))   if losses_bce   else 0.0,
+        "supcon": (float(np.mean(losses_supcon))
+                   if losses_supcon else 0.0),
+    }
 
 
 @torch.no_grad()
@@ -469,10 +508,13 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
-        train_loss = train_one_epoch(
+        loss_d = train_one_epoch(
             model, spec_extractor, train_loader,
             optimizer, scheduler, device, epoch,
+            supcon_weight=args.supcon_weight,
+            supcon_temperature=args.supcon_temperature,
         )
+        train_loss = loss_d["total"]
         val_arrs = collect_val_scores(
             model, spec_extractor, val_loader, device,
         )
@@ -481,7 +523,9 @@ def main():
 
         history.append({
             "epoch": epoch,
-            "train_loss": train_loss,
+            "train_loss_total": loss_d["total"],
+            "train_loss_bce":   loss_d["bce"],
+            "train_loss_supcon": loss_d["supcon"],
             "macro_combined_f1": macro,
             **{f"f1_combined_{k}": v["f1_combined"]
                for k, v in summary.items() if isinstance(v, dict)},
@@ -490,15 +534,24 @@ def main():
         })
 
         elapsed = time.time() - t0
-        print(f"\nEpoch {epoch:3d}/{args.epochs}  "
-              f"loss={train_loss:.4f}  macro_F1={macro:.4f}  "
-              f"({elapsed:.1f}s)")
+        if args.supcon_weight > 0:
+            print(f"\nEpoch {epoch:3d}/{args.epochs}  "
+                  f"loss={loss_d['total']:.4f} "
+                  f"(bce={loss_d['bce']:.4f}, "
+                  f"sup={loss_d['supcon']:.4f})  "
+                  f"macro_F1={macro:.4f}  ({elapsed:.1f}s)")
+        else:
+            print(f"\nEpoch {epoch:3d}/{args.epochs}  "
+                  f"loss={train_loss:.4f}  macro_F1={macro:.4f}  "
+                  f"({elapsed:.1f}s)")
         print_summary(summary, f"  Per-class (val) — epoch {epoch}")
 
         if use_wandb:
             payload = {
                 "epoch": epoch,
-                "train/loss": train_loss,
+                "train/loss_total":  loss_d["total"],
+                "train/loss_bce":    loss_d["bce"],
+                "train/loss_supcon": loss_d["supcon"],
                 "val/macro_combined_f1": macro,
                 "val/lr": optimizer.param_groups[0]["lr"],
             }
