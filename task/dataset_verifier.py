@@ -6,47 +6,31 @@ PyTorch ``Dataset`` that serves cropped audio windows centred on stage-1
 candidate events, paired with the candidate's predicted class identity and
 the ground-truth TP/FP label produced by ``extract_candidates.py``.
 
-Design choices
---------------
-**30-second crop window (configurable).** The crop matches ``train.py``'s
-30-second eval segments, which means:
-    - ``SpectrogramExtractor`` works on the crop without any reshaping logic,
-    - even the longest whale call (BMABZ Z-calls run ~20 s) fits inside one
-      window with margin on either side,
-    - batch tensors have a uniform shape, so collation is trivial.
+v2 (2026-05-08): added optional augmentation (random time shift, volume
+scaling, time masking) and made the crop window configurable. The v1
+defaults (30 s, no augmentation) remain available via constructor args
+for direct comparison.
 
-**Edge handling: shift, don't pad.** If centring the crop would place its
-left edge before sample 0 or its right edge past end-of-file, we shift the
-window so it stays inside the file. This means the event is no longer at
-the centre near file boundaries, but every crop has the full window length
-with real audio. Pad-with-zeros would have been an alternative but training
-on synthetic silence at boundaries is its own bias.
+Why the v2 changes
+------------------
+v1's first run peaked at epoch 1 (macro F1 = 0.7393) and degraded
+afterwards while training loss kept dropping (0.59 → 0.16 over 9 epochs).
+Classic overfitting on a 14k-sample dataset with a 200k-parameter model
+seeing the same audio crops every epoch. The fix has three legs:
+  1. Halve the crop length (30 s → 15 s) — less audio per sample, less
+     to memorise. 15 s still covers the longest BMABZ Z-calls (~20 s)
+     when the call is centred (the ~2.5 s clipped from each end is on
+     the call's quiet tails, not its informative middle).
+  2. Augment during training so the same TP is seen with different
+     position, volume, and dropouts each time.
+  3. Stronger regularization in the model (handled in train_verifier.py).
 
-**Class identity passed alongside audio.** The verifier model is multi-head:
-one shared backbone, three sigmoid output heads (one per coarse class), and
-the dataset returns the candidate's ``class_idx`` so the training loop can
-read the correct head. This shares features across classes while keeping
-per-class specialisation in the final layer.
-
-**Balanced sampling.** ``VerifierDataset.make_balanced_sampler`` produces a
-``WeightedRandomSampler`` whose weights equalise (class × TP/FP) cells in
-expectation. This matters because:
-    - BMABZ has many candidates, D has few — uniform sampling would make
-      the verifier good at BMABZ and indifferent to D, exactly the
-      opposite of what we want;
-    - within each class, FPs typically outnumber TPs at the low operating
-      threshold, so without rebalancing the model would learn "predict
-      everything is FP" and reach high training accuracy that doesn't
-      transfer to event-level F1.
-
-What this dataset does NOT do
------------------------------
-- No spectrogram conversion. Audio is returned raw; the training script
-  pipes it through ``SpectrogramExtractor`` so the verifier and stage-1
-  share the same feature extractor at inference time.
-- No on-the-fly augmentation. Augmentations belong in the training loop
-  (or a wrapper Dataset) so they can be toggled without touching the
-  data-loading code path.
+Augmentation in __getitem__, not as a wrapper
+---------------------------------------------
+We gate every augmentation step on ``self.train`` so the same Dataset
+class can serve both phases — just construct a separate val instance with
+``train=False``. This is simpler than chaining transforms and avoids
+accidentally augmenting validation crops.
 """
 
 from __future__ import annotations
@@ -79,11 +63,9 @@ class CandidateRecord:
     dataset, filename : str
         Origin of the candidate.
     path : str
-        Absolute path to the WAV file (cached at extraction time so the
-        DataLoader workers don't have to redo the manifest walk).
+        Absolute path to the WAV file.
     file_dur_s : float
-        Total duration of the source file in seconds. Needed for the
-        edge-shift logic below.
+        Total duration of the source file in seconds.
     start_s, end_s : float
         Candidate event span (file-relative).
     class_idx : int
@@ -91,8 +73,7 @@ class CandidateRecord:
     label : int
         1 for TP (matched a GT event), 0 for FP.
     stage1_score : float
-        Mean per-frame probability over the candidate span. Useful as an
-        auxiliary input feature, or for diagnostic plotting.
+        Mean per-frame probability over the candidate span.
     """
     cand_id: int
     dataset: str
@@ -111,22 +92,10 @@ class CandidateRecord:
 # ======================================================================
 
 def load_candidates(parquet_path: str | Path) -> list[CandidateRecord]:
-    """
-    Read a candidates parquet into a list of ``CandidateRecord``.
-
-    Parameters
-    ----------
-    parquet_path : str or Path
-
-    Returns
-    -------
-    list of CandidateRecord
-    """
+    """Read a candidates parquet into a list of ``CandidateRecord``."""
     df = pd.read_parquet(parquet_path)
     records = []
     for _, r in df.iterrows():
-        # Defensive cast: parquet round-trip can leave numeric columns as
-        # numpy dtypes which trip dataclass slots later on.
         records.append(CandidateRecord(
             cand_id=int(r["cand_id"]),
             dataset=str(r["dataset"]),
@@ -148,29 +117,48 @@ def load_candidates(parquet_path: str | Path) -> list[CandidateRecord]:
 
 class VerifierDataset(Dataset):
     """
-    Map-style dataset of (audio_crop, class_idx, label) triples.
+    Map-style dataset of (audio_crop, class_idx, label, meta) 4-tuples.
 
     Parameters
     ----------
     records : list of CandidateRecord
-    crop_s : float, default = 30.0
-        Crop window length in seconds. 30 s matches the stage-1 eval
-        window so SpectrogramExtractor works without any reshaping.
-    rng_seed : int, optional
-        Currently unused (no random augmentation), reserved so a future
-        augmenting wrapper can stay reproducible.
+    crop_s : float, default 15.0
+        Crop window length in seconds. v1 used 30; v2 default 15 cuts
+        memorisable surface area in half.
+    train : bool, default False
+        Enables augmentation. Validation should always be ``False`` for
+        deterministic eval.
+    time_shift_max_s : float, default 2.0
+        Max absolute shift of the crop centre, sampled uniformly per call.
+        Stops the verifier from memorising the always-centred event
+        position.
+    volume_scale_range : tuple, default (0.7, 1.3)
+        Multiplicative gain range — approximates per-recording level
+        variation.
+    time_mask_max_s : float, default 1.0
+        Max width of the random zero-mask applied to the waveform.
+    time_mask_prob : float, default 0.5
+        Probability of applying time mask in any given training call.
     """
 
     def __init__(
         self,
         records: list[CandidateRecord],
-        crop_s: float = 30.0,
-        rng_seed: int | None = None,
+        crop_s: float = 15.0,
+        train: bool = False,
+        time_shift_max_s: float = 2.0,
+        volume_scale_range: tuple[float, float] = (0.7, 1.3),
+        time_mask_max_s: float = 1.0,
+        time_mask_prob: float = 0.5,
     ):
         self.records = records
         self.crop_s = crop_s
         self.crop_samples = int(round(crop_s * cfg.SAMPLE_RATE))
-        self.rng_seed = rng_seed
+        self.train = train
+        self.time_shift_max_s = time_shift_max_s
+        self.volume_scale_range = volume_scale_range
+        self.time_mask_max_s = time_mask_max_s
+        self.time_mask_prob = time_mask_prob
 
     def __len__(self) -> int:
         return len(self.records)
@@ -179,34 +167,25 @@ class VerifierDataset(Dataset):
     # Crop geometry
     # ------------------------------------------------------------------
 
-    def _compute_crop_window(self, rec: CandidateRecord) -> tuple[int, int]:
+    def _compute_crop_window(
+        self, rec: CandidateRecord, shift_s: float = 0.0
+    ) -> tuple[int, int]:
         """
         Compute ``[start_sample, end_sample)`` for the audio crop.
 
-        The candidate is centred when possible; if centring would push
-        either edge outside ``[0, file_dur_s]``, the window is shifted
-        inward so it always has the configured length and contains only
-        real audio. For files shorter than ``crop_s`` (very rare), the
-        whole file is returned and the caller's spectrogram path will see
-        a shorter sequence — handled by zero-padding in ``__getitem__``.
-
-        Parameters
-        ----------
-        rec : CandidateRecord
-
-        Returns
-        -------
-        start_sample, end_sample : int
+        The candidate is centred (plus optional ``shift_s``) when
+        possible; if centring would push either edge outside
+        ``[0, file_dur_s]``, the window is shifted inward.
         """
         sr = cfg.SAMPLE_RATE
         file_samples = int(round(rec.file_dur_s * sr))
-        center_sample = int(round(((rec.start_s + rec.end_s) / 2) * sr))
+        center_s = (rec.start_s + rec.end_s) / 2 + shift_s
+        center_sample = int(round(center_s * sr))
 
         half = self.crop_samples // 2
         start = center_sample - half
         end = start + self.crop_samples
 
-        # Shift inward if outside file bounds.
         if start < 0:
             shift = -start
             start += shift
@@ -215,11 +194,8 @@ class VerifierDataset(Dataset):
             shift = end - file_samples
             start -= shift
             end -= shift
-        # If the file is shorter than crop_s, clamp to file bounds and let
-        # __getitem__ pad. Both must be non-negative.
         start = max(0, start)
         end = min(file_samples, end)
-
         return start, end
 
     # ------------------------------------------------------------------
@@ -227,25 +203,18 @@ class VerifierDataset(Dataset):
     # ------------------------------------------------------------------
 
     def __getitem__(self, idx: int):
-        """
-        Load the audio crop for one candidate and return a 4-tuple.
-
-        Returns
-        -------
-        audio : torch.Tensor, shape (crop_samples,)
-            Float32 waveform. Zero-padded on the right if the source file
-            is shorter than ``crop_s``.
-        class_idx : torch.Tensor, scalar long
-            0 = bmabz, 1 = d, 2 = bp.
-        label : torch.Tensor, scalar float
-            1.0 for TP, 0.0 for FP. Float so it slots straight into BCE.
-        meta : dict
-            ``{"cand_id": int, "stage1_score": float}`` for downstream
-            score combination during inference.
-        """
         rec = self.records[idx]
-        start, end = self._compute_crop_window(rec)
 
+        # Per-worker numpy RNG (seeded via ``worker_init_fn`` in
+        # train_verifier.py).
+        if self.train and self.time_shift_max_s > 0:
+            shift_s = float(np.random.uniform(
+                -self.time_shift_max_s, self.time_shift_max_s,
+            ))
+        else:
+            shift_s = 0.0
+
+        start, end = self._compute_crop_window(rec, shift_s=shift_s)
         audio_np, sr = sf.read(
             rec.path, start=start, stop=end, dtype="float32",
         )
@@ -253,15 +222,28 @@ class VerifierDataset(Dataset):
             f"Expected {cfg.SAMPLE_RATE} Hz, got {sr} for {rec.path}"
         )
 
-        # Zero-pad on the right if file was shorter than crop_s.
+        # Pad / truncate to exact crop length.
         n_loaded = audio_np.shape[0]
         if n_loaded < self.crop_samples:
             pad = np.zeros(self.crop_samples - n_loaded, dtype=np.float32)
             audio_np = np.concatenate([audio_np, pad], axis=0)
         elif n_loaded > self.crop_samples:
-            # Defensive: should not happen given our shift logic, but
-            # truncate just in case.
             audio_np = audio_np[: self.crop_samples]
+
+        # Augmentations — training only.
+        if self.train:
+            scale = float(np.random.uniform(*self.volume_scale_range))
+            audio_np = audio_np * scale
+
+            if np.random.random() < self.time_mask_prob:
+                mask_s = float(np.random.uniform(0.1, self.time_mask_max_s))
+                mask_len = int(round(mask_s * cfg.SAMPLE_RATE))
+                mask_len = min(mask_len, self.crop_samples - 1)
+                if mask_len > 0:
+                    mask_start = int(np.random.randint(
+                        0, self.crop_samples - mask_len + 1,
+                    ))
+                    audio_np[mask_start:mask_start + mask_len] = 0.0
 
         audio = torch.from_numpy(audio_np)
         class_idx = torch.tensor(rec.class_idx, dtype=torch.long)
@@ -282,32 +264,12 @@ class VerifierDataset(Dataset):
         replacement: bool = True,
     ) -> WeightedRandomSampler:
         """
-        Build a ``WeightedRandomSampler`` that equalises (class × label).
-
-        Each of the up to 6 cells (3 classes × {TP, FP}) is sampled with
-        equal expected frequency: weights for each record are
-        ``1 / (n_cells × n_records_in_its_cell)``. Cells that happen to be
-        empty (e.g. no D-class TPs at all) contribute nothing — their
-        absence is correctly handled by uniform-over-non-empty-cells.
-
-        Parameters
-        ----------
-        num_samples : int, optional
-            Total samples per epoch. Defaults to ``len(self)``.
-        replacement : bool, default True
-            Whether to sample with replacement. With six cells of varying
-            sizes and replacement = True, an "epoch" loosely covers each
-            cell ~``num_samples / 6`` times — the right behaviour for
-            balancing.
-
-        Returns
-        -------
-        WeightedRandomSampler
+        ``WeightedRandomSampler`` that equalises (class × label) cells in
+        expectation.
         """
         if num_samples is None:
             num_samples = len(self.records)
 
-        # Count records per (class_idx, label) cell.
         counts: dict[tuple[int, int], int] = {}
         for rec in self.records:
             counts[(rec.class_idx, rec.label)] = (
@@ -331,25 +293,7 @@ class VerifierDataset(Dataset):
 # ======================================================================
 
 def verifier_collate_fn(batch):
-    """
-    Stack same-shape tensors and pass meta through as a list of dicts.
-
-    All audio crops are the same length (``crop_samples``) by
-    construction, so this is just a stack — much simpler than
-    ``dataset.collate_fn``.
-
-    Parameters
-    ----------
-    batch : list of 4-tuples
-        Each element is ``(audio, class_idx, label, meta)``.
-
-    Returns
-    -------
-    audio : torch.Tensor, shape (B, crop_samples)
-    class_idx : torch.Tensor, shape (B,) long
-    label : torch.Tensor, shape (B,) float
-    metas : list of dict
-    """
+    """Stack same-shape tensors; pass meta through as list of dicts."""
     audios, class_idxs, labels, metas = zip(*batch)
     audio = torch.stack(audios, dim=0)
     class_idx = torch.stack(class_idxs, dim=0)
@@ -362,10 +306,6 @@ def verifier_collate_fn(batch):
 # ======================================================================
 
 def _summarise(parquet_path: str):
-    """
-    Print a small summary of the candidates parquet without loading audio.
-    Intended for ``python -m dataset_verifier path.parquet`` ad-hoc checks.
-    """
     df = pd.read_parquet(parquet_path)
     print(f"\nLoaded {len(df)} candidates from {parquet_path}")
     print(f"  splits: {df['source_split'].value_counts().to_dict()}")
