@@ -1,31 +1,33 @@
 """
-Hard-Negative Mining for D-Class False Positives
-=================================================
+Hard-Negative Mining for D-Class False Positives (multi-checkpoint)
+====================================================================
 
-Run a trained Whale-VAD checkpoint on the labeled training data, identify
-event-level false positives (model fires confidently on a region with no
-GT call of the target class), and persist their locations to disk so a
-fine-tuning script can resample them as explicit negatives.
+Run one or more trained checkpoints on the labeled training data, average
+their per-frame probabilities, identify event-level false positives of
+the target class, and persist their locations to disk for fine-tuning.
 
-Why bother
-----------
-Random negative segments are drawn uniformly from non-call regions of
-the corpus. The probability of hitting a ship-noise transient or an
-ice-crack — the patterns the model actually mistakes for D-calls — is
-low. Hard-negative mining replaces this uniform draw with a targeted one:
-every mined segment is *guaranteed* to contain a pattern the current
-model gets wrong. Repeated exposure with explicit ``D=0`` targets gives
-the model the negative gradient signal it never got from random
-sampling alone.
+Single-checkpoint mode mines from one model. Multi-checkpoint mode mines
+from the ensemble's averaged probabilities — useful when you want
+"consensus FPs" that all models in the ensemble fail on.
 
 Usage
 -----
 ::
 
+    # single model (per-model mining; recommended for ensemble retraining)
     python mine_hard_negatives.py \\
-        --checkpoint runs/baseline_seed42/best_model.pt \\
+        --checkpoints runs/whalevad_20260507_191223/best_model.pt \\
         --target d --threshold 0.2 --top_k 1500 \\
-        --output runs/hardnegs/d_top1500.json
+        --output runs/hardnegs/d_seed3.json
+
+    # full ensemble (consensus FP signal)
+    python mine_hard_negatives.py \\
+        --checkpoints runs/whalevad_20260504_152450/best_model.pt \\
+                      runs/phase5_20260506_204358/best_model.pt \\
+                      runs/whalevad_20260507_191223/best_model.pt \\
+                      runs/phase5_20260507_211504/best_model.pt \\
+        --target d --threshold 0.2 --top_k 1500 \\
+        --output runs/hardnegs/d_ensemble.json
 """
 
 from __future__ import annotations
@@ -42,25 +44,32 @@ from dataset import (
     WhaleDataset, build_val_segments, collate_fn,
     get_file_manifest, load_annotations,
 )
-from model import WhaleVAD
 from postprocess import (
-    Detection, compute_iou_1d, merge_and_filter,
+    Detection, collapse_probs_to_3class, compute_iou_1d, merge_and_filter,
     smooth_probabilities, stitch_segments, threshold_to_detections,
 )
 from spectrogram import SpectrogramExtractor
 
+# Reuse the ensemble's model/inference plumbing — the file already
+# handles baseline vs BPN auto-detection and BPN's dict return value.
+from ensemble_predict import (
+    average_prob_dicts, build_model_for_ckpt, predict_probabilities,
+)
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--checkpoint", type=str, required=True)
-    p.add_argument("--target", type=str, default="d", choices=cfg.CALL_TYPES_3,
-                   help="Class to mine FPs for. D has the worst FP rate.")
+    p.add_argument("--checkpoints", nargs="+", required=True,
+                   help="One or more checkpoint paths. Multiple → "
+                        "averaged probabilities (ensemble mining).")
+    p.add_argument("--weights", nargs="+", type=float, default=None,
+                   help="Optional per-checkpoint weights (must match "
+                        "len(checkpoints)). Default: equal.")
+    p.add_argument("--target", type=str, default="d", choices=cfg.CALL_TYPES_3)
     p.add_argument("--threshold", type=float, default=0.2,
                    help="Frame-level threshold for proposal generation. "
-                        "Lower than the tuned operating point on purpose.")
-    p.add_argument("--max_iou_for_fp", type=float, default=0.1,
-                   help="A proposal is a FP iff max IoU with any same-class "
-                        "GT event is below this. Keeps near-misses out.")
+                        "Lower than tuned operating point on purpose.")
+    p.add_argument("--max_iou_for_fp", type=float, default=0.1)
     p.add_argument("--top_k", type=int, default=1500)
     p.add_argument("--datasets", type=str, nargs="+", default=None)
     p.add_argument("--output", type=str, required=True)
@@ -68,33 +77,14 @@ def parse_args():
     return p.parse_args()
 
 
-@torch.no_grad()
-def run_inference(model, spec_extractor, loader, device):
-    """Mirror eval_only.py / train.validate inference block exactly."""
-    all_probs = {}
-    hop = spec_extractor.hop_length
-    for audio, _, _, metas in tqdm(loader, desc="Mining inference"):
-        audio = audio.to(device, non_blocking=True)
-        logits = model(spec_extractor(audio))
-        probs = torch.sigmoid(logits).cpu().numpy()
-        for j, meta in enumerate(metas):
-            key = (meta["dataset"], meta["filename"], meta["start_sample"])
-            n_samp = meta["end_sample"] - meta["start_sample"]
-            n_frames = min(n_samp // hop, probs[j].shape[0])
-            all_probs[key] = probs[j, :n_frames, :]
-    return all_probs
-
-
 def build_target_class_thresholds(target_idx: int, threshold: float) -> np.ndarray:
-    """Threshold array that's `threshold` for target class, 0.999 for others.
-    Disabling other classes prevents cross-class detections we'd just filter."""
+    """Threshold array: `threshold` for target class, 0.999 for others."""
     thr = np.full(cfg.n_classes(), 0.999, dtype=np.float64)
     thr[target_idx] = threshold
     return thr
 
 
 def build_gt_events_for_class(annotations, file_start_dts, target_class: str):
-    """Same-class GT Detections for IoU matching."""
     gt = []
     for _, row in annotations.iterrows():
         label = row["label_3class"] if cfg.USE_3CLASS else row["annotation"]
@@ -114,11 +104,9 @@ def build_gt_events_for_class(annotations, file_start_dts, target_class: str):
 
 
 def predictions_to_fps(predictions, gt, target_class: str, max_iou_for_fp: float):
-    """Filter to predictions whose max same-class IoU is below threshold."""
-    gt_by_file: dict = {}
+    gt_by_file = {}
     for g in gt:
         gt_by_file.setdefault((g.dataset, g.filename), []).append(g)
-
     fps = []
     for p in predictions:
         if p.label != target_class:
@@ -142,7 +130,22 @@ def main():
     target_idx = cfg.CALL_TYPES_3.index(args.target)
     print(f"Target class: '{args.target}' (idx {target_idx})")
     print(f"Proposal threshold: {args.threshold}")
+    print(f"Mining from {len(args.checkpoints)} checkpoint(s)")
 
+    # ------------------------------------------------------------------
+    # Weights handling — same convention as ensemble_predict.py
+    # ------------------------------------------------------------------
+    if args.weights is not None:
+        assert len(args.weights) == len(args.checkpoints)
+        total = sum(args.weights)
+        weights = [w / total for w in args.weights]
+        print(f"Per-checkpoint weights (normalized): {weights}")
+    else:
+        weights = None
+
+    # ------------------------------------------------------------------
+    # Build inference loader — same fixed 30s tiles as validation
+    # ------------------------------------------------------------------
     datasets = args.datasets or cfg.TRAIN_DATASETS
     print(f"Mining on: {datasets}")
 
@@ -150,8 +153,6 @@ def main():
     annotations = load_annotations(datasets, manifest=manifest)
     print(f"  {len(manifest)} files, {len(annotations)} annotations")
 
-    # Same fixed 30s tiles as validation — mining must operate on the
-    # input distribution the training-time inference path produces.
     segments = build_val_segments(manifest, annotations)
     print(f"  {len(segments)} 30s tiles to score")
 
@@ -161,20 +162,51 @@ def main():
         num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
     )
 
-    print(f"\nLoading checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     spec_extractor = SpectrogramExtractor().to(device)
-    model = WhaleVAD(num_classes=cfg.n_classes()).to(device)
-    with torch.no_grad():
-        dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
-        model(spec_extractor(dummy))
-    model.load_state_dict(ckpt["model_state_dict"])
-    model.eval()
 
-    t0 = time.time()
-    all_probs = run_inference(model, spec_extractor, loader, device)
-    print(f"  inference done in {time.time() - t0:.0f}s")
+    # ------------------------------------------------------------------
+    # Run inference with each checkpoint, collecting prob dicts
+    # ------------------------------------------------------------------
+    all_prob_dicts = []
+    for i, ckpt_path in enumerate(args.checkpoints):
+        print(f"\n[{i+1}/{len(args.checkpoints)}] {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        model, model_type = build_model_for_ckpt(ckpt, device)
+        print(f"  type: {model_type}")
 
+        # Materialize lazy projection layer before load_state_dict.
+        with torch.no_grad():
+            dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
+            spec = spec_extractor(dummy)
+            _ = model(spec)
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+
+        t0 = time.time()
+        probs = predict_probabilities(
+            model, model_type, spec_extractor, loader, device)
+        # Collapse to 3-class if the model is 7-class (no-op for 3-class).
+        probs = collapse_probs_to_3class(probs)
+        all_prob_dicts.append(probs)
+        print(f"  inference {time.time()-t0:.0f}s, {len(probs)} prob arrays")
+
+        del model
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------------
+    # Average probabilities (single checkpoint → identity)
+    # ------------------------------------------------------------------
+    if len(all_prob_dicts) == 1:
+        all_probs = all_prob_dicts[0]
+        print(f"\nSingle-checkpoint mode: skipping averaging.")
+    else:
+        all_probs = average_prob_dicts(all_prob_dicts, weights=weights)
+        print(f"\nAveraged probs across {len(all_prob_dicts)} models, "
+              f"{len(all_probs)} segments")
+
+    # ------------------------------------------------------------------
+    # Stitch + smooth + threshold + merge
+    # ------------------------------------------------------------------
     file_probs = stitch_segments(all_probs)
     thr = build_target_class_thresholds(target_idx, args.threshold)
     raw_dets = []
@@ -182,9 +214,12 @@ def main():
         probs = smooth_probabilities(probs)
         raw_dets.extend(threshold_to_detections(probs, thr, ds, fn))
     pred_events = merge_and_filter(raw_dets)
-    print(f"  {len(pred_events)} candidate '{args.target}' proposals "
+    print(f"  {len(pred_events)} '{args.target}' proposals "
           f"at threshold {args.threshold}")
 
+    # ------------------------------------------------------------------
+    # Match to GT, identify FPs, top-k by confidence
+    # ------------------------------------------------------------------
     file_start_dts = {
         (r["dataset"], r["filename"]): r["start_dt"]
         for _, r in manifest.iterrows()
@@ -200,10 +235,14 @@ def main():
         fps = fps[:args.top_k]
         print(f"  truncated to top {args.top_k} by confidence")
 
+    # ------------------------------------------------------------------
+    # Persist
+    # ------------------------------------------------------------------
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
-        "checkpoint": str(args.checkpoint),
+        "checkpoints": [str(c) for c in args.checkpoints],
+        "weights": weights,
         "target_class": args.target,
         "threshold": args.threshold,
         "max_iou_for_fp": args.max_iou_for_fp,
