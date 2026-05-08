@@ -424,7 +424,7 @@ def validate_hnm(model, model_type, spec_extractor, val_loader, device,
     return {
         "loss": val_loss,
         "mean_f1": overall_f1,
-        "per_class": metrics,
+        "per_class": {k: v for k, v in metrics.items() if k in cfg.CALL_TYPES_3},
         "thresholds": thresholds.tolist(),
     }
 
