@@ -46,7 +46,7 @@ from pathlib import Path
 #:       validation/
 #:         annotations/{dataset_name}.csv
 #:         audio/{dataset_name}/*.wav
-DATA_ROOT = Path(__file__).resolve().parent / "2026_BioDCASE_development_set"
+DATA_ROOT = Path("/home/matthias-nagl/BioDCASE/task/2026_BioDCASE_development_set/")
 
 #: Directory under which all training runs write their checkpoints and logs.
 #: Each run creates a timestamped subdirectory (e.g. ``runs/whalevad_20260419_085020/``).
@@ -342,6 +342,13 @@ POST_MAX_DUR_S = 30.0
 #: have been supplied. Call ``tune_thresholds.py`` after training to produce
 #: class-specific values that usually outperform the naive 0.5.
 DEFAULT_THRESHOLDS = [0.5, 0.5, 0.5]
+
+#: Default location of the per-class post-processing config produced by
+#: ``tune_postprocess_optuna.py``. ``inference.py`` auto-loads this file
+#: when present and falls back to the default (single-threshold)
+#: post-processing pipeline when it isn't, so committing this path to
+#: cfg is safe even before the tuner has been run.
+POSTPROCESS_CONFIG_PATH = Path("./postprocess_config.json")
 
 
 # ======================================================================

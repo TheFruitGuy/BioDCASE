@@ -32,6 +32,9 @@ from dataset import (
     WhaleDataset, build_val_segments, get_file_manifest, collate_fn,
 )
 from postprocess import postprocess_predictions, export_challenge_csv
+from postprocess_per_class import (
+    load_postprocess_config, postprocess_predictions_per_class,
+)
 
 
 def parse_args():
@@ -45,6 +48,20 @@ def parse_args():
     p.add_argument("--batch_size", type=int, default=cfg.BATCH_SIZE,
                    help="Batch size for inference. Larger values are "
                         "faster but use more GPU memory.")
+    p.add_argument("--postprocess-config", type=str,
+                   default=str(cfg.POSTPROCESS_CONFIG_PATH),
+                   help="Path to the per-class post-processing config "
+                        "JSON written by tune_postprocess_optuna.py. "
+                        "When the file exists, the per-class pipeline "
+                        "is used; otherwise the script silently falls "
+                        "back to the default (single-threshold) "
+                        "pipeline. Pass '' (empty string) or "
+                        "--no-postprocess-config to force the default "
+                        "even when the file exists.")
+    p.add_argument("--no-postprocess-config", action="store_true",
+                   help="Disable per-class post-processing even if a "
+                        "config file is present. Useful for "
+                        "before/after comparisons.")
     return p.parse_args()
 
 
@@ -121,8 +138,23 @@ def main():
     # ------------------------------------------------------------------
     # Post-processing and export
     # ------------------------------------------------------------------
-    print("Postprocessing…")
-    detections = postprocess_predictions(all_probs, thresholds)
+    pp_config = None
+    if not args.no_postprocess_config and args.postprocess_config:
+        pp_config = load_postprocess_config(args.postprocess_config)
+
+    if pp_config is not None:
+        print(f"Postprocessing (per-class config from "
+              f"{args.postprocess_config})…")
+        detections = postprocess_predictions_per_class(all_probs, pp_config)
+    else:
+        if args.no_postprocess_config:
+            reason = "disabled via --no-postprocess-config"
+        elif not args.postprocess_config:
+            reason = "no config path provided"
+        else:
+            reason = f"no config found at {args.postprocess_config}"
+        print(f"Postprocessing (default pipeline; {reason})…")
+        detections = postprocess_predictions(all_probs, thresholds)
     print(f"{len(detections)} detections")
 
     export_challenge_csv(detections, args.output)
