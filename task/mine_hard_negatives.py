@@ -50,6 +50,8 @@ from postprocess import (
 )
 from spectrogram import SpectrogramExtractor
 
+import wandb_utils as wbu
+
 # Reuse the ensemble's model/inference plumbing — the file already
 # handles baseline vs BPN auto-detection and BPN's dict return value.
 from ensemble_predict import (
@@ -74,6 +76,9 @@ def parse_args():
     p.add_argument("--datasets", type=str, nargs="+", default=None)
     p.add_argument("--output", type=str, required=True)
     p.add_argument("--batch_size", type=int, default=cfg.BATCH_SIZE)
+    p.add_argument("--no-wandb", action="store_true",
+                   help="Skip wandb tracking for this mining run "
+                        "(default: track as phase 6 mining job).")
     return p.parse_args()
 
 
@@ -131,6 +136,60 @@ def main():
     print(f"Target class: '{args.target}' (idx {target_idx})")
     print(f"Proposal threshold: {args.threshold}")
     print(f"Mining from {len(args.checkpoints)} checkpoint(s)")
+
+    # ------------------------------------------------------------------
+    # Wandb setup. Mining runs are tagged with phase 6 (the HNM phase
+    # they feed into) but with ``job_type="mining"`` to distinguish
+    # them from the actual fine-tuning runs. Each source checkpoint
+    # gets its phase inferred from the path so ``source_phase`` tags
+    # like ``source_5`` / ``source_baseline`` are queryable.
+    # ------------------------------------------------------------------
+    run = None
+    if not args.no_wandb:
+        import re
+        # Infer source phase from the FIRST checkpoint path. For ensemble
+        # mining (multiple checkpoints), we additionally tag with the
+        # number of source models so ensemble vs single-model mining
+        # runs are distinguishable in the runs table.
+        first_src = str(args.checkpoints[0])
+        m = re.search(r"phase(\w+)_\d{8}_\d{6}", first_src)
+        if m:
+            source_phase = m.group(1)
+        elif "whalevad" in first_src:
+            source_phase = "baseline"
+        else:
+            source_phase = "unknown"
+
+        ensemble_size = len(args.checkpoints)
+        extra_tags = [
+            f"target_{args.target}",
+            f"source_{source_phase}",
+            "mining",  # explicit so the runs table filter is one click
+        ]
+        if ensemble_size > 1:
+            extra_tags.append(f"ensemble_{ensemble_size}")
+        else:
+            extra_tags.append("single_model")
+
+        run = wbu.init_phase(
+            "6",
+            extra_tags=extra_tags,
+            job_type="mining",
+            config={
+                "target":           args.target,
+                "target_idx":       target_idx,
+                "threshold":        args.threshold,
+                "max_iou_for_fp":   args.max_iou_for_fp,
+                "top_k":            args.top_k,
+                "n_checkpoints":    ensemble_size,
+                "source_phase":     source_phase,
+                "checkpoints":      [str(c) for c in args.checkpoints],
+                "weights":          args.weights,
+                "datasets":         (args.datasets or list(cfg.TRAIN_DATASETS)),
+                "batch_size":       args.batch_size,
+                "output_path":      str(args.output),
+            },
+        )
 
     # ------------------------------------------------------------------
     # Weights handling — same convention as ensemble_predict.py
@@ -264,6 +323,58 @@ def main():
         confs = np.array([d.confidence for d in fps])
         print(f"  confidence range: {confs.min():.3f}–{confs.max():.3f} "
               f"(median {np.median(confs):.3f})")
+
+    # ------------------------------------------------------------------
+    # Wandb finalize: stamp summary metrics + verdict + upload the JSON
+    # as a typed artifact so phase 6 fine-tuning runs can pick it up
+    # via ``run.use_artifact`` for true lineage. The artifact is
+    # aliased with target class + source phase so the consumer can
+    # request ``hardnegs:target_d_source_5:latest`` etc.
+    # ------------------------------------------------------------------
+    if run is not None:
+        n_total_proposals = len(pred_events)
+        n_gt = len(gt)
+        n_fps = len(fps)
+        confs = np.array([d.confidence for d in fps]) if fps else np.array([])
+
+        summary = {
+            "n_proposals":       n_total_proposals,
+            "n_gt_target_class": n_gt,
+            "n_fps_raw":         "computed_in_loop",  # placeholder
+            "n_fps_kept":        n_fps,
+            "fp_rate":           n_total_proposals and (n_fps / n_total_proposals),
+        }
+        if confs.size > 0:
+            summary.update({
+                "fp_confidence_min":    float(confs.min()),
+                "fp_confidence_max":    float(confs.max()),
+                "fp_confidence_median": float(np.median(confs)),
+                "fp_confidence_mean":   float(confs.mean()),
+            })
+
+        # Verdict — short, comparable across mining runs at a glance.
+        verdict = (
+            f"Mined {n_fps} {args.target}-class FPs (top_k={args.top_k}) "
+            f"from {len(args.checkpoints)} checkpoint(s) at threshold "
+            f"{args.threshold}, max_iou_for_fp={args.max_iou_for_fp}. "
+            f"GT events of this class on the mining datasets: {n_gt}."
+        )
+
+        wbu.finalize_eval_phase(
+            summary,
+            verdict=verdict,
+            artifact_path=out_path,
+            artifact_type="hardnegs",
+            artifact_metadata={
+                "target":          args.target,
+                "threshold":       args.threshold,
+                "max_iou_for_fp":  args.max_iou_for_fp,
+                "n_fps":           n_fps,
+                "n_checkpoints":   len(args.checkpoints),
+                "source_phase":    run.config.get("source_phase"),
+                "checkpoints":     [str(c) for c in args.checkpoints],
+            },
+        )
 
 
 if __name__ == "__main__":

@@ -435,8 +435,7 @@ def validate_hnm(model, model_type, spec_extractor, val_loader, device,
 
 def main():
     args = parse_args()
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    wbu.seed_everything(args.seed, deterministic=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -446,6 +445,20 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir: {run_dir}")
 
+    # Infer source phase from the checkpoint path: phase5_<ts>/best_model.pt
+    # → "5"; whalevad_<ts>/best_model.pt → "baseline"; otherwise "unknown".
+    # Used below in tag construction once we've also loaded the JSON.
+    import re
+    src_path = str(args.checkpoint)
+    m = re.search(r"phase(\w+)_\d{8}_\d{6}", src_path)
+    if m:
+        source_phase = m.group(1)
+    elif "whalevad" in src_path:
+        source_phase = "baseline"
+    else:
+        source_phase = "unknown"
+    print(f"Inferred source_phase: {source_phase}")
+
     # ------------------------------------------------------------------
     # Hard negatives
     # ------------------------------------------------------------------
@@ -453,6 +466,61 @@ def main():
     print(f"\nLoaded {len(fp_records)} hard negatives "
           f"(target='{hnm_meta['target_class']}', "
           f"threshold={hnm_meta['threshold']})")
+
+    # ------------------------------------------------------------------
+    # Wandb run setup. Phase 6 = hard-negative mining fine-tune. The
+    # lineage to the source checkpoint lives in config.source_phase +
+    # tag ``source_<phase>``; the mining axes (target class, mining
+    # threshold, n_fps) live in config so the runs table can be sorted
+    # and filtered without opening individual runs.
+    # ------------------------------------------------------------------
+    target_class = hnm_meta["target_class"]
+    extra_tags = [
+        f"source_{source_phase}",
+        f"target_{target_class}",
+        f"oversample{args.oversample}",
+    ]
+    if cfg.USE_WEIGHTED_BCE:
+        extra_tags.append("weighted_bce")
+    if getattr(cfg, "USE_FOCAL_LOSS", False):
+        extra_tags.append("focal_loss")
+    if not cfg.USE_WEIGHTED_BCE and not getattr(cfg, "USE_FOCAL_LOSS", False):
+        extra_tags.append("plain_bce")
+
+    run = wbu.init_phase(
+        "6",
+        extra_tags=extra_tags,
+        config={
+            "lr":               args.lr,
+            "epochs":           args.epochs,
+            "oversample":       args.oversample,
+            "seed":             args.seed,
+            "batch_size":       cfg.BATCH_SIZE,
+            "weight_decay":     cfg.WEIGHT_DECAY,
+            "neg_ratio":        cfg.NEG_RATIO,
+            "use_3class":       cfg.USE_3CLASS,
+            "use_weighted_bce": cfg.USE_WEIGHTED_BCE,
+            "use_focal_loss":   getattr(cfg, "USE_FOCAL_LOSS", False),
+            "focal_alpha":      getattr(cfg, "FOCAL_ALPHA", None),
+            "focal_gamma":      getattr(cfg, "FOCAL_GAMMA", None),
+            "train_sites":      list(cfg.TRAIN_DATASETS),
+            "val_sites":        list(cfg.VAL_DATASETS),
+            "early_stop_patience": HNM_EARLY_STOP,
+            "resample_every":   HNM_RESAMPLE_EVERY,
+            # Source / mining lineage — what was fine-tuned and from what.
+            "source_checkpoint": str(args.checkpoint),
+            "source_phase":      source_phase,
+            "hard_negatives_path": str(args.hard_negatives),
+            "n_fps":             len(fp_records),
+            # Mining metadata read directly from the JSON (target class,
+            # threshold, datasets, etc.) so every HNM run is self-
+            # describing without needing to chase the JSON.
+            "mining":            hnm_meta,
+            "mining_target":     hnm_meta["target_class"],
+            "mining_threshold":  hnm_meta["threshold"],
+            "mining_n_models":   len(hnm_meta.get("checkpoints", [])),
+        },
+    )
 
     # ------------------------------------------------------------------
     # Standard data
@@ -566,12 +634,27 @@ def main():
     val0 = validate_hnm(
         model, model_type, spec_extractor, val_loader, device,
         gt_events, baseline_criterion, pos_weight, tune_thresholds=True)
+    # Log epoch 0 (pre-finetune sanity baseline) so the wandb chart
+    # starts from the source-checkpoint F1, not from epoch 1.
+    wbu.log_epoch_3class(
+        epoch=0,
+        train_loss=float("nan"),  # no training happened yet
+        val={"loss": val0["loss"], "f1": val0["mean_f1"],
+             "per_class": val0["per_class"]},
+    )
 
     # ------------------------------------------------------------------
     # Loop
     # ------------------------------------------------------------------
     best_f1 = val0["mean_f1"]
     no_improve = 0
+    history: list[dict] = [{
+        "epoch": 0,
+        "train_loss": float("nan"),
+        "val_loss": val0["loss"],
+        "f1": val0["mean_f1"],
+        "per_class": val0["per_class"],
+    }]
     print(f"\n{'=' * 60}")
     print(f"HNM fine-tune {args.epochs} epochs @ lr={args.lr}")
     print(f"  starting F1: {best_f1:.3f}")
@@ -598,6 +681,21 @@ def main():
         print(f"  Val F1: {val['mean_f1']:.3f}  Best: {best_f1:.3f}")
         print(f"  Tuned thresholds: "
               f"{['%.2f' % t for t in val['thresholds']]}")
+
+        # Wandb per-epoch log + history append for finalize_phase.
+        wbu.log_epoch_3class(
+            epoch=epoch,
+            train_loss=train_loss,
+            val={"loss": val["loss"], "f1": val["mean_f1"],
+                 "per_class": val["per_class"]},
+        )
+        history.append({
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val["loss"],
+            "f1": val["mean_f1"],
+            "per_class": val["per_class"],
+        })
 
         scheduler.step(val["mean_f1"])
 
@@ -631,6 +729,63 @@ def main():
     print(f"  starting:  {val0['mean_f1']:.3f}")
     print(f"  delta:     {best_f1 - val0['mean_f1']:+.3f}")
     print(f"Best checkpoint: {run_dir / 'best_model.pt'}")
+
+    # ------------------------------------------------------------------
+    # Wandb finalize: stamp summary metrics + verdict + upload best ckpt.
+    # The verdict captures the headline question for HNM directly:
+    # "did fine-tuning on FPs improve F1, and by how much?"
+    # ------------------------------------------------------------------
+
+    # Pull the targeted class's F1 trajectory so the summary captures
+    # the *targeted* improvement, not just overall macro F1. This is
+    # what the prof actually wants to see when comparing target_d vs
+    # target_bp runs side by side.
+    target_class = hnm_meta["target_class"]
+    start_target_f1 = val0["per_class"].get(target_class, {}).get("f1", 0.0)
+    best_target_f1 = max(
+        h["per_class"].get(target_class, {}).get("f1", 0.0)
+        for h in history
+    )
+    target_delta = best_target_f1 - start_target_f1
+
+    # Stamp targeted metrics on the wandb summary.
+    import wandb
+    wandb.summary[f"start_f1_{target_class}"] = start_target_f1
+    wandb.summary[f"best_f1_{target_class}"]  = best_target_f1
+    wandb.summary[f"delta_f1_{target_class}"] = target_delta
+    wandb.summary["target_class"]             = target_class
+
+    delta = best_f1 - val0["mean_f1"]
+    if delta > 0.005:
+        verdict_text = (
+            f"HNM helped: macro F1 {val0['mean_f1']:.3f} → {best_f1:.3f} "
+            f"(+{delta:.3f}); target {target_class} F1 "
+            f"{start_target_f1:.3f} → {best_target_f1:.3f} "
+            f"({target_delta:+.3f}) on {len(fp_records)} mined FPs from "
+            f"source phase {source_phase}."
+        )
+    elif delta > -0.005:
+        verdict_text = (
+            f"HNM neutral: macro F1 {val0['mean_f1']:.3f} → {best_f1:.3f} "
+            f"({delta:+.3f}); target {target_class} F1 "
+            f"{start_target_f1:.3f} → {best_target_f1:.3f} "
+            f"({target_delta:+.3f}). Source phase {source_phase} appears "
+            f"to already handle these {target_class} FPs."
+        )
+    else:
+        verdict_text = (
+            f"HNM hurt: macro F1 {val0['mean_f1']:.3f} → {best_f1:.3f} "
+            f"({delta:+.3f}); target {target_class} F1 "
+            f"{start_target_f1:.3f} → {best_target_f1:.3f} "
+            f"({target_delta:+.3f}). LR={args.lr} or oversample="
+            f"{args.oversample} may be too aggressive."
+        )
+
+    wbu.finalize_phase(
+        history,
+        verdict=verdict_text,
+        best_ckpt=run_dir / "best_model.pt",
+    )
 
 
 if __name__ == "__main__":
