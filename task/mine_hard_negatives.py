@@ -76,6 +76,11 @@ def parse_args():
     p.add_argument("--datasets", type=str, nargs="+", default=None)
     p.add_argument("--output", type=str, required=True)
     p.add_argument("--batch_size", type=int, default=cfg.BATCH_SIZE)
+    p.add_argument("--seed", type=int, default=42,
+                   help="Seed for reproducible mining. Affects any "
+                        "stochastic ops in the inference pipeline. "
+                        "Use the same seed across mining runs you want "
+                        "to compare directly.")
     p.add_argument("--no-wandb", action="store_true",
                    help="Skip wandb tracking for this mining run "
                         "(default: track as phase 6 mining job).")
@@ -129,6 +134,8 @@ def predictions_to_fps(predictions, gt, target_class: str, max_iou_for_fp: float
 
 def main():
     args = parse_args()
+    wbu.seed_everything(args.seed, deterministic=False)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -136,6 +143,7 @@ def main():
     print(f"Target class: '{args.target}' (idx {target_idx})")
     print(f"Proposal threshold: {args.threshold}")
     print(f"Mining from {len(args.checkpoints)} checkpoint(s)")
+    print(f"Seed: {args.seed}")
 
     # ------------------------------------------------------------------
     # Wandb setup. Mining runs are tagged with phase 6 (the HNM phase
@@ -187,6 +195,7 @@ def main():
                 "weights":          args.weights,
                 "datasets":         (args.datasets or list(cfg.TRAIN_DATASETS)),
                 "batch_size":       args.batch_size,
+                "seed":             args.seed,
                 "output_path":      str(args.output),
             },
         )
