@@ -37,17 +37,7 @@ from ensemble_predict import (
     tune_thresholds_on_probs, evaluate_with_thresholds,
 )
 
-def maybe_disable_cudnn_for_blackwell(device):
-    """Disable cuDNN on Blackwell (sm_120+) — cuDNN has no kernels for it
-    yet, and the fallback native CUDA paths work fine, just slower."""
-    if device.type != "cuda":
-        return
-    cap = torch.cuda.get_device_capability(device)
-    if cap[0] >= 12:
-        print(f"  detected sm_{cap[0]}{cap[1]} (Blackwell), "
-              f"disabling cuDNN to avoid 'no kernel image' errors "
-              f"(inference will use native CUDA — ~2× slower but works)")
-        torch.backends.cudnn.enabled = False
+
 
 
 def parse_args():
@@ -154,7 +144,6 @@ def main():
     args = parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
-    maybe_disable_cudnn_for_blackwell(device)
 
     cache_dir = Path(args.cache_dir)
     print(f"Cache dir: {cache_dir} (no_cache={args.no_cache}, "
