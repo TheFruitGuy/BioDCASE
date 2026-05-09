@@ -359,18 +359,20 @@ PHASE_REGISTRY: dict[str, dict] = {
     ),
     "6": dict(
         parent=None,
-        hypothesis=("Hard-negative mining fine-tune. Take a converged "
+        hypothesis=("Hard-negative mining fine-tune with optional per-"
+                    "class gradient isolation (PGI). Take a converged "
                     "checkpoint (baseline, phase 5 BPN, or any "
-                    "ensemble member), run it on the training set, "
-                    "harvest event-level false positives of a target "
-                    "minority class (typically d), and continue "
-                    "training at low LR with those FPs oversampled in "
-                    "the negative pool. Tests whether explicit "
-                    "supervision on the model's own confused regions "
-                    "improves precision without hurting recall. "
-                    "Independent of the source phase (parent=None) "
-                    "because the source can vary; the lineage is "
-                    "captured via config.source_phase + tags."),
+                    "ensemble member), harvest event-level FPs of one "
+                    "or more target classes, and continue training at "
+                    "low LR with those FPs oversampled. With "
+                    "--isolate_classes (PGI), each hard-neg segment "
+                    "contributes loss only for its target class — non-"
+                    "target classes are zeroed, eliminating cross-"
+                    "class gradient interference (the methodological "
+                    "novelty). Independent of the source phase "
+                    "(parent=None) because the source can vary; "
+                    "lineage is captured via config.source_phase + "
+                    "tags."),
         interventions=["hard_negative_mining"],
     ),
     "baseline": dict(
