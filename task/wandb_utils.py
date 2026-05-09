@@ -352,9 +352,13 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "every knob (R, pool mode, init, taps, dilation, "
                     "auxiliary supervision). This phase searches that "
                     "config space + the dilated-depthwise architecture "
-                    "change. The headline 'with-gate vs without-gate' "
-                    "comparison is recoverable via the bpn_enabled "
-                    "config field."),
+                    "change. Two BPN implementations live under this "
+                    "phase: v1 (train_bpn.py / model_bpn.py) and v2 "
+                    "(train_bpn_v2.py / model_bpn_v2.py, paper-faithful "
+                    "with macro-block taps + aux-loss warmup). Runs are "
+                    "tagged ``v2`` to distinguish them; ``with_gate`` / "
+                    "``no_gate`` covers the headline architecture "
+                    "ablation across both versions."),
         interventions=["dilated_depthwise", "bpn_search"],
     ),
     "6": dict(
