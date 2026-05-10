@@ -302,7 +302,7 @@ GRAD_CLIP = 1.0
 #: segments and ``P_c`` is the number of positive segments for class c; see
 #: ``model.compute_class_weights``. The DCASE tech report Section 2.6 uses
 #: weighted BCE.
-USE_WEIGHTED_BCE = True
+USE_WEIGHTED_BCE = False
 
 #: If True, apply focal modulation on top of the BCE loss. The DCASE tech
 #: report Table 2 shows that adding focal loss on top of weighted BCE gave
