@@ -87,7 +87,7 @@ from postprocess import (
 # Stabilization hyperparameters — copied verbatim from train.py / train_bpn.py
 # ======================================================================
 
-RESAMPLE_EVERY = 5
+RESAMPLE_EVERY = 1
 EARLY_STOP_PATIENCE = 25
 LR_PATIENCE = 8
 LR_FACTOR = 0.5
