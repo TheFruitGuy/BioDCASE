@@ -379,6 +379,23 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "tags."),
         interventions=["hard_negative_mining"],
     ),
+    "final_eval": dict(
+        parent=None,
+        hypothesis=("Final reporting on the validation set: per-site "
+                    "evaluation of the chosen submission ensemble (the "
+                    "hybrid 4-model setup: BMABZ + BP weighted-averaged, "
+                    "D-class taken from a nominated model). Compares "
+                    "global thresholds (tuned once on pooled val — the "
+                    "realistic pipeline) with per-site oracle thresholds "
+                    "(upper bound that leaks site labels). Not a "
+                    "research arm — no model is trained here; this "
+                    "consumes converged checkpoints and reports where "
+                    "the ensemble is strong/weak across val sites. "
+                    "Independent of the phase ladder (parent=None) "
+                    "because the consumed checkpoints can come from "
+                    "any phase."),
+        interventions=["per_site_report"],
+    ),
     "baseline": dict(
         parent=None,
         hypothesis=("Production training baseline. Paper recipe (8 sites, "
