@@ -49,6 +49,7 @@ Usage
 """
 
 import argparse
+import random
 import time
 from pathlib import Path
 
@@ -261,8 +262,9 @@ def dump_synthetic_examples(splice_state, args, out_dir: Path):
     print(f"\nDumping {args.dump_examples} synthetic examples to {out_dir}...")
 
     # Snapshot the RNG state so training sees the same sequence as it
-    # would without the dump.
-    rng_state = splice_state.rng.bit_generator.state
+    # would without the dump. Python random.Random uses getstate()/setstate(),
+    # not numpy's bit_generator.state attribute.
+    rng_state = splice_state.rng.getstate()
 
     sr = cfg.SAMPLE_RATE
     n_samples = int(30.0 * sr)
@@ -335,7 +337,7 @@ def dump_synthetic_examples(splice_state, args, out_dir: Path):
     print(f"  examples dumped to {out_dir}")
 
     # Restore RNG state so training sees the original sequence.
-    splice_state.rng.bit_generator.state = rng_state
+    splice_state.rng.setstate(rng_state)
 
 
 def _quick_spectrogram(x_np, sr, nperseg=256, noverlap=200):
@@ -375,7 +377,7 @@ def main():
     print(f"  {len(pool.hosts)} host clips across {len(pool.by_site)} donor sites")
 
     splice_state = CallSpliceState(
-        bank=bank, pool=pool, rng=np.random.default_rng(args.seed),
+        bank=bank, pool=pool, rng=random.Random(args.seed),
     )
 
     # Dump-only mode.
