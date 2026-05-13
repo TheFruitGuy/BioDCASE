@@ -339,7 +339,9 @@ def apply_call_splice(
         targets[b].zero_()
         # The synthetic clip is a clean 30 s of unseen-site audio with
         # only the planted call in it. Every frame is valid → mask=1.
-        mask[b].fill_(1.0)
+        # Use int 1 instead of float 1.0 so this works whether the
+        # caller's mask is bool (train.py) or float (phase1_baseline.py).
+        mask[b].fill_(1)
 
         cls_idx = info["cls_idx"]
         if cls_idx is None or cls_idx >= n_classes:
