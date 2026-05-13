@@ -384,6 +384,7 @@ def run_phase1_training(
     model_factory_config: Optional[dict] = None,
     pretrained: Optional[str] = None,
     freeze_epochs: int = 0,
+    extra_tags: Optional[list[str]] = None,
 ):
     """
     Run a Phase 1 training experiment with a given augmentation.
@@ -452,19 +453,29 @@ def run_phase1_training(
     # the existing dashboard groupings/filters work uniformly. The
     # phase string ("1a"/"1b"/"1c"/"1e") is the first arg.
     # ------------------------------------------------------------------
-    extra_tags = ["pretrained" if pretrained else "from_scratch"]
+    auto_tags = ["pretrained" if pretrained else "from_scratch"]
     if cfg.USE_WEIGHTED_BCE:
-        extra_tags.append("weighted_bce")
+        auto_tags.append("weighted_bce")
     if getattr(cfg, "USE_FOCAL_LOSS", False):
-        extra_tags.append("focal_loss")
+        auto_tags.append("focal_loss")
     if not cfg.USE_WEIGHTED_BCE and not getattr(cfg, "USE_FOCAL_LOSS", False):
-        extra_tags.append("plain_bce")
+        auto_tags.append("plain_bce")
     if augmentation_fn is not None:
-        extra_tags.append(f"aug_{augmentation_fn.__name__}")
+        auto_tags.append(f"aug_{augmentation_fn.__name__}")
     else:
-        extra_tags.append("no_aug")
+        auto_tags.append("no_aug")
     if model_factory is not None:
-        extra_tags.append("custom_arch")
+        auto_tags.append("custom_arch")
+    # Merge caller-provided tags. Used by phase 7 (call-splice) to add
+    # variant/donor/SNR-bucket tags without overriding the auto-built
+    # ones. Duplicates are deduped while preserving order.
+    if extra_tags:
+        seen = set(auto_tags)
+        for t in extra_tags:
+            if t not in seen:
+                auto_tags.append(t)
+                seen.add(t)
+    extra_tags = auto_tags
 
     config_payload = {
         "lr":               cfg.LR,

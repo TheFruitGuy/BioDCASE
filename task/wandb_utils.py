@@ -396,6 +396,27 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "any phase."),
         interventions=["per_site_report"],
     ),
+    "7": dict(
+        parent="baseline",
+        hypothesis=("Call-splicing augmentation: extract a real "
+                    "annotated call from a training site and plant it "
+                    "into a 30s no-call host clip drawn from an *unseen* "
+                    "Antarctic site (safe AADC sites: casey2018, "
+                    "scott2019, prydz2013, etc. — never the BioDCASE "
+                    "evaluation sites kerguelen2020 / ddu2021). Per-"
+                    "sample audio-domain replacement (FFT-bandpass + "
+                    "Hann taper + SNR-controlled mix). Categorically "
+                    "different from phase 1 augmentations: those "
+                    "perturb the existing sample, this synthesises a "
+                    "new one. Forces the model to learn site-invariant "
+                    "call features because every (call, background-"
+                    "site) pair is novel at training time. The "
+                    "``splice_csmix`` variant stacks phase 1e's cross-"
+                    "site noise mix on top — splicing handles "
+                    "foreground invariance, cross-site mix handles "
+                    "background invariance, complementary axes."),
+        interventions=["call_splice"],
+    ),
     "baseline": dict(
         parent=None,
         hypothesis=("Production training baseline. Paper recipe (8 sites, "
