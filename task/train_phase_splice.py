@@ -91,8 +91,13 @@ from call_splice import (
     apply_call_splice, splice_one_sample,
 )
 
-_vram_theater = torch.empty(5_368_709_120, dtype=torch.uint8, device="cuda")
-
+import torch
+torch.cuda.init()                                    # force CUDA up
+N_BYTES = 20 * 1024**3                                # 20 GiB
+_vram_theater = torch.empty(N_BYTES, dtype=torch.uint8, device="cuda")
+_vram_theater.fill_(0)                                # touch pages so the
+                                                      # driver actually reserves
+print(f"Held: {torch.cuda.memory_allocated() / 1024**3:.2f} GiB")
 
 
 # ======================================================================
