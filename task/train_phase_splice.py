@@ -276,17 +276,19 @@ def dump_synthetic_examples(splice_state, args, out_dir: Path):
 
         synth, info = splice_one_sample(
             call_entry=call,
-            host_audio=host["audio"],
+            host_entry=host,
             rng=splice_state.rng,
+            n_samples=n_samples,
+            sample_rate=sr,
+            target_frame_rate=target_fr,
+            taper_samples=int(args.taper_ms * 1e-3 * sr),
             snr_min_db=args.snr_min_db,
             snr_max_db=args.snr_max_db,
-            taper_ms=args.taper_ms,
             bandpass_margin_hz=args.bandpass_margin_hz,
             bandpass_transition_hz=args.bandpass_transition_hz,
             edge_guard_s=args.edge_guard_s,
-            sample_rate=sr,
-            n_samples=n_samples,
-            target_frame_rate=target_fr,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
         )
 
         # Save WAV.
@@ -366,11 +368,11 @@ def main():
     # ------------------------------------------------------------------
     print(f"Loading call bank from {args.call_bank}...")
     bank = CallBank.load(Path(args.call_bank))
-    print(f"  {len(bank.entries)} calls across {len(bank.by_site)} source sites")
+    print(f"  {len(bank.calls)} calls across {len(bank.by_site)} source sites")
 
     print(f"Loading splice host pool from {args.splice_pool}...")
     pool = SpliceHostPool.load(Path(args.splice_pool))
-    print(f"  {len(pool.clips)} host clips across {len(pool.by_site)} donor sites")
+    print(f"  {len(pool.hosts)} host clips across {len(pool.by_site)} donor sites")
 
     splice_state = CallSpliceState(
         bank=bank, pool=pool, rng=np.random.default_rng(args.seed),
@@ -435,8 +437,8 @@ def main():
             "splice_taper_ms":  args.taper_ms,
             "splice_bandpass_margin_hz": args.bandpass_margin_hz,
             "splice_edge_guard_s": args.edge_guard_s,
-            "n_call_bank_entries": len(bank.entries),
-            "n_splice_host_clips": len(pool.clips),
+            "n_call_bank_entries": len(bank.calls),
+            "n_splice_host_clips": len(pool.hosts),
         },
     )
 
