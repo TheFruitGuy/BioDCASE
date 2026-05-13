@@ -144,6 +144,7 @@ def score_clips(
     aadc_clips_path: Path,
     checkpoint_paths: list[Path],
     weights: list[float] | None,
+    d_from: int | None,
     out_path: Path,
     batch_size: int,
     device: str,
@@ -167,7 +168,15 @@ def score_clips(
         total = float(sum(weights))
         weights = [w / total for w in weights]
     print(f"Ensemble of {n_ckpts} checkpoint(s), normalized weights: "
-          f"{[f'{w:.3f}' for w in weights]}\n")
+          f"{[f'{w:.3f}' for w in weights]}")
+    if d_from is not None:
+        if not (0 <= d_from < n_ckpts):
+            raise SystemExit(
+                f"--d_from {d_from} out of range [0, {n_ckpts - 1}]"
+            )
+        print(f"Hybrid mode: D-class probability taken from checkpoint "
+              f"index {d_from} only ({checkpoint_paths[d_from].name})")
+    print()
 
     spec_extractor = SpectrogramExtractor().to(device)
 
@@ -210,15 +219,26 @@ def score_clips(
             spec = spec_extractor(audio)
 
             # Weighted ensemble of sigmoid outputs.
+            # Keep each model's probs separately when we may need to
+            # override one class with a single-model output.
+            per_model_probs: list[torch.Tensor] = []
             ens_probs = None
             for (model, _mtype), w in zip(models, weights):
                 out = model(spec)
                 if isinstance(out, dict):
                     out = out["logits"]
                 probs = torch.sigmoid(out)            # (B, T, C)
+                per_model_probs.append(probs)
                 ens_probs = (w * probs) if ens_probs is None else (ens_probs + w * probs)
 
-            # Per-clip summaries on the averaged probs.
+            # Per-class hybrid: override D (class index 1) with the
+            # single nominated model's output, matching hybrid_ensemble_predict.py.
+            if d_from is not None and n_classes >= 2:
+                d_idx = 1                                # bmabz=0, d=1, bp=2
+                ens_probs = ens_probs.clone()
+                ens_probs[..., d_idx] = per_model_probs[d_from][..., d_idx]
+
+            # Per-clip summaries on the (possibly hybrid) probs.
             max_pc = ens_probs.amax(dim=1)              # (B, C)
             max_p_all, _ = max_pc.max(dim=1)            # (B,)
             mean_p_all = ens_probs.mean(dim=(1, 2))     # (B,)
@@ -285,6 +305,13 @@ def parse_args():
              "Will be normalized to sum to 1.",
     )
     p.add_argument(
+        "--d_from", type=int, default=None,
+        help="If set, take D-class probability from this checkpoint INDEX "
+             "(0-based) only, instead of the weighted average. Matches the "
+             "--d-from flag in hybrid_ensemble_predict.py. Use for "
+             "byte-exact reproduction of your F1=0.518 hybrid ensemble.",
+    )
+    p.add_argument(
         "--out", type=Path, default=Path("aadc_scores.pt"),
         help="Destination .pt file.",
     )
@@ -306,6 +333,7 @@ if __name__ == "__main__":
         aadc_clips_path=args.aadc_clips,
         checkpoint_paths=list(args.checkpoints),
         weights=args.weights,
+        d_from=args.d_from,
         out_path=args.out,
         batch_size=args.batch_size,
         device=args.device,
