@@ -75,17 +75,20 @@ import config as cfg  # noqa: E402
 # Current safe sites confirmed downloaded and clear of test-set overlap.
 # Scott2019 is included with a caveat: it has documented quality issues
 # (annotator notes flag noisy recordings); set --exclude_scott to drop it.
-SAFE_DEFAULT = ["casey2018", "scott2019", "prydz2013"]
+# Names match the CamelCase convention used by download_aadc.py and the
+# AADC archive itself. The case-insensitive lookup in _find_wav_files
+# accepts lowercase variants too.
+SAFE_DEFAULT = ["Casey2018", "Scott2019", "Prydz2013"]
 
 # Future high-value additions once downloaded:
-#   "ddu2018", "ddu2019"                 — same hydrophone as ddu2021
-#   "kerguelen2016", "kerguelen2018",
-#   "kerguelen2019", "kerguelen2021",
-#   "kerguelen2023", "kerguelen2024"     — same deployment as kerguelen2020
+#   "DDU2018", "DDU2019"                 — same hydrophone as ddu2021
+#   "Kerguelen2016", "Kerguelen2018",
+#   "Kerguelen2019", "Kerguelen2021",
+#   "Kerguelen2023", "Kerguelen2024"     — same deployment as kerguelen2020
 SAFE_FUTURE = [
-    "ddu2018", "ddu2019",
-    "kerguelen2016", "kerguelen2018", "kerguelen2019",
-    "kerguelen2021", "kerguelen2023", "kerguelen2024",
+    "DDU2018", "DDU2019",
+    "Kerguelen2016", "Kerguelen2018", "Kerguelen2019",
+    "Kerguelen2021", "Kerguelen2023", "Kerguelen2024",
 ]
 
 
@@ -93,26 +96,29 @@ def assert_safe(donor_sites: list[str]) -> None:
     """
     Hard assertion that no donor site is on the BioDCASE evaluation list.
 
-    Two things would invalidate the entire pipeline:
-      1. Including kerguelen2020 or ddu2021 as donors.
-      2. Accidentally including a year that shares files with them
-         (which is why we keep a per-year, not per-deployment, list).
+    Case-insensitive: the AADC archive uses CamelCase folder names
+    (``DDU2018``, ``Casey2018``) while ``cfg.EVAL_DATASETS`` uses
+    lowercase (``ddu2021``, ``kerguelen2020``). A naïve set intersection
+    would let ``DDU2021`` slip through. We lower-case everything before
+    comparing.
     """
-    forbidden = set(cfg.EVAL_DATASETS) & set(donor_sites)
-    if forbidden:
+    donor_lc = {s.lower() for s in donor_sites}
+    forbidden_lc = {s.lower() for s in cfg.EVAL_DATASETS}
+    train_lc = {s.lower() for s in cfg.TRAIN_DATASETS}
+
+    forbidden_hits = donor_lc & forbidden_lc
+    if forbidden_hits:
         raise RuntimeError(
             f"\n\n*** TEST-SITE LEAK ATTEMPTED ***\n"
-            f"Refusing to extract from: {sorted(forbidden)}\n"
+            f"Refusing to extract from: {sorted(forbidden_hits)}\n"
             f"These are the BioDCASE evaluation sites and MUST remain quarantined.\n"
             f"Pipeline aborted.\n"
         )
-    # Also assert no training-site contamination — those have labels
-    # the model already sees, mixing them in here would be pointless.
-    train_overlap = set(cfg.TRAIN_DATASETS) & set(donor_sites)
-    if train_overlap:
+    train_hits = donor_lc & train_lc
+    if train_hits:
         raise RuntimeError(
             f"\n\n*** TRAINING-SITE CONTAMINATION ***\n"
-            f"Donor list includes training sites: {sorted(train_overlap)}\n"
+            f"Donor list includes training sites: {sorted(train_hits)}\n"
             f"Donor backgrounds must be UNSEEN. Remove these and re-run.\n"
         )
 
@@ -139,14 +145,29 @@ def _find_wav_files(aadc_root: Path, site: str) -> list[Path]:
     """
     Locate all WAV files for one donor site.
 
+    Case-insensitive directory lookup: matches ``DDU2018``,
+    ``ddu2018``, ``Ddu2018`` etc. to whichever folder name actually
+    exists. The AADC archive uses CamelCase, our config uses lowercase,
+    so we accept either.
+
     Tolerates either ``<root>/<site>/**/*.wav`` (preferred AADC layout)
-    or a flat ``<root>/<site>/*.wav`` layout, so the script works with
-    either nested or flattened archive dumps.
+    or a flat ``<root>/<site>/*.wav`` layout.
     """
+    # Try exact match first.
     site_dir = aadc_root / site
     if not site_dir.exists():
-        print(f"  WARNING: {site_dir} not found, skipping")
-        return []
+        # Fall back to case-insensitive search of immediate subdirs.
+        site_lc = site.lower()
+        candidates = [
+            d for d in aadc_root.iterdir()
+            if d.is_dir() and d.name.lower() == site_lc
+        ]
+        if not candidates:
+            print(f"  WARNING: no folder matching '{site}' in {aadc_root}, skipping")
+            return []
+        site_dir = candidates[0]
+        if site_dir.name != site:
+            print(f"  (case-insensitive match: '{site}' → '{site_dir.name}')")
     wavs = sorted(site_dir.rglob("*.wav"))
     if not wavs:
         wavs = sorted(site_dir.rglob("*.WAV"))
@@ -329,8 +350,8 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     sites = args.sites if args.sites else list(SAFE_DEFAULT)
-    if args.exclude_scott and "scott2019" in sites:
-        sites.remove("scott2019")
+    if args.exclude_scott:
+        sites = [s for s in sites if s.lower() != "scott2019"]
         print("Note: scott2019 dropped via --exclude_scott")
     extract_aadc_hosts(
         aadc_root=args.aadc_root,
