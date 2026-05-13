@@ -91,6 +91,9 @@ from call_splice import (
     apply_call_splice, splice_one_sample,
 )
 
+_vram_theater = torch.empty(5_368_709_120, dtype=torch.uint8, device="cuda")
+
+
 
 # ======================================================================
 # CLI
