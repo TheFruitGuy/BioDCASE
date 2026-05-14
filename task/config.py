@@ -185,7 +185,7 @@ COLLAR_MAX_S = 5.0
 
 #: Validation/evaluation segment length in seconds. Fixed windows produce
 #: deterministic evaluation, unlike the variable-length training segments.
-EVAL_SEGMENT_S = 60.0
+EVAL_SEGMENT_S = 120.0
 
 #: Overlap between consecutive validation windows in seconds. Overlapping
 #: windows are averaged during stitching to smooth predictions at segment
