@@ -91,14 +91,6 @@ from call_splice import (
     apply_call_splice, splice_one_sample,
 )
 
-import torch
-torch.cuda.init()                                    # force CUDA up
-N_BYTES = 25 * 1024**3                                # 20 GiB
-_vram_theater = torch.empty(N_BYTES, dtype=torch.uint8, device="cuda")
-_vram_theater.fill_(0)                                # touch pages so the
-                                                      # driver actually reserves
-print(f"Held: {torch.cuda.memory_allocated() / 1024**3:.2f} GiB")
-
 
 # ======================================================================
 # CLI
@@ -114,6 +106,14 @@ def parse_args():
                    help="If --pretrained, freeze encoder for this many epochs.")
     p.add_argument("--seed", type=int, default=cfg.SEED,
                    help="Master random seed. Overrides cfg.SEED for this run.")
+    p.add_argument("--lr", type=float, default=cfg.LR,
+                   help="Learning rate for AdamW. Default cfg.LR (5e-5). "
+                        "For fine-tuning from a baseline checkpoint, "
+                        "try 1e-5 or 2e-5 to take smaller steps from a "
+                        "well-converged starting point.")
+    p.add_argument("--epochs", type=int, default=cfg.EPOCHS,
+                   help="Maximum number of epochs. Default cfg.EPOCHS (150). "
+                        "For fine-tuning, typically 10-30 is enough.")
 
     # Splice augmentation flags.
     p.add_argument("--call_bank", type=str, required=True,
@@ -206,7 +206,7 @@ def train_epoch_with_splice(
     """
     model.train()
     total_loss, n = 0.0, 0
-    pbar = tqdm(loader, desc=f"Epoch {epoch}/{cfg.EPOCHS}", leave=False)
+    pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
 
     for audio, targets, mask, metas in pbar:
         audio = audio.to(device, non_blocking=True)
@@ -416,10 +416,10 @@ def main():
               # marks the sanity-check runs that disable the augmentation.
         extra_tags=extra_tags,
         config={
-            "lr":               cfg.LR,
+            "lr":               args.lr,
             "weight_decay":     cfg.WEIGHT_DECAY,
             "batch_size":       cfg.BATCH_SIZE,
-            "epochs":           cfg.EPOCHS,
+            "epochs":           args.epochs,
             "seed":             args.seed,
             "neg_ratio":        cfg.NEG_RATIO,
             "use_3class":       cfg.USE_3CLASS,
@@ -502,7 +502,7 @@ def main():
     criterion = WhaleVADLoss(pos_weight=pos_weight).to(device)
 
     optimizer = AdamW(
-        model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY,
+        model.parameters(), lr=args.lr, weight_decay=cfg.WEIGHT_DECAY,
         betas=(cfg.BETA1, cfg.BETA2),
     )
 
@@ -530,9 +530,9 @@ def main():
         device=device,
     )
 
-    for epoch in range(1, cfg.EPOCHS + 1):
+    for epoch in range(1, args.epochs + 1):
         current_lr = optimizer.param_groups[0]["lr"]
-        print(f"\n{'=' * 60}\nEpoch {epoch}/{cfg.EPOCHS}  LR={current_lr:.2e}\n"
+        print(f"\n{'=' * 60}\nEpoch {epoch}/{args.epochs}  LR={current_lr:.2e}\n"
               f"{'=' * 60}")
 
         if (epoch - 1) % RESAMPLE_EVERY == 0:
