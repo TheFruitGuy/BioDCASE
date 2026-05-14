@@ -4,8 +4,8 @@ LEAF Frontend for Whale-VAD
 
 A drop-in replacement for ``SpectrogramExtractor`` that uses the LEAF
 learnable filterbank (Zeghidour et al., arXiv:2101.08596) instead of a
-fixed phase-aware STFT. Wraps SpeechBrain's ``Leaf`` module (tested with
-speechbrain==1.1.0).
+fixed phase-aware STFT. Wraps SpeechBrain's ``Leaf`` module (tested
+with speechbrain==1.1.0).
 
 Whale-specific adaptations
 --------------------------
@@ -17,20 +17,38 @@ Whale-specific adaptations
 2. **Linear Gabor initialization.** Published bioacoustic studies
    (Anderson, Kinnunen & Harte 2023; Schlüter & Gutenbrunner 2022)
    find that LEAF filters barely move from their init, so init choice
-   dominates. For narrow low-frequency bands the default mel spacing
-   wastes filter capacity; linear spacing distributes filters evenly.
+   dominates the result. For narrow low-frequency bands the default mel
+   spacing wastes filter capacity; linear spacing distributes filters
+   evenly.
 
-   SpeechBrain's ``GaborConv1d`` stores filter params in a single
-   parameter tensor ``self.weights`` of shape ``(n_filters, 2)`` where
-   column 0 is the **center frequency in radians** and column 1 is the
-   **inverse bandwidth** (also in normalized angular-frequency units).
-   See ``_reinit_gabor_linear`` for the unit conversion.
+SpeechBrain GaborConv1d parameter conventions (verified empirically
+against the mel init values for speechbrain==1.1.0)
+-----------------------------------------------------------------
+The Gabor parameter tensor on ``leaf.complex_conv`` has shape
+``(n_filters, 2)``:
+
+  - **Column 0 (mu)**: center frequency in **angular radians**, i.e.
+    ``mu = π · f / Nyquist``. Range ``[0, π]`` maps to ``[0, Nyquist]``
+    Hz. SpeechBrain's mel init at SR=250 produces mu in [0.147, 3.117]
+    rad, matching 5.86 to 124.02 Hz.
+
+  - **Column 1 (sigma)**: Gabor envelope's temporal standard deviation
+    in **samples**. The filter's frequency-domain FWHM is
+    ``FWHM_freq_rad = 2.3548 / sigma``. SpeechBrain's mel init produces
+    sigma in [47.97, 95.94] samples — corresponding to frequency FWHMs
+    that approximately equal the mel-bin spacing (i.e. adjacent filters
+    meet at their half-max points; standard 50% overlap).
 
 Output format
 -------------
 ``(B, n_samples)`` -> ``(B, 1, n_filters, n_time_frames)``. Matches the
-rank of ``SpectrogramExtractor``'s output (which was 3-channel); construct
-``WhaleVAD(feat_channels=1)`` to consume.
+rank of ``SpectrogramExtractor``'s output (which was 3-channel);
+construct ``WhaleVAD(feat_channels=1)`` to consume.
+
+Note: with ``use_pcen=False`` SpeechBrain's Leaf has no compression
+layer, but the Gaussian lowpass pooling has a learnable bias enabled by
+default. As a result the output is non-negative with min ~1 (the bias
+floor); information is carried by variation above that floor.
 
 Dependencies
 ------------
@@ -99,8 +117,6 @@ class LeafFrontend(nn.Module):
 
         n_fft = max(256, int(round(window_len_ms * sample_rate / 1000.0)))
 
-        # speechbrain>=1.0 requires `in_channels` or `input_shape`.
-        # For mono audio, in_channels=1.
         self.leaf = Leaf(
             in_channels=1,
             out_channels=n_filters,
@@ -116,8 +132,6 @@ class LeafFrontend(nn.Module):
             n_fft=n_fft,
         )
 
-        # Snapshot what SpeechBrain's mel init produced — useful when
-        # comparing against our linear-init values for unit-convention bugs.
         if verbose:
             self._print_gabor_state("after SpeechBrain mel init")
 
@@ -130,9 +144,6 @@ class LeafFrontend(nn.Module):
                 f"Unknown init mode '{init}', expected 'linear' or 'mel'."
             )
 
-    # ------------------------------------------------------------------
-    # Compat shim for validate() in train.py (uses spec_extractor.hop_length)
-    # ------------------------------------------------------------------
     @property
     def hop_length(self) -> int:
         return int(round(self.window_stride_ms * self.sample_rate / 1000.0))
@@ -142,19 +153,13 @@ class LeafFrontend(nn.Module):
     # ------------------------------------------------------------------
 
     def _gabor_param(self) -> torch.nn.Parameter:
-        """
-        Locate the GaborConv1d's (mu, sigma) parameter tensor of shape
-        (n_filters, 2). SpeechBrain has named this ``weights``,
-        ``kernel``, and ``_kernel`` in different versions, so we try
-        the known names first, then fall back to shape-based search.
-        """
+        """Locate the (n_filters, 2) Gabor parameter tensor."""
         gabor = self.leaf.complex_conv
-        # Known attribute names across SpeechBrain versions.
         for name in ("weights", "kernel", "_kernel", "mu", "_mu"):
             attr = getattr(gabor, name, None)
             if isinstance(attr, torch.nn.Parameter):
-                return attr
-        # Fall back: scan named_parameters() for the right shape.
+                if attr.dim() == 2 and attr.shape == (self.n_filters, 2):
+                    return attr
         candidates = [
             (n, p) for n, p in gabor.named_parameters()
             if p.dim() == 2 and p.shape == (self.n_filters, 2)
@@ -163,19 +168,18 @@ class LeafFrontend(nn.Module):
             return candidates[0][1]
         if len(candidates) > 1:
             raise RuntimeError(
-                "Multiple GaborConv1d parameters of shape "
-                f"({self.n_filters}, 2) found: "
-                f"{[n for n, _ in candidates]}. Cannot disambiguate."
+                "Multiple parameters of shape "
+                f"({self.n_filters}, 2) found on GaborConv1d: "
+                f"{[n for n, _ in candidates]}."
             )
         named = list(gabor.named_parameters())
         raise RuntimeError(
-            "Could not locate the Gabor (mu, sigma) parameter tensor on "
-            f"speechbrain Leaf.complex_conv. Parameters present: "
+            "Could not locate the Gabor (mu, sigma) parameter tensor. "
+            f"GaborConv1d parameters: "
             f"{[(n, tuple(p.shape)) for n, p in named]}"
         )
 
     def _print_gabor_state(self, tag: str) -> None:
-        """Print a compact summary of the current Gabor params."""
         try:
             p = self._gabor_param().detach().cpu()
         except RuntimeError as e:
@@ -183,72 +187,64 @@ class LeafFrontend(nn.Module):
             return
         mu = p[:, 0]
         sig = p[:, 1]
-        # Print the param in *raw* tensor units (unit-agnostic), and also
-        # converted assuming SpeechBrain's convention is angular radians
-        # in [0, π] (the most common Gabor convention).
         sr = self.sample_rate
-        mu_hz_radians = (mu / math.pi * (sr / 2)).cpu()
-        mu_hz_normalized = (mu * sr).cpu()
+        mu_hz_angular = (mu / math.pi * (sr / 2.0))
+        # FWHM in Hz under the angular-radian + samples convention:
+        # FWHM_freq_rad = 2.3548 / sigma; convert rad -> Hz via Nyquist.
+        fwhm_hz = (2.3548 / sig.clamp(min=1e-8)) * (sr / 2.0) / math.pi
         print(
             f"[LeafFrontend] {tag}: param shape={tuple(p.shape)}\n"
-            f"  raw mu       : min={mu.min().item():.6f} "
-            f"max={mu.max().item():.6f} "
-            f"med={mu.median().item():.6f}\n"
-            f"  if angular   : min={mu_hz_radians.min().item():.2f} Hz "
-            f"max={mu_hz_radians.max().item():.2f} Hz "
-            f"med={mu_hz_radians.median().item():.2f} Hz\n"
-            f"  if normalized: min={mu_hz_normalized.min().item():.2f} Hz "
-            f"max={mu_hz_normalized.max().item():.2f} Hz "
-            f"med={mu_hz_normalized.median().item():.2f} Hz\n"
-            f"  raw sigma    : min={sig.min().item():.6f} "
-            f"max={sig.max().item():.6f} "
-            f"med={sig.median().item():.6f}"
+            f"  mu (angular rad)      : "
+            f"min={mu.min().item():.4f} max={mu.max().item():.4f} "
+            f"med={mu.median().item():.4f}\n"
+            f"  mu (=> Hz)            : "
+            f"min={mu_hz_angular.min().item():.2f} "
+            f"max={mu_hz_angular.max().item():.2f} "
+            f"med={mu_hz_angular.median().item():.2f}\n"
+            f"  sigma (samples)       : "
+            f"min={sig.min().item():.4f} max={sig.max().item():.4f} "
+            f"med={sig.median().item():.4f}\n"
+            f"  implied FWHM (Hz)     : "
+            f"min={fwhm_hz.min().item():.2f} max={fwhm_hz.max().item():.2f} "
+            f"med={fwhm_hz.median().item():.2f}"
         )
 
     def _reinit_gabor_linear(self) -> None:
         """
-        Replace SpeechBrain's mel-spaced Gabor centers/bandwidths with a
-        linear spacing across ``[min_freq, max_freq]``.
-
-        SpeechBrain's ``GaborConv1d`` uses **angular frequency in radians**
-        for ``mu``: ``mu = 2π f / sample_rate``, so a center frequency f
-        Hz maps to ``mu = π · (f / Nyquist)``, with the range being
-        ``[0, π]`` rather than ``[0, 0.5]``. The bandwidth-related
-        ``sigma`` is in the same units.
-
-        If you observe degenerate output after reinitialization (e.g.
-        near-constant features), inspect the snapshot printed before/
-        after init: if SpeechBrain's mel init produced ``mu`` values in
-        a different range, the unit convention has changed in your
-        installed speechbrain and this function needs updating.
+        Replace SpeechBrain's mel-spaced Gabor params with linear-in-Hz
+        spacing across ``[min_freq, max_freq]`` and a single fixed
+        bandwidth matching the inter-filter spacing.
         """
         param = self._gabor_param()
         sr = self.sample_rate
+        nyq = sr / 2.0
 
-        # Convert target Hz -> angular radians.
-        # f_hz / nyquist ∈ [0, 1], times π gives [0, π]
-        min_mu = math.pi * self.min_freq / (sr / 2.0)
-        max_mu = math.pi * self.max_freq / (sr / 2.0)
+        # mu in angular radians: f Hz -> π · f / Nyquist
+        min_mu = math.pi * self.min_freq / nyq
+        max_mu = math.pi * self.max_freq / nyq
         new_mu = torch.linspace(min_mu, max_mu, self.n_filters)
 
-        # Bandwidth: aim for adjacent filters to overlap at FWHM.
-        # FWHM(σ) ≈ 2.355 σ for a Gaussian, so σ = spacing / 2.355
-        # gives roughly half-overlap.
-        spacing = (max_mu - min_mu) / max(self.n_filters - 1, 1)
-        new_sigma = torch.full((self.n_filters,), spacing / 2.355)
+        # sigma is temporal std in samples. Choose it so each filter's
+        # frequency FWHM equals 2× the inter-filter spacing (i.e. adjacent
+        # filters meet at half-max). This mirrors SpeechBrain's mel-init
+        # convention and gives ~50% overlap between neighbors.
+        spacing_rad = (max_mu - min_mu) / max(self.n_filters - 1, 1)
+        target_fwhm_rad = 2.0 * spacing_rad
+        sigma_samples = 2.3548 / target_fwhm_rad
 
+        new_sigma = torch.full((self.n_filters,), float(sigma_samples))
         new_kernel = torch.stack([new_mu, new_sigma], dim=-1)
         with torch.no_grad():
             param.copy_(new_kernel.to(param.device).to(param.dtype))
 
         spacing_hz = (self.max_freq - self.min_freq) / max(self.n_filters - 1, 1)
+        fwhm_hz = target_fwhm_rad * (sr / 2.0) / math.pi
         print(
-            f"[LeafFrontend] Linear Gabor init "
-            f"(angular-radian units, [0, π] => [0, Nyquist={sr/2:.1f}] Hz):\n"
+            f"[LeafFrontend] Linear Gabor init:\n"
             f"  {self.n_filters} filters across "
             f"[{self.min_freq:.1f}, {self.max_freq:.1f}] Hz, "
-            f"spacing {spacing_hz:.2f} Hz "
-            f"(mu range [{min_mu:.4f}, {max_mu:.4f}] rad)"
+            f"spacing {spacing_hz:.2f} Hz, FWHM {fwhm_hz:.2f} Hz, "
+            f"sigma {sigma_samples:.2f} samples"
         )
 
     # ------------------------------------------------------------------
@@ -256,9 +252,6 @@ class LeafFrontend(nn.Module):
     # ------------------------------------------------------------------
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
-        """
-        ``(B, n_samples)`` -> ``(B, 1, n_filters, n_time_frames)``.
-        """
         if audio.ndim == 1:
             audio = audio.unsqueeze(0)
         try:
@@ -295,9 +288,12 @@ if __name__ == "__main__":
     audio = torch.randn(2, cfg.SAMPLE_RATE * 30)
     feat_mel = leaf_mel(audio)
     print(f"  Output shape: {feat_mel.shape}")
-    print(f"  Output stats: min={feat_mel.min():.6f} "
-          f"max={feat_mel.max():.6f} "
-          f"mean={feat_mel.mean():.6f} std={feat_mel.std():.6f}")
+    print(f"  Output stats: min={feat_mel.min():.4f} "
+          f"max={feat_mel.max():.4f} "
+          f"mean={feat_mel.mean():.4f} std={feat_mel.std():.4f}")
+    pfs = feat_mel[0, 0].std(dim=-1)
+    print(f"  Per-filter time std: "
+          f"min={pfs.min():.4f} max={pfs.max():.4f} mean={pfs.mean():.4f}")
 
     print()
     print("=" * 60)
@@ -306,9 +302,12 @@ if __name__ == "__main__":
     leaf_lin = LeafFrontend(n_filters=128, init="linear", use_pcen=False)
     feat_lin = leaf_lin(audio)
     print(f"  Output shape: {feat_lin.shape}")
-    print(f"  Output stats: min={feat_lin.min():.6f} "
-          f"max={feat_lin.max():.6f} "
-          f"mean={feat_lin.mean():.6f} std={feat_lin.std():.6f}")
+    print(f"  Output stats: min={feat_lin.min():.4f} "
+          f"max={feat_lin.max():.4f} "
+          f"mean={feat_lin.mean():.4f} std={feat_lin.std():.4f}")
+    pfs = feat_lin[0, 0].std(dim=-1)
+    print(f"  Per-filter time std: "
+          f"min={pfs.min():.4f} max={pfs.max():.4f} mean={pfs.mean():.4f}")
 
     print()
     print(f"Gradient check (linear init):")
