@@ -2,36 +2,25 @@
 train_leaf.py — Whale-VAD training with the LEAF learnable frontend.
 
 Mirror of ``train.py`` with the fixed phase-aware STFT frontend replaced
-by ``LeafFrontend`` (SpeechBrain ``Leaf``, linear Gabor init by default).
-
-What differs from ``train.py``
-------------------------------
-1. ``SpectrogramExtractor`` → ``LeafFrontend`` (5-125 Hz passband,
-   128 filters, linear init, no PCEN by default).
-2. ``WhaleVAD(feat_channels=1)`` to consume LEAF's single-channel output.
-3. AdamW uses **two parameter groups**: ``leaf_lr_scale × cfg.LR`` (0.1×
-   by default) for LEAF parameters, ``cfg.LR`` for the rest.
-4. Gradient clipping covers both the model and the frontend.
-5. Checkpoints save the trained Gabor weights alongside the model.
-6. wandb tags include leaf_init / n_filters / pcen so runs are scannable.
-7. Each epoch prints diagnostic stats on Gabor-center drift.
+by ``LeafFrontend`` (SpeechBrain ``Leaf``, linear Gabor init by default,
+log compression by default).
 
 Usage
 -----
 ::
 
-    # Single GPU (recommended) — DO NOT just `python train_leaf.py`
-    # on this cluster, it grabs all 10 GPUs including incompatible ones.
+    # Single GPU (the cluster's Blackwell GPUs aren't supported by
+    # this PyTorch build, so always scope CUDA_VISIBLE_DEVICES).
     CUDA_VISIBLE_DEVICES=0 python train_leaf.py
+
+    # Compare with PCEN compression
+    CUDA_VISIBLE_DEVICES=0 python train_leaf.py --compression pcen
 
     # Mel-init ablation
     CUDA_VISIBLE_DEVICES=0 python train_leaf.py --init mel
 
-    # With learnable PCEN
-    CUDA_VISIBLE_DEVICES=0 python train_leaf.py --use_pcen
-
-    # If training diverges, drop the LEAF LR further
-    CUDA_VISIBLE_DEVICES=0 python train_leaf.py --leaf_lr_scale 0.05
+    # Diagnostic only: no compression (known degenerate on whale data)
+    CUDA_VISIBLE_DEVICES=0 python train_leaf.py --compression none
 """
 
 import argparse
@@ -56,7 +45,6 @@ from dataset import (
 )
 from postprocess import tune_thresholds_event_level
 
-# Reuse the shared training utilities from train.py.
 from train import (
     align_lengths, validate, set_seed,
     RESAMPLE_EVERY, EARLY_STOP_PATIENCE, LR_PATIENCE, LR_FACTOR, MIN_LR,
@@ -73,18 +61,25 @@ def parse_args():
     p.add_argument("--freeze_epochs", type=int, default=0)
     p.add_argument("--n_filters", type=int, default=128)
     p.add_argument("--init", choices=["linear", "mel"], default="linear")
-    p.add_argument("--use_pcen", action="store_true")
+    p.add_argument(
+        "--compression", choices=["log", "pcen", "none"], default="log",
+        help="LEAF output compression. 'log' (default) is comparable to "
+             "log-mel and works on whale data; 'pcen' uses learnable PCEN; "
+             "'none' is broken on whale data, diagnostic only."
+    )
+    # Backward-compat alias.
+    p.add_argument("--use_pcen", action="store_true",
+                   help="(legacy) equivalent to --compression pcen")
     p.add_argument("--leaf_lr_scale", type=float, default=0.1)
     return p.parse_args()
 
 
 # ======================================================================
-# Training epoch — LEAF variant
+# Training epoch
 # ======================================================================
 
 def train_epoch_leaf(model, spec_extractor, loader, criterion,
                      optimizer, device, epoch):
-    """One training epoch with the LEAF frontend trained jointly."""
     model.train()
     spec_extractor.train()
     total_loss, n = 0.0, 0
@@ -124,20 +119,12 @@ def train_epoch_leaf(model, spec_extractor, loader, criterion,
 # ======================================================================
 
 def gabor_centers_hz(spec_extractor: LeafFrontend) -> torch.Tensor | None:
-    """
-    Return current Gabor center frequencies in Hz.
-
-    Reuses the LeafFrontend's own param locator so we get the right
-    tensor regardless of speechbrain version, and converts from the
-    angular-radian convention (mu = π · f / Nyquist) used by SpeechBrain
-    1.1.0's GaborConv1d.
-    """
+    """Current Gabor center frequencies in Hz (angular-radian -> Hz)."""
     try:
         param = spec_extractor._gabor_param()
     except RuntimeError:
         return None
     sr = spec_extractor.sample_rate
-    # mu in [0, π] -> f in [0, Nyquist] Hz
     return (param[:, 0].detach() / math.pi * (sr / 2.0)).cpu()
 
 
@@ -147,25 +134,22 @@ def gabor_centers_hz(spec_extractor: LeafFrontend) -> torch.Tensor | None:
 
 def main():
     args = parse_args()
+    compression = "pcen" if args.use_pcen else args.compression
+
     set_seed()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     if torch.cuda.is_available():
-        print(f"CUDA_VISIBLE_DEVICES set, seeing "
-              f"{torch.cuda.device_count()} GPU(s):")
+        print(f"Seeing {torch.cuda.device_count()} GPU(s):")
         for i in range(torch.cuda.device_count()):
             print(f"  cuda:{i}  {torch.cuda.get_device_name(i)}")
 
-    # ------------------------------------------------------------------
-    # wandb
-    # ------------------------------------------------------------------
     extra_tags = [
         "leaf_frontend",
         f"leaf_init_{args.init}",
         f"leaf_filters_{args.n_filters}",
+        f"leaf_compression_{compression}",
     ]
-    if args.use_pcen:
-        extra_tags.append("leaf_pcen")
     if cfg.USE_WEIGHTED_BCE:
         extra_tags.append("weighted_bce")
     if getattr(cfg, "USE_FOCAL_LOSS", False):
@@ -200,7 +184,7 @@ def main():
             "frontend":        "leaf",
             "leaf_n_filters":  args.n_filters,
             "leaf_init":       args.init,
-            "leaf_use_pcen":   args.use_pcen,
+            "leaf_compression": compression,
             "leaf_lr_scale":   args.leaf_lr_scale,
         },
     )
@@ -209,9 +193,6 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir: {run_dir}")
 
-    # ------------------------------------------------------------------
-    # Data
-    # ------------------------------------------------------------------
     train_ds, train_loader, val_loader = build_dataloaders()
     val_annotations = load_annotations(cfg.VAL_DATASETS)
     val_manifest = get_file_manifest(cfg.VAL_DATASETS)
@@ -220,13 +201,10 @@ def main():
         for _, r in val_manifest.iterrows()
     }
 
-    # ------------------------------------------------------------------
-    # Model + LEAF frontend
-    # ------------------------------------------------------------------
     spec_extractor = LeafFrontend(
         n_filters=args.n_filters,
         init=args.init,
-        use_pcen=args.use_pcen,
+        compression=compression,
     ).to(device)
     model = WhaleVAD(num_classes=cfg.n_classes(), feat_channels=1).to(device)
 
@@ -245,9 +223,7 @@ def main():
         if unexpected:
             print(f"  Unexpected: {len(unexpected)}")
         print("  NOTE: pretrained encoder weights were trained for "
-              "feat_channels=3 (STFT). The `filterbank` Conv2d here has "
-              "feat_channels=1 (LEAF) and will be silently dropped from "
-              "the load (reported above as missing).")
+              "feat_channels=3 (STFT). filterbank weights will be dropped.")
 
     if torch.cuda.device_count() > 1:
         print(f"DataParallel across {torch.cuda.device_count()} GPUs")
@@ -258,9 +234,6 @@ def main():
     print(f"Model params: {n_model:,}")
     print(f"LEAF params:  {n_leaf:,}")
 
-    # ------------------------------------------------------------------
-    # Loss + optimizer
-    # ------------------------------------------------------------------
     pos_weight = compute_class_weights().to(device) if cfg.USE_WEIGHTED_BCE else None
     criterion = WhaleVADLoss(pos_weight=pos_weight).to(device)
 
@@ -287,9 +260,6 @@ def main():
               f"med={init_centers.median():.2f} "
               f"max={init_centers.max():.2f}")
 
-    # ------------------------------------------------------------------
-    # Training loop
-    # ------------------------------------------------------------------
     best_f1 = 0.0
     no_improve_epochs = 0
     thresholds = torch.tensor(
@@ -390,11 +360,11 @@ def main():
             "best_f1":          best_f1,
             "thresholds":       thresholds.cpu(),
             "leaf_args": {
-                "n_filters": args.n_filters,
-                "init":      args.init,
-                "use_pcen":  args.use_pcen,
-                "min_freq":  spec_extractor.min_freq,
-                "max_freq":  spec_extractor.max_freq,
+                "n_filters":   args.n_filters,
+                "init":        args.init,
+                "compression": compression,
+                "min_freq":    spec_extractor.min_freq,
+                "max_freq":    spec_extractor.max_freq,
             },
         }
 
@@ -415,9 +385,6 @@ def main():
                   f"{EARLY_STOP_PATIENCE} epochs")
             break
 
-    # ------------------------------------------------------------------
-    # Post-training threshold tuning
-    # ------------------------------------------------------------------
     print(f"\n{'=' * 60}\nTuning thresholds on best model\n{'=' * 60}")
     best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device,
                            weights_only=False)
@@ -439,11 +406,11 @@ def main():
         "leaf_state_dict":  spec_extractor.state_dict(),
         "thresholds":       torch.tensor(tuned),
         "leaf_args": {
-            "n_filters": args.n_filters,
-            "init":      args.init,
-            "use_pcen":  args.use_pcen,
-            "min_freq":  spec_extractor.min_freq,
-            "max_freq":  spec_extractor.max_freq,
+            "n_filters":   args.n_filters,
+            "init":        args.init,
+            "compression": compression,
+            "min_freq":    spec_extractor.min_freq,
+            "max_freq":    spec_extractor.max_freq,
         },
     }, run_dir / "final_model.pt")
 
@@ -458,7 +425,7 @@ def main():
     wandb.summary["frontend"]            = "leaf"
     wandb.summary["leaf_init"]           = args.init
     wandb.summary["leaf_n_filters"]      = args.n_filters
-    wandb.summary["leaf_use_pcen"]       = args.use_pcen
+    wandb.summary["leaf_compression"]    = compression
     final_centers = gabor_centers_hz(spec_extractor)
     if final_centers is not None and init_centers is not None:
         drift = (final_centers - init_centers).abs()
@@ -466,19 +433,19 @@ def main():
         wandb.summary["leaf/final_drift_max_hz"]  = float(drift.max())
     wandb.summary["verdict"] = (
         f"LEAF frontend ({args.init} init, {args.n_filters} filters, "
-        f"PCEN={args.use_pcen}) finished at best F1 {best_f1:.3f}."
+        f"compression={compression}) finished at best F1 {best_f1:.3f}."
     )
 
     art = wandb.Artifact(
         f"model-leaf-{run.name}", type="model",
         metadata={
-            "best_f1":         float(best_f1),
-            "best_epoch":      int(best_ckpt.get("epoch", 0)),
-            "epochs_run":      int(epoch),
-            "frontend":        "leaf",
-            "leaf_init":       args.init,
-            "leaf_n_filters":  args.n_filters,
-            "leaf_use_pcen":   args.use_pcen,
+            "best_f1":          float(best_f1),
+            "best_epoch":       int(best_ckpt.get("epoch", 0)),
+            "epochs_run":       int(epoch),
+            "frontend":         "leaf",
+            "leaf_init":        args.init,
+            "leaf_n_filters":   args.n_filters,
+            "leaf_compression": compression,
         },
     )
     art.add_file(str(run_dir / "best_model.pt"))
