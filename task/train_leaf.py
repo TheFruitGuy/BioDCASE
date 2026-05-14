@@ -6,52 +6,36 @@ by ``LeafFrontend`` (SpeechBrain ``Leaf``, linear Gabor init by default).
 
 What differs from ``train.py``
 ------------------------------
-1. ``SpectrogramExtractor`` → ``LeafFrontend`` with whale-appropriate
-   defaults (5-125 Hz passband, 128 filters, linear init, no PCEN).
+1. ``SpectrogramExtractor`` → ``LeafFrontend`` (5-125 Hz passband,
+   128 filters, linear init, no PCEN by default).
 2. ``WhaleVAD(feat_channels=1)`` to consume LEAF's single-channel output.
 3. AdamW uses **two parameter groups**: ``leaf_lr_scale × cfg.LR`` (0.1×
-   by default) for the LEAF parameters, ``cfg.LR`` for the rest.
+   by default) for LEAF parameters, ``cfg.LR`` for the rest.
 4. Gradient clipping covers both the model and the frontend.
-5. Checkpoints save the trained Gabor weights alongside the model so
-   inference can reload the full learnable pipeline.
+5. Checkpoints save the trained Gabor weights alongside the model.
 6. wandb tags include leaf_init / n_filters / pcen so runs are scannable.
-7. Each epoch prints diagnostic stats on where the Gabor centers have
-   drifted to — the published "filters don't move from init" failure
-   mode is exactly what these stats catch.
-
-What's reused from ``train.py``
--------------------------------
-``set_seed``, ``align_lengths``, ``validate``, and the stability
-hyperparameters (``RESAMPLE_EVERY``, ``EARLY_STOP_PATIENCE``,
-``LR_PATIENCE``, ``LR_FACTOR``, ``MIN_LR``) are imported. If you tweak
-those in train.py the changes apply here automatically.
+7. Each epoch prints diagnostic stats on Gabor-center drift.
 
 Usage
 -----
 ::
 
-    # Recommended first run: linear init, no PCEN, 128 filters
-    python train_leaf.py
+    # Single GPU (recommended) — DO NOT just `python train_leaf.py`
+    # on this cluster, it grabs all 10 GPUs including incompatible ones.
+    CUDA_VISIBLE_DEVICES=0 python train_leaf.py
 
     # Mel-init ablation
-    python train_leaf.py --init mel
+    CUDA_VISIBLE_DEVICES=0 python train_leaf.py --init mel
 
     # With learnable PCEN
-    python train_leaf.py --use_pcen
-
-    # Smaller bank (will need feat_extractor MaxPool adjustments)
-    python train_leaf.py --n_filters 64
+    CUDA_VISIBLE_DEVICES=0 python train_leaf.py --use_pcen
 
     # If training diverges, drop the LEAF LR further
-    python train_leaf.py --leaf_lr_scale 0.05
-
-    # Multi-seed sweep matching the baseline protocol
-    for s in 42 1337 9999 7777; do
-        SEED=$s python train_leaf.py
-    done
+    CUDA_VISIBLE_DEVICES=0 python train_leaf.py --leaf_lr_scale 0.05
 """
 
 import argparse
+import math
 import time
 from pathlib import Path
 
@@ -72,7 +56,7 @@ from dataset import (
 )
 from postprocess import tune_thresholds_event_level
 
-# Reuse the shared training utilities from train.py so they stay in sync.
+# Reuse the shared training utilities from train.py.
 from train import (
     align_lengths, validate, set_seed,
     RESAMPLE_EVERY, EARLY_STOP_PATIENCE, LR_PATIENCE, LR_FACTOR, MIN_LR,
@@ -85,28 +69,18 @@ from train import (
 
 def parse_args():
     p = argparse.ArgumentParser()
-    # Baseline knobs
-    p.add_argument("--pretrained", type=str, default=None,
-                   help="Path to a pretrained encoder checkpoint.")
-    p.add_argument("--freeze_epochs", type=int, default=0,
-                   help="Freeze encoder for this many initial epochs.")
-    # LEAF-specific knobs
-    p.add_argument("--n_filters", type=int, default=128,
-                   help="Number of Gabor filters in LEAF.")
-    p.add_argument("--init", choices=["linear", "mel"], default="linear",
-                   help="Gabor center-frequency initialization.")
-    p.add_argument("--use_pcen", action="store_true",
-                   help="Enable learnable PCEN compression in LEAF.")
-    p.add_argument("--leaf_lr_scale", type=float, default=0.1,
-                   help="LR multiplier for LEAF params relative to cfg.LR.")
+    p.add_argument("--pretrained", type=str, default=None)
+    p.add_argument("--freeze_epochs", type=int, default=0)
+    p.add_argument("--n_filters", type=int, default=128)
+    p.add_argument("--init", choices=["linear", "mel"], default="linear")
+    p.add_argument("--use_pcen", action="store_true")
+    p.add_argument("--leaf_lr_scale", type=float, default=0.1)
     return p.parse_args()
 
 
 # ======================================================================
 # Training epoch — LEAF variant
 # ======================================================================
-# Only difference from train.train_epoch: spec_extractor.train() to keep
-# any PCEN / BN stats updating, and grad clipping covers both modules.
 
 def train_epoch_leaf(model, spec_extractor, loader, criterion,
                      optimizer, device, epoch):
@@ -146,27 +120,25 @@ def train_epoch_leaf(model, spec_extractor, loader, criterion,
 
 
 # ======================================================================
-# Helpers
+# Diagnostics
 # ======================================================================
 
 def gabor_centers_hz(spec_extractor: LeafFrontend) -> torch.Tensor | None:
-    """Return current Gabor center frequencies in Hz, or None if not found."""
-    gabor = spec_extractor.leaf.complex_conv
-    param = None
-    for name in ("kernel", "_kernel", "mu", "_mu"):
-        if hasattr(gabor, name):
-            attr = getattr(gabor, name)
-            if isinstance(attr, torch.nn.Parameter):
-                param = attr
-                break
-    if param is None:
-        for _, p in gabor.named_parameters():
-            if p.dim() == 2 and p.shape[1] == 2:
-                param = p
-                break
-    if param is None:
+    """
+    Return current Gabor center frequencies in Hz.
+
+    Reuses the LeafFrontend's own param locator so we get the right
+    tensor regardless of speechbrain version, and converts from the
+    angular-radian convention (mu = π · f / Nyquist) used by SpeechBrain
+    1.1.0's GaborConv1d.
+    """
+    try:
+        param = spec_extractor._gabor_param()
+    except RuntimeError:
         return None
-    return (param[:, 0].detach() * spec_extractor.sample_rate).cpu()
+    sr = spec_extractor.sample_rate
+    # mu in [0, π] -> f in [0, Nyquist] Hz
+    return (param[:, 0].detach() / math.pi * (sr / 2.0)).cpu()
 
 
 # ======================================================================
@@ -178,9 +150,14 @@ def main():
     set_seed()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    if torch.cuda.is_available():
+        print(f"CUDA_VISIBLE_DEVICES set, seeing "
+              f"{torch.cuda.device_count()} GPU(s):")
+        for i in range(torch.cuda.device_count()):
+            print(f"  cuda:{i}  {torch.cuda.get_device_name(i)}")
 
     # ------------------------------------------------------------------
-    # wandb setup
+    # wandb
     # ------------------------------------------------------------------
     extra_tags = [
         "leaf_frontend",
@@ -220,7 +197,6 @@ def main():
             "min_lr":          MIN_LR,
             "pretrained":      args.pretrained,
             "freeze_epochs":   args.freeze_epochs,
-            # LEAF-specific
             "frontend":        "leaf",
             "leaf_n_filters":  args.n_filters,
             "leaf_init":       args.init,
@@ -254,7 +230,6 @@ def main():
     ).to(device)
     model = WhaleVAD(num_classes=cfg.n_classes(), feat_channels=1).to(device)
 
-    # Lazy projection init via dummy forward.
     with torch.no_grad():
         dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
         model(spec_extractor(dummy))
@@ -269,9 +244,6 @@ def main():
         print(f"  Missing: {len(missing)} keys")
         if unexpected:
             print(f"  Unexpected: {len(unexpected)}")
-        # Pretrained encoder was trained against the STFT frontend, so
-        # the filterbank Conv2d weights expect 3 input channels — not
-        # compatible with feat_channels=1. Warn loudly.
         print("  NOTE: pretrained encoder weights were trained for "
               "feat_channels=3 (STFT). The `filterbank` Conv2d here has "
               "feat_channels=1 (LEAF) and will be silently dropped from "
@@ -287,7 +259,7 @@ def main():
     print(f"LEAF params:  {n_leaf:,}")
 
     # ------------------------------------------------------------------
-    # Loss and optimizer (two parameter groups: small LR for LEAF)
+    # Loss + optimizer
     # ------------------------------------------------------------------
     pos_weight = compute_class_weights().to(device) if cfg.USE_WEIGHTED_BCE else None
     criterion = WhaleVADLoss(pos_weight=pos_weight).to(device)
@@ -298,7 +270,7 @@ def main():
         weight_decay=cfg.WEIGHT_DECAY,
         betas=(cfg.BETA1, cfg.BETA2),
     )
-    print(f"Optimizer parameter groups:")
+    print("Optimizer parameter groups:")
     for g in optimizer.param_groups:
         gp_n = sum(p.numel() for p in g["params"])
         print(f"  {g.get('name', '?'):8s} lr={g['lr']:.2e} params={gp_n:,}")
@@ -308,7 +280,6 @@ def main():
         patience=LR_PATIENCE, min_lr=MIN_LR,
     )
 
-    # Snapshot initial Gabor centers so we can quantify drift.
     init_centers = gabor_centers_hz(spec_extractor)
     if init_centers is not None:
         print(f"Initial Gabor centers (Hz): "
@@ -355,14 +326,12 @@ def main():
                 p.requires_grad = True
             print("  [unfroze encoder]")
 
-        # ---- train ----
         train_loss = train_epoch_leaf(
             model, spec_extractor, train_loader, criterion,
             optimizer, device, epoch,
         )
 
-        # ---- validate ----
-        spec_extractor.eval()  # validate() in train.py only calls model.eval()
+        spec_extractor.eval()
         val = validate(
             model, spec_extractor, val_loader, criterion, device,
             thresholds, val_annotations, file_start_dts,
@@ -375,10 +344,6 @@ def main():
         print(f"\n  Train loss: {train_loss:.4f}  Val loss: {val['loss']:.4f}")
         print(f"  Mean F1: {val['mean_f1']:.3f}  Best F1: {best_f1:.3f}")
 
-        # ---- Gabor drift diagnostic ----
-        # This is the most important diagnostic: if centers haven't moved
-        # at all, you're measuring the init (Anderson et al. 2023 failure
-        # mode), not LEAF doing anything useful.
         curr_centers = gabor_centers_hz(spec_extractor)
         drift_str = ""
         if curr_centers is not None and init_centers is not None:
@@ -387,10 +352,10 @@ def main():
                   f"min={curr_centers.min():.2f} "
                   f"med={curr_centers.median():.2f} "
                   f"max={curr_centers.max():.2f}  "
-                  f"mean_drift={drift.mean():.3f} max_drift={drift.max():.3f}")
+                  f"mean_drift={drift.mean():.3f} "
+                  f"max_drift={drift.max():.3f}")
             drift_str = f" drift~{drift.mean():.2f}Hz"
 
-        # ---- wandb log ----
         payload = {
             "epoch":         epoch,
             "lr/model":      lr_model,
@@ -415,7 +380,6 @@ def main():
                 payload["leaf/drift_max_hz"]  = float(drift.max())
         wandb.log(payload, step=epoch)
 
-        # ---- checkpoint ----
         model_state = (model.module.state_dict()
                        if isinstance(model, nn.DataParallel)
                        else model.state_dict())
@@ -452,7 +416,7 @@ def main():
             break
 
     # ------------------------------------------------------------------
-    # Post-training threshold tuning on the best checkpoint
+    # Post-training threshold tuning
     # ------------------------------------------------------------------
     print(f"\n{'=' * 60}\nTuning thresholds on best model\n{'=' * 60}")
     best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device,
@@ -486,9 +450,6 @@ def main():
     print(f"\nDone. Best F1: {best_f1:.3f}")
     print(f"Run dir: {run_dir}")
 
-    # ------------------------------------------------------------------
-    # wandb summary + artifact
-    # ------------------------------------------------------------------
     wandb.summary["best_f1"]             = float(best_f1)
     wandb.summary["best_f1_post_tuning"] = float(best_ckpt.get("best_f1", best_f1))
     wandb.summary["final_thresholds"]    = list(map(float, tuned))
@@ -498,7 +459,6 @@ def main():
     wandb.summary["leaf_init"]           = args.init
     wandb.summary["leaf_n_filters"]      = args.n_filters
     wandb.summary["leaf_use_pcen"]       = args.use_pcen
-    # Final drift summary — important for interpretability
     final_centers = gabor_centers_hz(spec_extractor)
     if final_centers is not None and init_centers is not None:
         drift = (final_centers - init_centers).abs()
