@@ -4,48 +4,33 @@ LEAF Frontend for Whale-VAD
 
 A drop-in replacement for ``SpectrogramExtractor`` that uses the LEAF
 learnable filterbank (Zeghidour et al., arXiv:2101.08596) instead of a
-fixed phase-aware STFT. Wraps SpeechBrain's ``Leaf`` module with two
-whale-specific adaptations:
+fixed phase-aware STFT. Wraps SpeechBrain's ``Leaf`` module (tested
+with speechbrain==1.1.0) with two whale-specific adaptations:
 
-1. **Sample-rate-aware configuration.** SpeechBrain's defaults are tuned
-   for speech at 16 kHz with a 60-7800 Hz passband; this wrapper exposes
-   the relevant arguments and defaults them to whale-appropriate values
-   read from ``config.py`` (250 Hz SR, 5-125 Hz passband, 1024 ms window,
-   20 ms stride to match the baseline STFT frame rate).
+1. **Sample-rate-aware configuration.** SpeechBrain's defaults target
+   speech at 16 kHz / 60-7800 Hz; this wrapper defaults to 250 Hz SR,
+   5-125 Hz passband, 1024 ms window, 20 ms stride to match the baseline
+   STFT frame rate one-for-one.
 
 2. **Linear Gabor initialization.** Published bioacoustic studies
-   (Anderson, Kinnunen & Harte 2023, ICASSP; Schlüter & Gutenbrunner 2022,
-   EUSIPCO) consistently find that LEAF filters barely move from their
-   initialization, so init choice dominates the result. For calls living
-   in a narrow 5-150 Hz band the default mel spacing wastes filter
-   capacity at low frequencies; linear spacing distributes filters evenly
-   across the relevant band. This module applies a linear init by default.
+   (Anderson, Kinnunen & Harte 2023; Schlüter & Gutenbrunner 2022)
+   consistently find that LEAF filters barely move from their init, so
+   init choice dominates the result. For narrow low-frequency bands the
+   default mel spacing wastes filter capacity; linear spacing
+   distributes filters evenly across the passband.
 
 Output format
 -------------
-For input audio of shape ``(B, n_samples)``, returns a tensor of shape
-``(B, 1, n_filters, n_time_frames)``. This matches the rank of
-``SpectrogramExtractor``'s output (which was ``(B, 3, 129, T)``) so the
-rest of the pipeline can consume it unchanged — just construct
-``WhaleVAD(feat_channels=1)`` instead of the default ``feat_channels=3``.
-
-Why ``n_filters=128`` by default
---------------------------------
-The downstream ``WhaleVAD.filterbank`` Conv2d uses a (7, 1) kernel with
-stride (3, 1) along frequency, so a 128-filter LEAF output gives
-``(128-7)/3 + 1 = 41`` bins entering ``feat_extractor``, almost exactly
-the 41 bins produced by the original 129-bin STFT path. This keeps
-downstream feature-map sizes comparable to baseline. Using fewer filters
-(e.g. 64, which is what the bioacoustics literature recommends as the
-"minimum sufficient" count) eventually breaks one of the MaxPool layers
-in ``feat_extractor`` because the frequency dim collapses below the
-kernel size; if you want to try fewer filters, also widen / shorten the
-MaxPool kernels in ``model.py``.
+For input ``(B, n_samples)``, returns ``(B, 1, n_filters, n_time_frames)``.
+This matches the rank of ``SpectrogramExtractor``'s output, so the rest
+of the pipeline can consume it unchanged — construct
+``WhaleVAD(feat_channels=1)`` instead of the default 3.
 
 Dependencies
 ------------
-Requires ``speechbrain`` (tested with 1.x):
-    pip install speechbrain
+::
+
+    pip install speechbrain  # 1.0+, tested with 1.1.0
 """
 
 import torch
@@ -61,30 +46,24 @@ class LeafFrontend(nn.Module):
     Parameters
     ----------
     n_filters : int, default=128
-        Number of Gabor filters. See module docstring for why 128 is the
-        default rather than the 32-64 typical for bioacoustics.
+        Number of Gabor filters. 128 keeps downstream feature-map sizes
+        comparable to the baseline 129-bin STFT.
     sample_rate : int, optional
-        Audio sample rate in Hz. Defaults to ``cfg.SAMPLE_RATE``.
+        Sample rate in Hz. Defaults to ``cfg.SAMPLE_RATE``.
     window_len_ms : float, optional
-        Gabor convolution window length in ms. Defaults to a value that
-        reproduces ``cfg.WIN_LENGTH`` samples at ``sample_rate``.
+        Gabor window length in ms; defaults to reproducing
+        ``cfg.WIN_LENGTH`` samples.
     window_stride_ms : float, optional
-        Output frame stride in ms. Defaults to reproducing
+        Output frame stride in ms; defaults to reproducing
         ``cfg.HOP_LENGTH`` samples.
     min_freq : float, default=5.0
-        Lowest filter center in Hz. The lowest target calls (fin whale
-        ~15 Hz, Antarctic blue Z-call ~17 Hz) sit comfortably above 5 Hz
-        with room for Gabor bandwidth tails.
+        Lowest filter center in Hz.
     max_freq : float, optional
-        Highest filter center in Hz. Defaults to Nyquist.
+        Highest filter center in Hz; defaults to Nyquist.
     use_pcen : bool, default=False
-        Apply learnable PCEN compression. Off by default so the first
-        ablation isolates the learnable-filterbank effect from the
-        learnable-compression effect. Re-enable as a separate experiment.
+        Apply learnable PCEN compression.
     init : {"linear", "mel"}, default="linear"
-        Gabor filter initialization. "linear" spaces filter centers
-        uniformly across ``[min_freq, max_freq]`` (recommended for narrow
-        low-frequency passbands); "mel" uses SpeechBrain's default.
+        Gabor filter initialization scheme.
     """
 
     def __init__(
@@ -100,8 +79,6 @@ class LeafFrontend(nn.Module):
     ):
         super().__init__()
 
-        # Defaults derived from config so the LEAF frame rate exactly
-        # matches the STFT frame rate of the baseline.
         sample_rate = sample_rate if sample_rate is not None else cfg.SAMPLE_RATE
         window_len_ms = (
             window_len_ms if window_len_ms is not None
@@ -122,8 +99,6 @@ class LeafFrontend(nn.Module):
         self.use_pcen = use_pcen
         self.init_mode = init
 
-        # Defer the SpeechBrain import so this module can at least be
-        # imported (e.g. for type checking) without the dep installed.
         try:
             from speechbrain.lobes.features import Leaf
         except ImportError as e:
@@ -132,11 +107,12 @@ class LeafFrontend(nn.Module):
                 "    pip install speechbrain"
             ) from e
 
-        # SpeechBrain's Leaf takes n_fft only for internal init bookkeeping;
-        # match the equivalent of cfg.WIN_LENGTH in samples.
         n_fft = max(256, int(round(window_len_ms * sample_rate / 1000.0)))
 
+        # NOTE: speechbrain >=1.0 requires `in_channels` (or `input_shape`).
+        # For mono audio, in_channels=1.
         self.leaf = Leaf(
+            in_channels=1,
             out_channels=n_filters,
             window_len=window_len_ms,
             window_stride=window_stride_ms,
@@ -146,13 +122,10 @@ class LeafFrontend(nn.Module):
             use_pcen=use_pcen,
             learnable_pcen=use_pcen,
             use_legacy_complex=False,
-            skip_transpose=True,    # return (B, F, T), not (B, T, F)
+            skip_transpose=True,
             n_fft=n_fft,
         )
 
-        # Override SpeechBrain's mel-based Gabor init if requested. Done
-        # after construction so SpeechBrain runs its own init first; we
-        # then overwrite the parameter tensor in place.
         if init == "linear":
             self._reinit_gabor_linear()
         elif init != "mel":
@@ -161,46 +134,53 @@ class LeafFrontend(nn.Module):
             )
 
     # ------------------------------------------------------------------
+    # Compatibility shim: expose `hop_length` so the existing validate()
+    # in train.py (which calls ``spec_extractor.hop_length``) works
+    # unchanged when LeafFrontend is dropped in for SpectrogramExtractor.
+    # ------------------------------------------------------------------
+    @property
+    def hop_length(self) -> int:
+        """Frame stride in samples — for validate() / postprocessing compat."""
+        return int(round(self.window_stride_ms * self.sample_rate / 1000.0))
+
+    # ------------------------------------------------------------------
     # Custom Gabor initialization
     # ------------------------------------------------------------------
 
     def _reinit_gabor_linear(self) -> None:
         """
-        Replace mel-spaced Gabor centers/bandwidths with linear spacing.
+        Replace SpeechBrain's mel-spaced Gabor centers/bandwidths with a
+        linear spacing across ``[min_freq, max_freq]``.
 
-        SpeechBrain's ``GaborConv1d`` stores its parameters as a single
-        tensor of shape ``(n_filters, 2)``, where column 0 is the
-        normalized center frequency (mu, in ``[0, 0.5]`` where 0.5 is
-        Nyquist) and column 1 is the bandwidth-related sigma in the same
-        normalized units.
-
-        We use ``2.355`` as the FWHM-to-σ factor (a Gaussian's
-        full-width-half-max is ``2 sqrt(2 ln 2) σ``), which makes the
-        bandwidth equal to the spacing between adjacent centers — neighboring
-        filters cover roughly half each other's response.
+        The Gabor parameter tensor has shape ``(n_filters, 2)``: column 0
+        is the normalized center frequency (mu, in ``[0, 0.5]``, where
+        0.5 = Nyquist) and column 1 is sigma in the same units.
         """
         gabor = self.leaf.complex_conv
 
-        # Be defensive about SpeechBrain's evolving naming.
         param = None
-        for name in ("kernel", "_kernel"):
+        # SpeechBrain has used several names across versions; try the
+        # likely ones first, then scan all params for an (n_filters, 2) tensor.
+        for name in ("kernel", "_kernel", "mu", "_mu"):
             if hasattr(gabor, name):
                 attr = getattr(gabor, name)
                 if isinstance(attr, torch.nn.Parameter):
                     param = attr
                     break
         if param is None:
+            for n, p in gabor.named_parameters():
+                if p.dim() == 2 and p.shape == (self.n_filters, 2):
+                    param = p
+                    break
+        if param is None:
             named = list(gabor.named_parameters())
             raise RuntimeError(
-                "Could not locate the Gabor parameter tensor on "
-                "speechbrain.lobes.features.Leaf.complex_conv. "
-                f"Available parameters: {[n for n, _ in named]}. "
-                "You may need to update _reinit_gabor_linear() for your "
-                "speechbrain version."
+                "Could not locate the Gabor (mu, sigma) parameter tensor on "
+                "speechbrain Leaf.complex_conv. "
+                f"Parameters present: {[n for n, _ in named]}. "
+                "Update _reinit_gabor_linear() for this speechbrain version."
             )
 
-        # Compute linear-spaced centers and matched bandwidths, in the
-        # normalized-frequency units the parameter expects.
         min_mu = self.min_freq / self.sample_rate
         max_mu = self.max_freq / self.sample_rate
         new_mu = torch.linspace(min_mu, max_mu, self.n_filters)
@@ -224,26 +204,22 @@ class LeafFrontend(nn.Module):
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
         """
-        Run LEAF and shape its output to match SpectrogramExtractor.
-
-        Parameters
-        ----------
-        audio : torch.Tensor
-            Waveform of shape ``(B, n_samples)`` or ``(n_samples,)``.
-
-        Returns
-        -------
-        torch.Tensor
-            Feature tensor of shape ``(B, 1, n_filters, n_time_frames)``.
+        ``(B, n_samples)`` -> ``(B, 1, n_filters, n_time_frames)``.
         """
         if audio.ndim == 1:
             audio = audio.unsqueeze(0)
 
-        # (B, n_filters, T_frames) — skip_transpose=True keeps it channels-first.
-        x = self.leaf(audio)
-        # Add a singleton channel dim so downstream code that expects 4-D
-        # input (B, C, F, T) works unchanged with WhaleVAD(feat_channels=1).
-        x = x.unsqueeze(1)
+        # speechbrain Leaf accepts (B, T) for mono audio. If a future
+        # version requires explicit (B, T, 1), the fallback below covers it.
+        try:
+            x = self.leaf(audio)
+        except (RuntimeError, ValueError):
+            x = self.leaf(audio.unsqueeze(-1))
+
+        # Output is (B, n_filters, T_frames) with skip_transpose=True.
+        # Add a singleton channel for downstream WhaleVAD(feat_channels=1).
+        if x.ndim == 3:
+            x = x.unsqueeze(1)
         return x
 
     # ------------------------------------------------------------------
@@ -254,28 +230,8 @@ class LeafFrontend(nn.Module):
         self, base_lr: float, leaf_lr_scale: float = 0.1,
     ) -> list[dict]:
         """
-        Build optimizer parameter groups with a smaller LR for LEAF.
-
-        LEAF parameters are notoriously sensitive: the original paper and
-        follow-up bioacoustic studies use 5-10x smaller learning rates
-        for the frontend than for the classifier. The default scale of
-        0.1 (10x smaller) is a safe starting point — increase later if
-        you observe LEAF underfitting (filters still in their init
-        positions after training).
-
-        Example
-        -------
-        ::
-
-            extractor = LeafFrontend(...).to(device)
-            model = WhaleVAD(num_classes=cfg.n_classes(),
-                             feat_channels=1).to(device)
-            groups = (
-                extractor.gabor_param_groups(cfg.LR, leaf_lr_scale=0.1)
-                + [{"params": model.parameters(), "lr": cfg.LR}]
-            )
-            optimizer = AdamW(groups, weight_decay=cfg.WEIGHT_DECAY,
-                              betas=(cfg.BETA1, cfg.BETA2))
+        Optimizer param group for LEAF parameters with a smaller LR.
+        10× smaller (0.1) is the standard starting point.
         """
         return [{
             "params": [p for p in self.parameters() if p.requires_grad],
@@ -294,10 +250,10 @@ if __name__ == "__main__":
     feat = extractor(audio)
     print(f"Input:  {audio.shape}")
     print(f"Output: {feat.shape}")
+    print(f"hop_length: {extractor.hop_length} samples")
     n = sum(p.numel() for p in extractor.parameters() if p.requires_grad)
     print(f"LEAF trainable params: {n:,}")
 
-    # Verify gradients flow to LEAF
     loss = feat.pow(2).mean()
     loss.backward()
     nonzero = sum(
