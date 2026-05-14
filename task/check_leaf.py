@@ -1,28 +1,19 @@
 """
 LEAF vs STFT frontend sanity check.
 
-Run this BEFORE launching a full training run. Verifies that:
-
-1. ``LeafFrontend`` output has the right shape for ``WhaleVAD(feat_channels=1)``.
-2. At random init, LEAF features look like a sensible time-frequency
-   representation (not all zeros, not pure noise) on real whale audio.
+Run BEFORE launching training. Verifies:
+1. ``LeafFrontend`` output shape is right for ``WhaleVAD(feat_channels=1)``.
+2. LEAF features actually vary with input (no degenerate constant output).
 3. Gradients flow into the Gabor parameters.
-4. (Optional) After a short trial-train, the Gabor filters actually move
-   from their initialization — guards against the documented "LEAF didn't
-   learn" failure mode from Anderson, Kinnunen & Harte (ICASSP 2023).
+4. (Optional) Filters actually move from init during a short trial-train.
 
 Usage
 -----
 ::
 
-    # Just plot and check shapes
-    python check_leaf.py
-
-    # Plot, plus brief grad-descent to verify filters move
-    python check_leaf.py --train_steps 200
-
-    # Compare against mel init instead of linear
-    python check_leaf.py --init mel
+    python check_leaf.py                     # linear init (default)
+    python check_leaf.py --init mel          # compare with mel init
+    python check_leaf.py --train_steps 200   # confirm filters move
 """
 
 import argparse
@@ -52,14 +43,15 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
-    # Real batch from the training pipeline — same dataset code as your
-    # actual trainer uses.
+    # Load a real batch.
     _, train_loader, _ = build_dataloaders()
     batch = next(iter(train_loader))
     audio = batch[0][:args.n_segments].to(device)
-    print(f"Audio batch: {audio.shape}")
+    print(f"Audio batch shape: {audio.shape}")
+    print(f"Audio stats: min={audio.min():.4f} max={audio.max():.4f} "
+          f"mean={audio.mean():.4f} std={audio.std():.4f}")
 
-    # Build both frontends
+    # Build both frontends.
     stft = SpectrogramExtractor().to(device)
     leaf = LeafFrontend(
         n_filters=args.n_filters,
@@ -67,27 +59,52 @@ def main() -> None:
         use_pcen=args.use_pcen,
     ).to(device)
 
+    # ------------------------------------------------------------------
+    # Diagnostic: dump the LEAF module structure and key submodules.
+    # If the output is degenerate (mean≈1, std≈0), this often reveals
+    # which submodule is misbehaving.
+    # ------------------------------------------------------------------
+    print(f"\nLEAF module structure:")
+    for name, mod in leaf.leaf.named_children():
+        print(f"  leaf.{name}: {type(mod).__name__}")
+    print(f"\nLEAF compression attribute: "
+          f"{getattr(leaf.leaf, 'compression', 'NOT FOUND')}")
+
+    # ------------------------------------------------------------------
+    # Forward pass — keep gradients enabled so we can run the gradient
+    # check below using the same tensor.
+    # ------------------------------------------------------------------
     with torch.no_grad():
         stft_feat = stft(audio)
-        leaf_feat = leaf(audio)
+    leaf_feat = leaf(audio)   # NOTE: outside no_grad so .backward() works
 
     print(f"\nShape check:")
-    print(f"  STFT: {tuple(stft_feat.shape)} (expected (B, 3, 129, ~1449))")
+    print(f"  STFT: {tuple(stft_feat.shape)} (expected (B, 3, 129, ~T))")
     print(f"  LEAF: {tuple(leaf_feat.shape)} "
-          f"(expected (B, 1, {args.n_filters}, ~similar T))")
+          f"(expected (B, 1, {args.n_filters}, ~T))")
 
     print(f"\nLEAF feature stats:")
-    print(f"  min={leaf_feat.min():.4f}  max={leaf_feat.max():.4f}  "
-          f"mean={leaf_feat.mean():.4f}  std={leaf_feat.std():.4f}")
-    if leaf_feat.abs().max() < 1e-6:
-        print("  WARNING: LEAF features are ~zero. Something is wrong "
-              "with init or sample-rate config.")
+    print(f"  min={leaf_feat.min().item():.6f}  "
+          f"max={leaf_feat.max().item():.6f}  "
+          f"mean={leaf_feat.mean().item():.6f}  "
+          f"std={leaf_feat.std().item():.6f}")
+    # Per-filter variance — if all near zero, filters are essentially
+    # producing the same constant for every input.
+    per_filter_std = leaf_feat[0, 0].std(dim=-1).cpu()  # std over time per filter
+    print(f"  per-filter std across time: "
+          f"min={per_filter_std.min().item():.6f} "
+          f"max={per_filter_std.max().item():.6f} "
+          f"mean={per_filter_std.mean().item():.6f}")
+    if per_filter_std.max() < 1e-4:
+        print("  ** WARNING: LEAF features barely vary with time. "
+              "Filters likely degenerate. **")
 
-    # Gradient-flow check
+    # ------------------------------------------------------------------
+    # Gradient flow
+    # ------------------------------------------------------------------
     loss = leaf_feat.pow(2).mean()
     loss.backward()
-    grad_ok = 0
-    grad_total = 0
+    grad_ok = grad_total = 0
     for name, p in leaf.named_parameters():
         if not p.requires_grad:
             continue
@@ -98,62 +115,64 @@ def main() -> None:
           f"non-zero gradients")
     leaf.zero_grad()
 
-    # Optional: brief trial training to verify filters actually move.
+    # ------------------------------------------------------------------
+    # Optional: brief auxiliary training
+    # ------------------------------------------------------------------
     if args.train_steps > 0:
         print(f"\nTrial-training LEAF for {args.train_steps} steps "
-              "(predict input RMS energy from mean LEAF activation)...")
-        # Find the Gabor parameter tensor to snapshot before/after.
-        gabor_param = None
-        for name, p in leaf.named_parameters():
-            if "kernel" in name.lower() and "complex_conv" in name.lower():
-                gabor_param = p
-                break
-        if gabor_param is None:
-            print("  Could not locate Gabor param to snapshot; skipping.")
-        else:
+              "(MSE between mean LEAF activation and audio RMS)...")
+        try:
+            gabor_param = leaf._gabor_param()
+        except Exception as e:
+            print(f"  Could not locate Gabor param: {e}; skipping.")
+            gabor_param = None
+
+        if gabor_param is not None:
             before = gabor_param.detach().clone()
             optim = torch.optim.AdamW(leaf.parameters(), lr=1e-3)
             for step in range(args.train_steps):
                 feat = leaf(audio)
                 pred = feat.mean(dim=(1, 2, 3))
                 target = audio.pow(2).mean(dim=-1).sqrt()
-                target = (target - target.mean()) / (target.std() + 1e-8)
-                pred = (pred - pred.mean()) / (pred.std() + 1e-8)
-                loss = torch.nn.functional.mse_loss(pred, target)
+                pred_n = (pred - pred.mean()) / (pred.std() + 1e-8)
+                target_n = (target - target.mean()) / (target.std() + 1e-8)
+                loss = torch.nn.functional.mse_loss(pred_n, target_n)
                 optim.zero_grad()
                 loss.backward()
                 optim.step()
             after = gabor_param.detach().clone()
-            d_mu = (after[:, 0] - before[:, 0]).abs()
-            d_sigma = (after[:, 1] - before[:, 1]).abs()
             sr = leaf.sample_rate
-            print(f"  Center freq drift: mean={d_mu.mean()*sr:.3f} Hz, "
-                  f"max={d_mu.max()*sr:.3f} Hz")
-            print(f"  Bandwidth drift:   mean={d_sigma.mean()*sr:.3f} Hz, "
-                  f"max={d_sigma.max()*sr:.3f} Hz")
-            print(f"  Centers before (first 5, Hz): "
-                  f"{(before[:5, 0]*sr).cpu().numpy().round(2)}")
-            print(f"  Centers after  (first 5, Hz): "
-                  f"{(after[:5, 0]*sr).cpu().numpy().round(2)}")
+            # Convert mu drift to Hz assuming angular-radian convention.
+            d_mu_rad = (after[:, 0] - before[:, 0]).abs()
+            d_mu_hz = d_mu_rad / torch.pi * (sr / 2)
+            d_sigma_rad = (after[:, 1] - before[:, 1]).abs()
+            print(f"  mu (center freq) drift: "
+                  f"mean={d_mu_hz.mean():.4f} Hz, "
+                  f"max={d_mu_hz.max():.4f} Hz")
+            print(f"  sigma drift (raw): "
+                  f"mean={d_sigma_rad.mean():.6f}, "
+                  f"max={d_sigma_rad.max():.6f}")
+            # Re-forward with trained leaf for the plot
             with torch.no_grad():
                 leaf_feat = leaf(audio)
 
-    # Side-by-side plot: STFT mag (top) vs LEAF (bottom)
+    # ------------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------------
     fig, axes = plt.subplots(2, args.n_segments,
                              figsize=(4 * args.n_segments, 6))
     if args.n_segments == 1:
         axes = axes.reshape(2, 1)
     for i in range(args.n_segments):
-        stft_mag = stft_feat[i, 0].cpu().numpy()
-        leaf_mag = leaf_feat[i, 0].cpu().numpy()
+        stft_mag = stft_feat[i, 0].detach().cpu().numpy()
+        leaf_mag = leaf_feat[i, 0].detach().cpu().numpy()
         axes[0, i].imshow(np.log1p(stft_mag), aspect="auto", origin="lower")
         axes[0, i].set_title(f"STFT magnitude (seg {i})")
         axes[0, i].set_ylabel("freq bin (0..125 Hz)")
         axes[1, i].imshow(np.log1p(leaf_mag), aspect="auto", origin="lower")
         axes[1, i].set_title(f"LEAF ({args.init} init) — seg {i}")
         axes[1, i].set_ylabel("filter idx (low→high freq)")
-        axes[1, i].set_xlabel("frame (20 ms)")
-
+        axes[1, i].set_xlabel("frame")
     plt.tight_layout()
     plt.savefig(args.out, dpi=100, bbox_inches="tight")
     print(f"\nSaved figure to {args.out}")
