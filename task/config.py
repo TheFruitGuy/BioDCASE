@@ -178,10 +178,10 @@ USE_3CLASS = True
 #: Minimum duration (seconds) of the random silence padding prepended and
 #: appended to each training call. The "collar" ensures the model learns to
 #: localize calls rather than triggering on trivial segment-level cues.
-COLLAR_MIN_S = 3.0
+COLLAR_MIN_S = 1.0
 
 #: Maximum collar duration in seconds.
-COLLAR_MAX_S = 15.0
+COLLAR_MAX_S = 5.0
 
 #: Validation/evaluation segment length in seconds. Fixed windows produce
 #: deterministic evaluation, unlike the variable-length training segments.

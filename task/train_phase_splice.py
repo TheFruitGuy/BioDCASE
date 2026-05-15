@@ -530,6 +530,52 @@ def main():
         device=device,
     )
 
+    # ------------------------------------------------------------------
+    # Epoch 0: starting-point validation (no training yet). Tells us
+    # exactly where this run begins — most useful when --pretrained is
+    # set (we see the source checkpoint's val F1 as the floor we need
+    # to beat). Also logged to wandb as epoch=0 so the training curve
+    # has an honest start point. Costs one validation pass (~5 min).
+    # ------------------------------------------------------------------
+    print(f"\n{'=' * 60}\nEpoch 0/{args.epochs}  (starting point — no training yet)\n"
+          f"{'=' * 60}")
+    start_val = validate(
+        model, spec_extractor, val_loader, criterion, device,
+        thresholds, val_annotations, file_start_dts,
+        tune_thresholds=True,
+    )
+    print(f"  Start F1: {start_val['mean_f1']:.3f}")
+    print(f"  Start thresholds: "
+          f"{['%.2f' % t for t in start_val['thresholds']]}")
+    for cname in cfg.CALL_TYPES_3:
+        pc = start_val["per_class"].get(cname, {})
+        print(f"    {cname:6}  F1={pc.get('f1', 0.0):.3f}  "
+              f"P={pc.get('precision', 0.0):.3f}  R={pc.get('recall', 0.0):.3f}")
+
+    # Track the starting F1 as the floor for the run. We initialize
+    # ``best_f1`` to it so the run doesn't celebrate "*** New best F1"
+    # for an epoch that simply matches where we started.
+    start_f1 = float(start_val["mean_f1"])
+    best_f1 = start_f1
+    thresholds = torch.tensor(start_val["thresholds"], device=device,
+                              dtype=torch.float32)
+
+    import wandb
+    start_payload = {
+        "epoch":         0,
+        "lr":            args.lr,
+        "val/loss":      start_val["loss"],
+        "val/f1_macro":  start_val["mean_f1"],
+    }
+    for ci, cname in enumerate(cfg.CALL_TYPES_3):
+        pc = start_val["per_class"].get(cname, {})
+        start_payload[f"val/f1/{cname}"]        = pc.get("f1", 0.0)
+        start_payload[f"val/precision/{cname}"] = pc.get("precision", 0.0)
+        start_payload[f"val/recall/{cname}"]    = pc.get("recall", 0.0)
+        start_payload[f"val/threshold/{cname}"] = float(start_val["thresholds"][ci])
+    wandb.log(start_payload, step=0)
+    wandb.summary["start_f1"] = start_f1
+
     for epoch in range(1, args.epochs + 1):
         current_lr = optimizer.param_groups[0]["lr"]
         print(f"\n{'=' * 60}\nEpoch {epoch}/{args.epochs}  LR={current_lr:.2e}\n"
@@ -666,9 +712,11 @@ def main():
     wandb.summary["epochs_run"]          = epoch
     wandb.summary["early_stopped"]       = no_improve_epochs >= EARLY_STOP_PATIENCE
     wandb.summary["splice_prob"]         = float(args.splice_prob)
+    wandb.summary["delta_from_start"]    = float(best_f1) - float(start_f1)
     wandb.summary["verdict"] = (
-        f"Splice run (prob={args.splice_prob}, seed={args.seed}) finished at "
-        f"best F1 {best_f1:.3f} (epoch {best_ckpt.get('epoch', '?')} of "
+        f"Splice run (prob={args.splice_prob}, seed={args.seed}) started at "
+        f"F1 {start_f1:.3f}, finished at best F1 {best_f1:.3f} "
+        f"(Δ {best_f1 - start_f1:+.3f}; epoch {best_ckpt.get('epoch', '?')} of "
         f"{epoch} run; final tuned thresholds "
         f"{[round(float(t),2) for t in tuned]})."
     )
