@@ -470,27 +470,46 @@ def postprocess_predictions_per_class(
 SEARCH_MEDIAN_KERNEL_MS = [0, 100, 200, 220, 500, 660, 1100]
 SEARCH_HANGOVER_KERNEL_MS = [0, 100, 220, 500, 660, 1100]
 
-# Event-level grids from Table IVb. The paper's per-class ranges
-# reflect the actual event durations of each class — keep them tight
-# so the search converges in O(few-hundred) trials.
+# Event-level grids.
+#
+# The bounds were originally taken straight from paper Table IVb but
+# proved too tight in practice — specifically the BMABZ min_dur lower
+# bound of 2.0 s sat ABOVE cfg.POST_MIN_DUR_S = 0.5 used by the
+# threshold-only baseline, structurally preventing the search from
+# reaching the same BMABZ operating point. Bounds are now widened
+# enough to include the global cfg defaults (so the threshold-only
+# baseline is reachable for enqueue) while still being class-appropriate.
 SEARCH_MERGE_GAP_S = {  # min. inter-event time (paper Table IVb row 1)
     "bmabz": (0.1, 0.9, 0.1),
     "d":     (0.1, 0.9, 0.1),
     "bp":    (0.1, 0.9, 0.1),
 }
 SEARCH_MIN_DUR_S = {    # min. event duration
-    "bmabz": (2.0, 5.0, 0.5),
-    "d":     (0.6, 3.0, 0.4),
-    "bp":    (0.3, 1.5, 0.2),
+    # bmabz: previously (2.0, 5.0, 0.5) — too restrictive. Threshold-only
+    # baseline uses 0.5 s; allow the search to go that low.
+    "bmabz": (0.3, 5.0, 0.2),
+    # d: previously (0.6, 3.0, 0.4) — also above the 0.5 s default and
+    # upper bound 3.0 hit the wall in best-trial results, suggesting
+    # longer D events exist in val.
+    "d":     (0.2, 5.0, 0.1),
+    # bp: previously (0.3, 1.5, 0.2) — already includes 0.5 s. Tightened
+    # step to 0.1 for finer resolution on a short-event class.
+    "bp":    (0.2, 2.0, 0.1),
 }
 SEARCH_MAX_DUR_S = {    # max. event duration
-    "bmabz": (25.0, 40.0, 2.5),
-    "d":     (5.0,  11.0, 1.0),
-    "bp":    (2.0,   5.0, 0.5),
+    # bmabz: previously (25.0, 40.0, 2.5) — straddles the 30 s default,
+    # widen slightly to allow some headroom either side.
+    "bmabz": (15.0, 50.0, 2.5),
+    # d: previously (5.0, 11.0, 1.0) — upper bound 11 s well below the
+    # 30 s default; allow the search to disable the upper filter.
+    "d":     (3.0,  30.0, 1.0),
+    # bp: previously (2.0, 5.0, 0.5) — upper bound 5 s also below 30.
+    "bp":    (2.0,  30.0, 1.0),
 }
 # On/off thresholds: 0.05 → 0.85 step 0.05 — slightly extended at the
 # low end because d/bp are rare classes whose probability mass is
-# shifted toward zero.
+# shifted toward zero. The step is shared with the off_gap and matches
+# train.py's in-training tuning grid.
 SEARCH_THRESHOLD_RANGE = (0.05, 0.85, 0.05)
 
 

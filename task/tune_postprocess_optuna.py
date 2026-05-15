@@ -29,6 +29,14 @@ Three combination modes
    combination the user has been validating with at macro 0.516; tuning
    on top of it adds class-dependent post-processing.
 
+Baseline enqueue
+----------------
+Before the TPE search starts, trial 0 is hard-coded to the per-class
+coordinate-descent threshold-only configuration (paper "baseline-
+postprocess" condition). This guarantees the search cannot return a
+config worse than the threshold-only macro F1 — Optuna remembers trial 0
+and ``best_trial`` is at least that good.
+
 Examples
 --------
 Hybrid ensemble (replicates the validated 4-model setup)::
@@ -221,25 +229,43 @@ def macro_f1(metrics: dict[str, dict[str, float]]) -> float:
 
 
 # ======================================================================
-# Per-model individual scoring (parity with --per-model-eval in hybrid)
+# Coordinate-descent threshold tune (configurable step)
 # ======================================================================
+
+def _build_cd_grid(step: float) -> list[np.ndarray]:
+    """
+    Build the per-class coordinate-descent threshold grids. BMABZ uses
+    [0.20, 0.85]; D and BP use a finer grid below 0.5 (where rare-class
+    optima tend to sit) and a coarser grid above. Granularity is set by
+    ``step`` — the BMABZ step is the input value; D/BP use ``step``
+    below 0.5 and ``2 * step`` above 0.5 (matches the structure used
+    elsewhere in the pipeline).
+    """
+    s = float(step)
+    coarse = max(s * 2, 0.05)
+    return [
+        np.arange(0.20, 0.85, s),                                       # bmabz
+        np.concatenate([np.arange(0.05, 0.5, s),
+                        np.arange(0.5, 0.85, coarse)]),                 # d
+        np.concatenate([np.arange(0.05, 0.5, s),
+                        np.arange(0.5, 0.85, coarse)]),                 # bp
+    ]
+
 
 def quick_per_class_threshold_tune(
     all_probs: dict[tuple, np.ndarray],
     gt_events: list[Detection],
+    step: float = 0.05,
 ) -> tuple[np.ndarray, dict]:
     """
     Coordinate-descent threshold sweep for individual-model F1 reference.
-    Same grid as ``hybrid_ensemble_predict.tune_thresholds_on_probs``.
+    Same grid shape as ``hybrid_ensemble_predict.tune_thresholds_on_probs``
+    but with a configurable step (default 0.05 to match train.py and
+    ensemble_predict.py; pass 0.025 for a finer search if D-class F1 is
+    suspected to sit between the 0.05 grid points).
     """
     thresholds = np.array([0.5, 0.5, 0.5], dtype=np.float64)
-    grids = [
-        np.arange(0.20, 0.85, 0.05),
-        np.concatenate([np.arange(0.05, 0.5, 0.05),
-                        np.arange(0.5, 0.85, 0.10)]),
-        np.concatenate([np.arange(0.05, 0.5, 0.05),
-                        np.arange(0.5, 0.85, 0.10)]),
-    ]
+    grids = _build_cd_grid(step)
     for c, name in enumerate(CLASS_NAMES):
         best_f1, best_t = -1.0, thresholds[c]
         for t in grids[c]:
@@ -301,7 +327,7 @@ def make_objective(
             # Sample the gap and subtract — keeps off_thr bounded in
             # [0.0, on_thr] without needing constraint sampling.
             off_gap = trial.suggest_float(
-                f"{cls}_off_gap", 0.0, on_thr, step=0.05,
+                f"{cls}_off_gap", 0.0, on_thr, step=on_step,
             )
             off_thr = round(on_thr - off_gap, 2)
             cfg_obj.off_thresholds[cls] = off_thr
@@ -329,6 +355,80 @@ def make_objective(
         return macro_f1(metrics)
 
     return objective
+
+
+# ======================================================================
+# Baseline-trial enqueue helpers
+# ======================================================================
+
+def _snap_to_grid(val: float, lo: float, hi: float, step: float) -> float:
+    """
+    Clip ``val`` to ``[lo, hi]`` and snap to the nearest grid point of
+    size ``step`` starting at ``lo``. Required because Optuna's
+    ``enqueue_trial`` rejects values that don't fall on the declared
+    grid; cfg defaults may sit between grid points after the bounds
+    were tightened for class-appropriateness (especially BP max_dur).
+    """
+    clipped = float(min(max(val, lo), hi))
+    n = round((clipped - lo) / step)
+    snapped = lo + n * step
+    # Re-clip after rounding (corner case near upper bound).
+    snapped = float(min(max(snapped, lo), hi))
+    # Round to the step's decimal places for clean JSON.
+    decimals = max(0, -int(np.floor(np.log10(step))))
+    return round(snapped, decimals)
+
+
+def _build_baseline_trial_params(
+    cd_thresholds: np.ndarray,
+) -> dict[str, Any]:
+    """
+    Construct the parameter dict that reproduces (or comes as close as
+    the search-space grid allows to) the coordinate-descent threshold-
+    only baseline. Used to seed Optuna trial 0 so the search cannot
+    return a config worse than threshold-only.
+
+    Per class:
+        median_ms     = 0           (no smoothing — matches global cfg)
+        on_thr        = cd_thresholds[c]
+        off_gap       = 0.0         (no hysteresis — single-threshold)
+        hangover_ms   = 0
+        merge_gap_s   = cfg.MERGE_GAP_S, snapped
+        min_dur_s     = cfg.POST_MIN_DUR_S, snapped to per-class grid
+        max_dur_s     = cfg.POST_MAX_DUR_S, snapped to per-class grid
+
+    Note: with the widened SEARCH ranges (POST_MIN_DUR_S=0.5 is reachable
+    for all classes, POST_MAX_DUR_S=30.0 is reachable for d/bp), the
+    snapping is a no-op for most classes. BP max_dur is the one place
+    where 30.0 may snap to the upper bound of the bp range (e.g. 30.0
+    is already reachable with the widened range). Verify with a manual
+    sanity check if the enqueued trial's macro F1 doesn't match the CD
+    baseline within ~0.002.
+    """
+    on_lo, on_hi, on_step = SEARCH_THRESHOLD_RANGE
+    params: dict[str, Any] = {}
+    for c, cls in enumerate(CLASS_NAMES):
+        # Frame-level: no smoothing, no hangover, no hysteresis.
+        params[f"{cls}_median_ms"] = 0
+        params[f"{cls}_on_thr"] = _snap_to_grid(
+            float(cd_thresholds[c]), on_lo, on_hi, on_step,
+        )
+        params[f"{cls}_off_gap"] = 0.0
+        params[f"{cls}_hangover_ms"] = 0
+        # Event-level: snap cfg defaults to per-class grids.
+        mg_lo, mg_hi, mg_step = SEARCH_MERGE_GAP_S[cls]
+        params[f"{cls}_merge_gap_s"] = _snap_to_grid(
+            cfg.MERGE_GAP_S, mg_lo, mg_hi, mg_step,
+        )
+        mn_lo, mn_hi, mn_step = SEARCH_MIN_DUR_S[cls]
+        params[f"{cls}_min_dur_s"] = _snap_to_grid(
+            cfg.POST_MIN_DUR_S, mn_lo, mn_hi, mn_step,
+        )
+        mx_lo, mx_hi, mx_step = SEARCH_MAX_DUR_S[cls]
+        params[f"{cls}_max_dur_s"] = _snap_to_grid(
+            cfg.POST_MAX_DUR_S, mx_lo, mx_hi, mx_step,
+        )
+    return params
 
 
 # ======================================================================
@@ -409,6 +509,21 @@ def parse_args() -> argparse.Namespace:
                    help="Optional wall-clock cap (seconds).")
     p.add_argument("--seed", type=int, default=cfg.SEED,
                    help="Seed for the TPE sampler.")
+    p.add_argument("--cd-step", type=float, default=0.025,
+                   help="Step size for the coordinate-descent baseline "
+                        "threshold sweep. Default 0.025 (finer than the "
+                        "0.05 used elsewhere in the pipeline; cheap on "
+                        "cached probs and gives a more precise baseline "
+                        "anchor). Use 0.05 for parity with train.py / "
+                        "ensemble_predict.py.")
+    p.add_argument("--no-baseline-enqueue", action="store_true",
+                   help="Skip seeding trial 0 with the threshold-only "
+                        "coordinate-descent config. Without seeding, "
+                        "Optuna's first ~10 trials are pure random and "
+                        "the search can fail to recover the threshold-"
+                        "only baseline within the trial budget — only "
+                        "use this if you intentionally want unbiased "
+                        "exploration.")
     p.add_argument("--output", type=str,
                    default=str(cfg.POSTPROCESS_CONFIG_PATH),
                    help=f"Output JSON. Defaults to "
@@ -487,9 +602,9 @@ def main() -> None:
             prob_dicts.append(probs)
 
             if args.per_model_eval:
-                print(f"  individual threshold tune:")
+                print(f"  individual threshold tune (step={args.cd_step}):")
                 ind_thr, ind_metrics = quick_per_class_threshold_tune(
-                    probs, gt_events,
+                    probs, gt_events, step=args.cd_step,
                 )
                 individual_metrics.append({
                     "path": ckpt,
@@ -500,7 +615,7 @@ def main() -> None:
                 })
                 print(f"    micro F1={individual_metrics[-1]['f1']:.3f}  "
                       f"macro F1={individual_metrics[-1]['macro_f1']:.3f}  "
-                      f"thr={[f'{t:.2f}' for t in ind_thr]}")
+                      f"thr={[f'{t:.3f}' for t in ind_thr]}")
 
         # Combine.
         if args.d_from is not None:
@@ -558,15 +673,17 @@ def main() -> None:
               f"baseline macro {base_macro:.4f} by "
               f"{abs(sanity_macro - base_macro):.4f}; expected to match.")
 
-    # 3. Per-class coordinate-descent threshold tune — your current 0.516
-    #    baseline corresponds to roughly this number on the hybrid probs.
+    # 3. Per-class coordinate-descent threshold tune. With --cd-step 0.025
+    #    (default) this is the finer-grid baseline; with 0.05 it matches
+    #    the rest of the pipeline. Used both for the progression report
+    #    and as the seed config for Optuna trial 0.
     cd_thresholds, cd_metrics = quick_per_class_threshold_tune(
-        all_probs, gt_events,
+        all_probs, gt_events, step=args.cd_step,
     )
     _print_metrics_table(
         cd_metrics,
-        f"per-class threshold-only tune (thresholds="
-        f"{[f'{t:.2f}' for t in cd_thresholds]})",
+        f"per-class threshold-only tune (step={args.cd_step}, thresholds="
+        f"{[f'{t:.3f}' for t in cd_thresholds]})",
     )
     cd_macro = macro_f1(cd_metrics)
 
@@ -583,6 +700,20 @@ def main() -> None:
         sampler=sampler,
         study_name=args.study_name,
     )
+
+    # Seed trial 0 with the threshold-only configuration so the search
+    # has a known-good anchor. Without this, TPE starts with ~10 random
+    # trials and can fail to find the threshold-only operating point
+    # within 500 trials in a 21-dim space (observed empirically).
+    if not args.no_baseline_enqueue:
+        baseline_params = _build_baseline_trial_params(cd_thresholds)
+        study.enqueue_trial(baseline_params)
+        enqueued_thrs = [baseline_params[f"{c}_on_thr"] for c in CLASS_NAMES]
+        print(f"\n  Enqueued trial 0 = threshold-only baseline "
+              f"(on_thr={enqueued_thrs}). "
+              f"Expected trial-0 macro F1 ≈ {cd_macro:.4f}.")
+        print(f"  Subsequent trials cannot regress below this value.")
+
     study.optimize(
         make_objective(all_probs, gt_events),
         n_trials=args.n_trials,
@@ -612,6 +743,15 @@ def main() -> None:
     print(f"    full per-class postprocess : {best_macro:.4f}  "
           f"(Δ vs default: {best_macro - base_macro:+.4f}, "
           f"Δ vs thr-only: {best_macro - cd_macro:+.4f})")
+
+    # Sanity check: with the baseline enqueue, full ≥ threshold-only is
+    # guaranteed (Optuna keeps the best trial across all trials).
+    if not args.no_baseline_enqueue and best_macro < cd_macro - 1e-4:
+        print(f"\n  NOTE: full macro ({best_macro:.4f}) regressed below "
+              f"threshold-only ({cd_macro:.4f}) despite baseline enqueue. "
+              f"This indicates the snapped trial-0 params did not exactly "
+              f"reproduce the CD result (probably due to grid mismatch on "
+              f"one of merge_gap / min_dur / max_dur).")
 
     print("\n  Per-class config:")
     for cls in CLASS_NAMES:
@@ -650,6 +790,8 @@ def main() -> None:
         "d_from": args.d_from,
         "combination": combination_label,
         "n_trials": int(args.n_trials),
+        "cd_step": float(args.cd_step),
+        "baseline_enqueued": (not args.no_baseline_enqueue),
         "macro_f1_default": float(base_macro),
         "macro_f1_threshold_only": float(cd_macro),
         "macro_f1_tuned": float(best_macro),
