@@ -417,6 +417,22 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "background invariance, complementary axes."),
         interventions=["call_splice"],
     ),
+    "8": dict(
+        parent="baseline",
+        hypothesis=("Per-class focal-γ fine-tune. Standard focal loss "
+                    "uses a scalar γ=2 across all classes; this phase "
+                    "replaces it with a per-class γ tensor that boosts "
+                    "D specifically (γ_d=4.0 by default) to apply "
+                    "sharper gradient pressure on hard D positives. "
+                    "Direct attack on the recall bottleneck identified "
+                    "by the BioDCASE community paper (recall <50% on "
+                    "average across submissions, with D the worst). "
+                    "Independent of phase 6 (HNM) but stackable via "
+                    "--hard_negatives. Source checkpoint is auto-"
+                    "detected (baseline / phase 5 BPN / phase 6 HNM); "
+                    "lineage captured via config.source_phase + tags."),
+        interventions=["per_class_focal_gamma"],
+    ),
     "baseline": dict(
         parent=None,
         hypothesis=("Production training baseline. Paper recipe (8 sites, "
