@@ -137,6 +137,16 @@ def parse_args():
     p.add_argument("--edge_guard_s", type=float, default=0.5,
                    help="Don't place the planted call within this many seconds "
                         "of the host clip's edge.")
+    p.add_argument("--splice_classes", type=str, nargs="+", default=None,
+                   choices=cfg.CALL_TYPES_3,
+                   help="If set, only splice calls of these 3-class labels "
+                        "(subset of {bmabz, d, bp}). Default: all 3 classes. "
+                        "Empirically: BMABZ-class splicing helps, D-class "
+                        "regresses, BP is roughly neutral. Use "
+                        "`--splice_classes bmabz` to splice only BMABZ "
+                        "(safest bet) or `--splice_classes bmabz bp` to "
+                        "splice BMABZ and BP, leaving D supervision purely "
+                        "on natural training data.")
     p.add_argument("--dump_examples", type=int, default=0,
                    help="If >0, generate N synthetic examples (WAV + spectrogram "
                         "PNGs) to --dump_dir and exit BEFORE training.")
@@ -379,6 +389,36 @@ def main():
     print(f"Loading call bank from {args.call_bank}...")
     bank = CallBank.load(Path(args.call_bank))
     print(f"  {len(bank.calls)} calls across {len(bank.by_site)} source sites")
+    print(f"  per 3-class label: " + ", ".join(
+        f"{c}={len(bank.by_label_3class.get(c, []))}"
+        for c in cfg.CALL_TYPES_3
+    ))
+
+    # Class-selective splicing. Restrict the bank's by_label_3class lookup
+    # to only the allowed classes so the balanced sampler can't pick a
+    # disallowed class. The other dicts (by_label_7class, by_site) are
+    # left intact; they're not consulted by the splice sampling path,
+    # only by code inspecting the bank directly.
+    if args.splice_classes is not None:
+        allowed = set(args.splice_classes)
+        original = {c: len(bank.by_label_3class.get(c, []))
+                    for c in cfg.CALL_TYPES_3}
+        bank.by_label_3class = {
+            c: idxs for c, idxs in bank.by_label_3class.items() if c in allowed
+        }
+        n_remaining = sum(len(idxs) for idxs in bank.by_label_3class.values())
+        n_total = len(bank.calls)
+        print(f"  → splice-eligible filter: keep only {sorted(allowed)} "
+              f"({n_remaining}/{n_total} calls retained for splicing)")
+        for c, before in original.items():
+            after = len(bank.by_label_3class.get(c, []))
+            marker = "✓" if c in allowed else "✗"
+            print(f"      {marker} {c:6}  {before:5d} → {after:5d}")
+        if n_remaining == 0:
+            raise SystemExit(
+                "No calls remain after --splice_classes filtering. "
+                f"Bank class counts: {original}; requested: {sorted(allowed)}"
+            )
 
     print(f"Loading splice host pool from {args.splice_pool}...")
     pool = SpliceHostPool.load(Path(args.splice_pool))
@@ -447,6 +487,9 @@ def main():
             "splice_taper_ms":  args.taper_ms,
             "splice_bandpass_margin_hz": args.bandpass_margin_hz,
             "splice_edge_guard_s": args.edge_guard_s,
+            "splice_classes":   (list(args.splice_classes)
+                                 if args.splice_classes is not None
+                                 else list(cfg.CALL_TYPES_3)),
             "n_call_bank_entries": len(bank.calls),
             "n_splice_host_clips": len(pool.hosts),
         },
@@ -517,7 +560,8 @@ def main():
     print(f"Negative resampling: every {RESAMPLE_EVERY} epochs")
     print(f"Splice augmentation: prob={args.splice_prob}, "
           f"SNR=[{args.snr_min_db:+.1f}, {args.snr_max_db:+.1f}] dB, "
-          f"taper={args.taper_ms} ms")
+          f"taper={args.taper_ms} ms, "
+          f"classes={sorted(args.splice_classes) if args.splice_classes else 'all'}")
 
     # ------------------------------------------------------------------
     # Training loop (identical to train.py, modulo splice substitution).
