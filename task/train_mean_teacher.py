@@ -100,6 +100,7 @@ from mean_teacher_core import (
     align_supervised_lengths,
     make_weak_view,
     make_strong_view,
+    freeze_bn_running_stats,
 )
 
 
@@ -344,6 +345,7 @@ def train_epoch_mean_teacher(
         the unlabeled loader is longer than the labeled one).
     """
     student.train()
+    freeze_bn_running_stats(student)
     total_sup, total_cons, n_steps = 0.0, 0.0, 0
     pbar = tqdm(labeled_loader, desc=f"Epoch {epoch}", leave=False)
 

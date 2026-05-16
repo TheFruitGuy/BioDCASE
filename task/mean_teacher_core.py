@@ -297,3 +297,18 @@ def make_strong_view(audio, sites, spec_extractor, no_call_pool=None):
         freq_mask_p=1.0,
         cross_site_p=0.5,
     )
+
+    def freeze_bn_running_stats(model: nn.Module) -> None:
+        """
+        Set all BatchNorm modules to eval mode: forward uses frozen running
+        statistics and no statistics are updated. Affine parameters and the
+        rest of the network still train normally.
+
+        Required when the unlabeled stream is from a different audio domain
+        than the labeled stream — otherwise BN running stats drift toward
+        the average of the two distributions and feature alignment with the
+        classifier breaks at val time.
+        """
+        for m in model.modules():
+            if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
+                m.eval()
