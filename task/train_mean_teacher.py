@@ -383,7 +383,7 @@ def train_epoch_mean_teacher(
             logits_u_t = teacher.teacher(spec_weak)
 
         logits_u_s, logits_u_t = align_lengths_pair(logits_u_s, logits_u_t)
-        loss_cons = consistency_loss_confident(logits_u_s, logits_u_t, conf_threshold=0.7)
+        loss_cons = consistency_loss_confident(logits_u_s, logits_u_t, conf_threshold=0.8)
 
         loss = loss_sup + lambda_weight * loss_cons
 
