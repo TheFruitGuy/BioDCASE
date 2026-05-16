@@ -312,3 +312,31 @@ def freeze_bn_running_stats(model: nn.Module) -> None:
         for m in model.modules():
             if isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
                 m.eval()
+
+
+def consistency_loss_confident(
+        student_logits: torch.Tensor,  # (B, T, C)
+        teacher_logits: torch.Tensor,  # (B, T, C), should be detached
+        conf_threshold: float = 0.7,  # teacher must be > 0.7 OR < 0.3
+        mask: Optional[torch.Tensor] = None,  # (B, T)
+) -> torch.Tensor:
+    """
+    MSE consistency, but only on elements where the teacher's prediction
+    is confident (sigmoid prob above conf_threshold or below 1 - conf_threshold).
+    Ambiguous teacher predictions contribute zero, eliminating the noise
+    that drives the BMABZ "fire on every weak pattern" regression.
+
+    Standard DCASE Task 4 refinement (Delphin-Poulat 2019 onward).
+    """
+    s = torch.sigmoid(student_logits)
+    t = torch.sigmoid(teacher_logits)
+    conf = (t > conf_threshold) | (t < (1.0 - conf_threshold))  # (B, T, C) bool
+    sq = (s - t).pow(2) * conf.float()
+
+    if mask is not None:
+        m = mask.unsqueeze(-1).float()
+        denom = (m * conf.float()).sum() + 1e-8
+        return (sq * m).sum() / denom
+
+    denom = conf.float().sum() + 1e-8
+    return sq.sum() / denom
