@@ -113,6 +113,11 @@ def parse_args() -> argparse.Namespace:
              "'tide' = baseline + TIDE gate.",
     )
     p.add_argument(
+        "--seed", type=int, default=cfg.SEED,
+        help=f"Random seed. Overrides cfg.SEED (currently {cfg.SEED}). "
+             "Pass different values to run a seed sweep.",
+    )
+    p.add_argument(
         "--name", type=str, default="",
         help="Free-form tag appended to the run name and recorded in "
              "config.json. Use it to label experiments meaningfully, "
@@ -632,6 +637,13 @@ def update_latest_symlink(run_dir: Path) -> None:
 
 def main() -> None:
     args = parse_args()
+
+    # Apply the CLI seed override before anything seeds itself. Mutating
+    # the module attribute makes every later ``cfg.SEED`` reference
+    # (in build_run_name, dataloader worker init, wandb config, ...)
+    # pick up the override consistently.
+    cfg.SEED = args.seed
+
     utils.seed_everything(cfg.SEED, deterministic=False)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
