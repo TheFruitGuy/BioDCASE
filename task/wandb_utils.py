@@ -433,6 +433,23 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "lineage captured via config.source_phase + tags."),
         interventions=["per_class_focal_gamma"],
     ),
+    "8b": dict(
+        parent="8",
+        hypothesis=("Per-class focal-α fine-tune (Phase 8 v2). Phase 8 "
+                    "v1 raised γ_d to 4.0 with α=0.25 and the focal-"
+                    "magnitude side effect actually *decreased* D's "
+                    "effective loss weight (3/4 v1 runs went backwards "
+                    "on macro F1). v2 holds γ=2 across classes "
+                    "(standard) and raises α_d to 0.6 to directly boost "
+                    "D's positive contribution — α is the correct lever "
+                    "for class reweighting; γ is for hard-example "
+                    "focusing. lr=1e-5 (HNM's stable rate, vs v1's "
+                    "5e-6 which oscillated even on a no-op smoke test). "
+                    "Documented as a child of phase 8 because it's a "
+                    "corrective iteration on the same intervention "
+                    "family, not a fork from baseline."),
+        interventions=["per_class_focal_alpha"],
+    ),
     "baseline": dict(
         parent=None,
         hypothesis=("Production training baseline. Paper recipe (8 sites, "
