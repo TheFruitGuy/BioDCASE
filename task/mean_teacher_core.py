@@ -340,3 +340,41 @@ def consistency_loss_confident(
 
     denom = conf.float().sum() + 1e-8
     return sq.sum() / denom
+
+def consistency_loss_asymmetric(
+    student_logits: torch.Tensor,        # (B, T, C)
+    teacher_logits: torch.Tensor,        # (B, T, C), should be detached
+    pos_weight: float = 2.0,
+    neg_weight: float = 1.0,
+    conf_threshold: float = 0.7,
+    mask: Optional[torch.Tensor] = None, # (B, T)
+) -> torch.Tensor:
+    """
+    Asymmetric MSE consistency with confidence masking.
+
+    Per-element weight: pos_weight where teacher predicts positive
+    (p_t > 0.5), neg_weight where teacher predicts negative. This
+    amplifies the matching pressure on positive teacher predictions,
+    directly targeting the mechanism observed to drive D-call gains
+    in MT+HNM seed 42 (consistency on AADC surfaces confident
+    positive predictions for sparse classes).
+
+    With pos_weight == neg_weight, reduces to consistency_loss_confident.
+    """
+    import torch
+    p_s = torch.sigmoid(student_logits)
+    p_t = torch.sigmoid(teacher_logits)
+
+    conf = (p_t > conf_threshold) | (p_t < (1.0 - conf_threshold))
+    is_pos = (p_t > 0.5).float()
+    weight = is_pos * pos_weight + (1.0 - is_pos) * neg_weight
+
+    sq = (p_s - p_t).pow(2) * weight * conf.float()
+
+    if mask is not None:
+        m = mask.unsqueeze(-1).float()
+        norm = (m * weight * conf.float()).sum() + 1e-8
+        return (sq * m).sum() / norm
+
+    norm = (weight * conf.float()).sum() + 1e-8
+    return sq.sum() / norm

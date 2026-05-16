@@ -102,6 +102,7 @@ from mean_teacher_core import (
     make_strong_view,
     freeze_bn_running_stats,
     consistency_loss_confident,
+    consistency_loss_asymmetric,
 )
 
 
@@ -383,8 +384,10 @@ def train_epoch_mean_teacher(
             logits_u_t = teacher.teacher(spec_weak)
 
         logits_u_s, logits_u_t = align_lengths_pair(logits_u_s, logits_u_t)
-        loss_cons = consistency_loss_confident(logits_u_s, logits_u_t, conf_threshold=0.8)
-
+        loss_cons = consistency_loss_asymmetric(
+            logits_u_s, logits_u_t,
+            conf_threshold=0.7, pos_weight=2.0, neg_weight=1.0,
+        )
         loss = loss_sup + lambda_weight * loss_cons
 
         if torch.isnan(loss) or torch.isinf(loss):
