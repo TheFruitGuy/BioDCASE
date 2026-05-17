@@ -168,7 +168,7 @@ COLLAR_MAX_S = 5.0
 #: affects: per-epoch validation F1 (and therefore LR scheduling,
 #: best-checkpoint selection, and the per-class thresholds saved
 #: with the final model), and inference segment length downstream.
-EVAL_SEGMENT_S = 30.0
+EVAL_SEGMENT_S = 60.0
 
 #: Overlap between consecutive validation windows (seconds). Kept
 #: absolute (not a fraction of EVAL_SEGMENT_S) on purpose — the
@@ -240,21 +240,20 @@ BATCH_SIZE = 32
 
 #: AdamW learning rate.
 #:
-#: 1e-3 is the value from the WhaleVAD-BPN paper (Geldenhuys et al.,
-#: Section V.B.5: "The learning rate is kept fixed at 0.001 with momentum
-#: terms of 0.9 and 0.999 and a weight decay factor of 0.01."). This is
-#: also the rate at which our reproduction reaches the published
-#: F1=0.465 baseline — see ``runs/whalevad_20260507_173617`` for the
-#: trajectory.
+#: 5e-5 is the empirically validated value for this codebase, matched
+#: against the canonical seed-42 baseline run (runs/whalevad_20260502_175547)
+#: which reaches F1=0.474 at epoch 30 with patience-8/25 schedule.
 #:
-#: The DCASE 2025 tech report's stated LR=1e-5 does not work in our
-#: reproduction: at 1e-5 the classifier weights barely move and the
-#: model stays stuck near the noise floor. An earlier guess of LR=5e-5
-#: was also broken (F1 stuck at ~0.18 across 20 epochs, classifier
-#: bias unchanged from init — see the new triton baseline runs that
-#: diverged from the old WhaleVAD trajectory). 1e-3 is the empirically
-#: validated value; do not lower without re-running a full baseline.
-LR = 1e-3
+#: The papers disagree: DCASE 2025 tech report says 1e-5, BPN paper says
+#: 1e-3 (fixed). Neither matches our working reproduction. 1e-5 doesn't
+#: move weights (paper's own LR doesn't converge with no schedule).
+#: 1e-3 overshoots with the patience-8/25 schedule we use (a separate
+#: experimental run with patience-4/12 and 1e-3 hit F1=0.465 — different
+#: config, not the canonical baseline). 5e-5 is the rate at which the
+#: schedule we actually use produces the F1=0.474 result that the report
+#: cites. Don't change this without first running a full baseline at the
+#: new value to validate.
+LR = 5e-5
 
 #: AdamW weight decay.
 WEIGHT_DECAY = 0.001
