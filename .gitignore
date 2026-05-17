@@ -54,3 +54,4 @@ result_images
 *.py~
 .DS_Store
 /task_backup
+/task/Backup_2
