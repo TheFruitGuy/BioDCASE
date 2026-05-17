@@ -161,10 +161,20 @@ COLLAR_MIN_S = 1.0
 COLLAR_MAX_S = 5.0
 
 #: Fixed-window length for validation/inference segments (seconds).
-EVAL_SEGMENT_S = 30.0
+#: Empirically 60 s outperformed 30 s in our reproduction — likely
+#: because the BiLSTM benefits from more bilateral context and the
+#: stitch-overlap zone shrinks as a fraction of each window. Going
+#: longer than ~120 s shows diminishing returns. Changing this
+#: affects: per-epoch validation F1 (and therefore LR scheduling,
+#: best-checkpoint selection, and the per-class thresholds saved
+#: with the final model), and inference segment length downstream.
+EVAL_SEGMENT_S = 60.0
 
-#: Overlap between consecutive validation windows (seconds). Stitching
-#: averages overlapping predictions, smoothing boundary frames.
+#: Overlap between consecutive validation windows (seconds). Kept
+#: absolute (not a fraction of EVAL_SEGMENT_S) on purpose — the
+#: stitch-zone artifact magnitude depends on the absolute overlap,
+#: not the ratio, and 2 s is already wider than the boundary
+#: uncertainty for the longest call type.
 EVAL_OVERLAP_S = 2.0
 
 #: Annotations shorter than this are dropped (likely errors).
@@ -228,12 +238,23 @@ EPOCHS = 150
 #: Mini-batch size (segments per gradient step).
 BATCH_SIZE = 32
 
-#: AdamW learning rate. The DCASE 2025 tech report specifies 1e-5, but
-#: in this reproduction the classifier weights barely moved at that
-#: rate (per-step gradients ~3e-5 → per-step update ~3e-10). We
-#: deviate to 5e-5 which produces visible weight movement and matches
-#: our observed best F1.
-LR = 5e-5
+#: AdamW learning rate.
+#:
+#: 1e-3 is the value from the WhaleVAD-BPN paper (Geldenhuys et al.,
+#: Section V.B.5: "The learning rate is kept fixed at 0.001 with momentum
+#: terms of 0.9 and 0.999 and a weight decay factor of 0.01."). This is
+#: also the rate at which our reproduction reaches the published
+#: F1=0.465 baseline — see ``runs/whalevad_20260507_173617`` for the
+#: trajectory.
+#:
+#: The DCASE 2025 tech report's stated LR=1e-5 does not work in our
+#: reproduction: at 1e-5 the classifier weights barely move and the
+#: model stays stuck near the noise floor. An earlier guess of LR=5e-5
+#: was also broken (F1 stuck at ~0.18 across 20 epochs, classifier
+#: bias unchanged from init — see the new triton baseline runs that
+#: diverged from the old WhaleVAD trajectory). 1e-3 is the empirically
+#: validated value; do not lower without re-running a full baseline.
+LR = 1e-3
 
 #: AdamW weight decay.
 WEIGHT_DECAY = 0.001

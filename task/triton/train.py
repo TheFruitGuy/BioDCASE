@@ -113,6 +113,27 @@ def parse_args() -> argparse.Namespace:
              "'tide' = baseline + TIDE gate.",
     )
     p.add_argument(
+        "--lr", type=float, default=None,
+        help=f"Override cfg.LR (currently {cfg.LR}). Use 1e-5 for "
+             "DCASE 2025 paper faithfulness, 1e-3 for BPN paper.",
+    )
+    p.add_argument(
+        "--weight-decay", type=float, default=None,
+        help=f"Override cfg.WEIGHT_DECAY (currently {cfg.WEIGHT_DECAY}). "
+             "0.001 = DCASE 2025; 0.01 = BPN paper.",
+    )
+    p.add_argument(
+        "--resample-every", type=int, default=None,
+        help=f"Override negative-resample period (currently {5}). "
+             "Set to 1 for DCASE 2025 / BPN paper faithfulness "
+             "(both papers resample each epoch).",
+    )
+    p.add_argument(
+        "--no-scheduler", action="store_true",
+        help="Disable ReduceLROnPlateau. Paper-faithful runs use no "
+             "LR schedule.",
+    )
+    p.add_argument(
         "--seed", type=int, default=cfg.SEED,
         help=f"Random seed. Overrides cfg.SEED (currently {cfg.SEED}). "
              "Pass different values to run a seed sweep.",
@@ -343,11 +364,27 @@ def validate(
         print(f"    {name.upper():6} t={used_thresholds[c]:.2f}  "
               f"TP={m['tp']:5} FP={m['fp']:6} FN={m['fn']:6}  "
               f"P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}")
-    print(f"    OVERALL F1={overall_f1:.3f}")
+    # Macro F1: mean of per-class F1s. This is the BioDCASE 2025
+    # Task 2 official ranking metric. Micro F1 (the "overall" key
+    # below) is kept around for backward comparison and diagnostics
+    # but is *not* the right selection criterion for this challenge —
+    # it's dominated by bmabz (~10× more positives than d/bp) and
+    # systematically picks checkpoints that hurt the minority classes.
+    per_class_f1s = [
+        metrics.get(c, {}).get("f1", 0.0) for c in cfg.CALL_TYPES_3
+    ]
+    macro_f1 = sum(per_class_f1s) / len(per_class_f1s)
+
+    print(f"    OVERALL F1 (micro): {overall_f1:.3f}")
+    print(f"    MACRO   F1:         {macro_f1:.3f}   ← selection metric")
 
     return {
         "loss": total_loss / max(n_batches, 1),
-        "mean_f1": overall_f1,
+        "macro_f1": macro_f1,
+        "overall_f1": overall_f1,
+        # Kept for any older code that still reads "mean_f1"; points
+        # at the macro value so behaviour matches the new selection.
+        "mean_f1": macro_f1,
         "per_class": metrics,
         "thresholds": used_thresholds.tolist(),
     }
@@ -560,6 +597,8 @@ def write_run_info(
     tuned_thresholds,
     early_stopped: bool,
     final_per_class: dict | None = None,
+    final_macro_f1: float | None = None,
+    final_overall_f1: float | None = None,
 ) -> None:
     """
     Write a short human-readable summary to ``run_info.txt`` at end of
@@ -572,7 +611,13 @@ def write_run_info(
     lines.append("=" * 60)
     lines.append(f"Run dir:         {run_dir.name}")
     lines.append(f"Model:           {args.model}")
-    lines.append(f"Best F1 (val):   {best_f1:.4f}")
+    lines.append(f"Best macro F1 (val, in-training): {best_f1:.4f}")
+    if final_macro_f1 is not None:
+        lines.append(f"Final macro F1 (post-tune):       {final_macro_f1:.4f}"
+                     "   ← BioDCASE ranking metric")
+    if final_overall_f1 is not None:
+        lines.append(f"Final micro/overall F1 (post-tune): {final_overall_f1:.4f}"
+                     "   (for backward comparison only)")
     lines.append(f"Best epoch:      {best_epoch}")
     lines.append(f"Epochs run:      {epochs_run}")
     lines.append(f"Early stopped:   {early_stopped}")
@@ -643,6 +688,16 @@ def main() -> None:
     # (in build_run_name, dataloader worker init, wandb config, ...)
     # pick up the override consistently.
     cfg.SEED = args.seed
+
+    # Apply other CLI hyperparameter overrides. Same pattern: mutate the
+    # module attribute so downstream code sees the override. Used mainly
+    # for paper-faithful runs (LR=1e-5 DCASE, LR=1e-3 BPN, etc).
+    if args.lr is not None:
+        print(f"Overriding cfg.LR: {cfg.LR} → {args.lr}")
+        cfg.LR = args.lr
+    if args.weight_decay is not None:
+        print(f"Overriding cfg.WEIGHT_DECAY: {cfg.WEIGHT_DECAY} → {args.weight_decay}")
+        cfg.WEIGHT_DECAY = args.weight_decay
 
     utils.seed_everything(cfg.SEED, deterministic=False)
 
@@ -763,13 +818,24 @@ def main() -> None:
         model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY,
         betas=(cfg.BETA1, cfg.BETA2),
     )
-    scheduler = ReduceLROnPlateau(
-        optimizer, mode="max", factor=LR_FACTOR,
-        patience=LR_PATIENCE, min_lr=MIN_LR,
-    )
-    print(f"Scheduler: ReduceLROnPlateau (patience={LR_PATIENCE}, factor={LR_FACTOR})")
+
+    # LR scheduler is optional. Paper-faithful runs (--no-scheduler)
+    # skip it entirely, matching the BPN paper's fixed-LR-for-32-epochs
+    # recipe and the DCASE 2025 paper's lack of a stated schedule.
+    if args.no_scheduler:
+        scheduler = None
+        print("Scheduler: none (paper-faithful)")
+    else:
+        scheduler = ReduceLROnPlateau(
+            optimizer, mode="max", factor=LR_FACTOR,
+            patience=LR_PATIENCE, min_lr=MIN_LR,
+        )
+        print(f"Scheduler: ReduceLROnPlateau (patience={LR_PATIENCE}, factor={LR_FACTOR})")
+
+    resample_every = args.resample_every if args.resample_every is not None else RESAMPLE_EVERY
     print(f"Early stopping: patience={EARLY_STOP_PATIENCE}")
-    print(f"Negative resampling: every {RESAMPLE_EVERY} epochs")
+    print(f"Negative resampling: every {resample_every} epochs"
+          + (" (CLI override)" if args.resample_every is not None else ""))
 
     # ------------------------------------------------------------------
     # Training loop
@@ -794,7 +860,7 @@ def main() -> None:
               f"{'=' * 60}")
 
         # Periodic negative resampling.
-        if (epoch - 1) % RESAMPLE_EVERY == 0:
+        if (epoch - 1) % resample_every == 0:
             print("  Resampling negatives")
             train_ds.resample_negatives()
             train_loader = DataLoader(
@@ -823,18 +889,28 @@ def main() -> None:
         thresholds = torch.tensor(val["thresholds"], device=device,
                                   dtype=torch.float32)
 
-        scheduler.step(val["mean_f1"])
+        # Drive the LR scheduler off macro F1 — the challenge metric —
+        # so a flat macro causes the LR to drop, not a flat micro.
+        # Skipped entirely when --no-scheduler (paper-faithful runs).
+        if scheduler is not None:
+            scheduler.step(val["macro_f1"])
 
         print(f"\n  Train loss: {train_loss:.4f}  Val loss: {val['loss']:.4f}")
-        print(f"  Mean F1: {val['mean_f1']:.3f}  Best F1: {best_f1:.3f}")
+        print(f"  Macro F1: {val['macro_f1']:.3f}  "
+              f"(Micro F1: {val['overall_f1']:.3f})  "
+              f"Best macro: {best_f1:.3f}")
         print(f"  Tuned thresholds: {['%.2f' % t for t in val['thresholds']]}")
 
-        # Wandb log
+        # Wandb log. Two F1 lines so dashboards show both — primary
+        # comparison metric is val/f1_macro (challenge ranking metric);
+        # val/f1_overall is the micro F1 for backwards comparability
+        # with the old "Overall" numbers in the HNM_D / BPN runs.
         wandb_payload = {
             "lr": current_lr,
             "train/loss": train_loss,
             "val/loss": val["loss"],
-            "val/f1_macro": val["mean_f1"],
+            "val/f1_macro": val["macro_f1"],
+            "val/f1_overall": val["overall_f1"],
         }
         for ci, cname in enumerate(cfg.CALL_TYPES_3):
             pc = val["per_class"].get(cname, {})
@@ -867,12 +943,12 @@ def main() -> None:
             ),
         }
 
-        if val["mean_f1"] > best_f1:
-            best_f1 = val["mean_f1"]
+        if val["macro_f1"] > best_f1:
+            best_f1 = val["macro_f1"]
             best_epoch = epoch
             ckpt["best_f1"] = best_f1
             torch.save(ckpt, run_dir / "best_model.pt")
-            print(f"  *** New best F1: {best_f1:.3f}")
+            print(f"  *** New best macro F1: {best_f1:.3f}")
             no_improve_epochs = 0
         else:
             no_improve_epochs += 1
@@ -933,10 +1009,13 @@ def main() -> None:
         tuned_thresholds=tuned,
         early_stopped=early_stopped,
         final_per_class=final_per_class,
+        final_macro_f1=final_val.get("macro_f1"),
+        final_overall_f1=final_val.get("overall_f1"),
     )
 
-    print(f"\nDone. Best F1 (in-training tuned): {best_f1:.3f}")
-    print(f"     Final F1 (post-tune): {final_val.get('mean_f1', 0.0):.3f}")
+    print(f"\nDone. Best macro F1 (in-training tuned): {best_f1:.3f}")
+    print(f"     Final macro F1 (post-tune): {final_val.get('macro_f1', 0.0):.3f}"
+          f"  (micro: {final_val.get('overall_f1', 0.0):.3f})")
     print(f"Run dir: {run_dir}")
 
     # ------------------------------------------------------------------
