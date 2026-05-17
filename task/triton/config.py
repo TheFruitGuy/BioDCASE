@@ -161,14 +161,24 @@ COLLAR_MIN_S = 1.0
 COLLAR_MAX_S = 5.0
 
 #: Fixed-window length for validation/inference segments (seconds).
-#: Empirically 60 s outperformed 30 s in our reproduction — likely
-#: because the BiLSTM benefits from more bilateral context and the
-#: stitch-overlap zone shrinks as a fraction of each window. Going
-#: longer than ~120 s shows diminishing returns. Changing this
-#: affects: per-epoch validation F1 (and therefore LR scheduling,
-#: best-checkpoint selection, and the per-class thresholds saved
-#: with the final model), and inference segment length downstream.
-EVAL_SEGMENT_S = 60.0
+#:
+#: Set to 30 s during training to match the training segment length
+#: distribution (positives = call + 1–5 s collar, ~5–15 s typical;
+#: negatives = random 5–30 s). The BiLSTM hidden state at end-of-segment
+#: is shaped by training-time context lengths; evaluating on longer
+#: segments puts the LSTM state into a distribution it never saw during
+#: training, which causes val F1 to *worsen* as training progresses
+#: even though train loss decreases (classic train/val distribution
+#: shift). This was the cause of the 2026-05-17 reproduction collapse:
+#: at EVAL_SEGMENT_S=60 the canonical seed-42 trajectory (which peaks
+#: at F1=0.474) instead diverged downward from epoch 4 onward.
+#:
+#: A separate longer-window eval *at test time* (after training is
+#: done, with a converged checkpoint) can give a small F1 boost because
+#: of reduced stitch-overlap artifacts. That's a deployment-time
+#: choice, not a training-time one. To do that, run inference.py with
+#: a custom EVAL_SEGMENT_S, leaving training-time config at 30.
+EVAL_SEGMENT_S = 30.0
 
 #: Overlap between consecutive validation windows (seconds). Kept
 #: absolute (not a fraction of EVAL_SEGMENT_S) on purpose — the
