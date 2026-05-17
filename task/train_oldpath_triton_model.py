@@ -45,7 +45,6 @@ to the canonical ``train.py``, in the project root). Then::
 
 import argparse
 import random
-import sys
 import time
 from pathlib import Path
 
@@ -73,10 +72,31 @@ from postprocess import (
 )
 
 # === THE ONE SWAPPED IMPORT ===========================================
-# Triton lives at task/triton/model.py; make it importable without
-# moving anything.
-sys.path.insert(0, str(Path(__file__).parent / "triton"))
-from triton.model import Triton as _TritonRaw  # noqa: E402
+# Triton lives at task/triton/model.py. We CANNOT use ``from triton.model
+# import Triton`` because the installed PyTorch/JAX ``triton`` package
+# (NVIDIA's GPU kernel compiler) wins the name lookup. Load by file path
+# instead via importlib, which dodges the installed package entirely.
+#
+# Inside triton/model.py the first line is ``import config as cfg`` — that
+# resolves via ``sys.modules['config']``, which this script already
+# populated as ``task/config.py`` a few lines above. So the Triton model
+# class sees the *same* cfg object as the rest of this file. No double
+# config, no surprises.
+import importlib.util  # noqa: E402
+
+_triton_model_path = Path(__file__).parent / "triton" / "model.py"
+if not _triton_model_path.exists():
+    raise FileNotFoundError(
+        f"Expected Triton model at {_triton_model_path}. "
+        "Make sure this file sits in task/ (the project root), next to "
+        "the canonical train.py, with the triton/ folder as a sibling."
+    )
+_spec = importlib.util.spec_from_file_location(
+    "triton_model_local", _triton_model_path,
+)
+_triton_model_module = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_triton_model_module)
+_TritonRaw = _triton_model_module.Triton
 
 
 # === Thin adapter so the OLD train loop sees raw logits ===============
