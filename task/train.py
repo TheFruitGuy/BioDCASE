@@ -4,26 +4,17 @@ Supervised Training Loop
 
 Main entry point for training the Whale-VAD model on the BioDCASE 2026
 development set. Implements the training recipe from Section 5.6 of the
-paper, with three stability-focused extensions that proved beneficial in
-our reproduction:
+paper, with one deliberate deviation:
 
-    1. **Stochastic undersampling at a lower frequency**: the paper resamples
-       negative segments every epoch; we resample every 5 epochs. Reshuffling
-       less often reduces validation-loss jitter and makes early-stopping
-       decisions more reliable, at no observed cost to final F1.
+    - **Best-model selection by validation F1** (at the fixed default
+      threshold [0.5, 0.5, 0.5]) rather than by lowest validation BCE loss
+      as in paper Section 2.9. This aligns the selection criterion with
+      the evaluation metric.
 
-    2. **ReduceLROnPlateau scheduler**: halves the learning rate if the
-       validation F1 stagnates for 5 consecutive epochs. Helps the model
-       settle into a minimum after the initial rapid improvement phase.
-
-    3. **Early stopping**: aborts training if validation F1 does not improve
-       for 15 epochs, preventing overfitting during the long tail when the
-       model memorizes training noise.
-
-After training completes, the best checkpoint (by validation F1) is
-automatically re-evaluated with a per-class threshold tuning pass, and the
-resulting ``final_model.pt`` contains both the best weights and the tuned
-thresholds ready for inference.
+After training completes, the best checkpoint is re-evaluated with a
+per-class threshold tuning pass (paper Section 2.9), and the resulting
+``final_model.pt`` contains both the best weights and the tuned thresholds
+ready for inference.
 
 Usage
 -----
@@ -46,7 +37,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -71,30 +61,16 @@ from postprocess import (
 # do not appear in the paper. They address stability issues that emerged
 # in our reproduction rather than the paper's own training dynamics.
 
-#: Resample negative segments every N epochs. Lower values match the paper
-#: more closely but increase validation noise; higher values (e.g. 10) risk
-#: overfitting to the same negative distribution.
-#: Resample negative segments every N epochs. DCASE tech report Section 2.5:
-#: "after each epoch of training, a different subset of negative segments is
-#: sampled." Set to 1 to match the paper exactly.
-RESAMPLE_EVERY = 5
+#: Resample negative segments every N epochs. Paper Section 2.5: "after each
+#: epoch of training, a different subset of negative segments is sampled."
+#: Set to 1 for paper-faithful behaviour.
+RESAMPLE_EVERY = 1
 
 #: Stop training if validation F1 does not improve for this many epochs. The
 #: paper does not specify a patience; we use a generous value because the
 #: rare-class learning is slow and we don't want to bail before D and BP
 #: come online.
 EARLY_STOP_PATIENCE = 25
-
-#: Number of stagnant epochs before the LR scheduler fires. Larger than
-#: EARLY_STOP_PATIENCE for the actual stop guard would be wrong, but enough
-#: room to let the LR drop once meaningfully before stopping.
-LR_PATIENCE = 8
-
-#: Multiplicative factor applied to the LR each time the scheduler fires.
-LR_FACTOR = 0.5
-
-#: Floor for the learning rate; scheduler will not reduce below this.
-MIN_LR = 1e-7
 
 
 # ======================================================================
@@ -438,9 +414,6 @@ def main():
             # production-recipe knobs
             "resample_every":   RESAMPLE_EVERY,
             "early_stop_patience": EARLY_STOP_PATIENCE,
-            "lr_patience":      LR_PATIENCE,
-            "lr_factor":        LR_FACTOR,
-            "min_lr":           MIN_LR,
             # SSL-pretrain knobs
             "pretrained":       args.pretrained,
             "freeze_epochs":    args.freeze_epochs,
@@ -511,14 +484,9 @@ def main():
         betas=(cfg.BETA1, cfg.BETA2),
     )
 
-    scheduler = ReduceLROnPlateau(
-        optimizer, mode="max", factor=LR_FACTOR,
-        patience=LR_PATIENCE, min_lr=MIN_LR,
-    )
     print(f"DEBUG class weights: {pos_weight.tolist()}")
-    print(f"Scheduler: ReduceLROnPlateau (patience={LR_PATIENCE}, factor={LR_FACTOR})")
     print(f"Early stopping: patience={EARLY_STOP_PATIENCE}")
-    print(f"Negative resampling: every {RESAMPLE_EVERY} epochs")
+    print(f"Negative resampling: every {RESAMPLE_EVERY} epoch(s)")
 
     # ------------------------------------------------------------------
     # Training loop
@@ -580,24 +548,15 @@ def main():
         val = validate(
             model, spec_extractor, val_loader, criterion, device,
             thresholds, val_annotations, file_start_dts,
-            tune_thresholds=True,
+            tune_thresholds=False,
         )
 
-        # Update the persistent threshold state with this epoch's tuned
-        # values. Using the previous epoch's tuned thresholds as the
-        # starting point for next epoch's sweep makes the per-class
-        # coordinate descent stable across epochs (the optimum drifts
-        # slowly as the model improves; restarting from 0.5 every time
-        # would waste sweep iterations).
-        thresholds = torch.tensor(val["thresholds"], device=device,
-                                  dtype=torch.float32)
-
-        scheduler.step(val["mean_f1"])
+        # No per-epoch threshold update — validate at fixed [0.5, 0.5, 0.5]
+        # throughout training. Paper-faithful threshold tuning happens once
+        # after training via tune_thresholds_event_level below.
 
         print(f"\n  Train loss: {train_loss:.4f}  Val loss: {val['loss']:.4f}")
-        print(f"  Mean F1: {val['mean_f1']:.3f}  Best F1: {best_f1:.3f}")
-        print(f"  Tuned thresholds: "
-              f"{['%.2f' % t for t in val['thresholds']]}")
+        print(f"  Mean F1 (@0.5): {val['mean_f1']:.3f}  Best F1: {best_f1:.3f}")
 
         # ------------------------------------------------------------------
         # Wandb per-epoch log. The validate() in this file returns

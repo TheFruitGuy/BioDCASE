@@ -28,7 +28,8 @@ localization via the post-processing pipeline.
 
 Also defined here:
     - ``WhaleVADLoss``: weighted BCE + optional focal loss (Section 5.6)
-    - ``compute_class_weights``: file-level class weighting formula
+    - ``compute_class_weights``: per-class positive weights, w_c = N / P_c
+      with P_c counted at the annotation level (paper Section 2.6)
 """
 
 import torch
@@ -406,55 +407,59 @@ def compute_class_weights() -> torch.Tensor:
     """
     Compute per-class positive weights using the paper's formula.
 
-    The paper defines ``w_c = N / P_c`` where ``N`` is the number of negative
-    segments and ``P_c`` is the number of positive segments for class c.
-    We interpret "segment" here as a distinct audio file containing at least
-    one call of class c, which yields sensible weights for the BioDCASE
-    dataset: classes appearing in fewer files receive proportionally higher
-    weight, so the loss does not collapse to "predict bmabz everywhere".
+    Paper Section 2.6: ``w_c = N / P_c`` where ``N`` is the number of negative
+    (no-call) segments and ``P_c`` is the number of positive segments belonging
+    to class c. The paper explicitly notes: "we found that when computing the
+    class weighting, rather than normalising by the duration of each class, it
+    was better to normalise by the number of segments belonging to each class."
 
-    The raw weights are normalized so that the minimum weight equals 1,
-    preserving the ratios between classes while ensuring no class is
-    *actively* downweighted.
+    In ``build_positive_segments`` each valid annotation produces exactly one
+    positive segment, so ``P_c`` is the count of valid annotations of class c
+    (after the same duration filter that segment-building applies). The number
+    of negative segments per epoch is ``NEG_RATIO`` times the total positive
+    count.
 
     Returns
     -------
     torch.Tensor
-        Per-class weight tensor of shape ``(num_classes,)``, with the
-        minimum weight normalized to 1.
+        Per-class positive weights, shape ``(num_classes,)``. Raw values from
+        ``N / P_c`` with no further normalisation.
     """
-    # Local import to avoid circular dependency (dataset imports model
-    # indirectly through its own typing annotations).
+    # Local import to avoid circular dependency.
     from dataset import load_annotations
 
     annotations = load_annotations(cfg.TRAIN_DATASETS)
-    total_files = annotations.groupby(["dataset", "filename"]).ngroups
+
+    # Apply the same duration filter that build_positive_segments applies,
+    # so the counts here match the segments that actually reach the model.
+    durations = (
+        annotations["end_datetime"] - annotations["start_datetime"]
+    ).dt.total_seconds()
+    valid = annotations[
+        (durations > 0)
+        & (durations >= cfg.MIN_CALL_DURATION_S)
+        & (durations <= cfg.MAX_CALL_DURATION_S)
+    ]
+
+    total_positives = len(valid)
+    n_neg = int(total_positives * cfg.NEG_RATIO)
 
     class_names = cfg.class_names()
     weights = []
     for c_name in class_names:
-        # Map coarse name back to the set of fine-grained labels it contains,
-        # so we can count the relevant annotations in the raw CSV.
         if cfg.USE_3CLASS:
+            # 3-class mode: count all fine-grained annotations that collapse
+            # to this coarse class.
             orig_labels = [k for k, v in cfg.COLLAPSE_MAP.items() if v == c_name]
-            class_annots = annotations[annotations["annotation"].isin(orig_labels)]
+            p_c = len(valid[valid["annotation"].isin(orig_labels)])
         else:
-            class_annots = annotations[annotations["annotation"] == c_name]
-
-        # Count positive files (at least one annotation of class c) and
-        # treat the rest as negatives for weight computation purposes.
-        p_c = max(class_annots.groupby(["dataset", "filename"]).ngroups, 1)
-        n_neg = max(total_files - p_c, 1)
-        w = n_neg / p_c
-        weights.append(w)
+            # 7-class mode: count annotations of this exact fine label.
+            p_c = len(valid[valid["annotation"] == c_name])
+        p_c = max(p_c, 1)  # avoid div-by-zero on degenerate splits
+        weights.append(n_neg / p_c)
 
     result = torch.tensor(weights, dtype=torch.float32)
-    # Normalize so the minimum weight is 1.0. Without this, the common class
-    # (bmabz) would be actively downweighted (weight < 1), slowing down
-    # learning on the class with the most training signal.
-    result = result / result.min()
-
-    print(f"Class weights (w_c = N/P_c, normalized to min=1):")
+    print(f"Class weights (w_c = N/P_c, raw):")
     for name, w in zip(class_names, result.tolist()):
         print(f"  {name}: {w:.3f}")
     return result

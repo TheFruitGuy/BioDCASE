@@ -160,14 +160,13 @@ COLLAPSE_MAP = {
 }
 
 #: If True, train and evaluate on the 3-class task. If False, the model
-#: outputs 7 fine-grained call-type logits which can be collapsed at
-#: evaluation time via COLLAPSE_MAP.
+#: outputs 7 fine-grained call-type logits which are collapsed to the
+#: 3 coarse classes at evaluation time via COLLAPSE_MAP.
 #:
-#: NOTE: The official Geldenhuys checkpoint (WhaleVAD_ATBFL_3P-c6f6a07a.pt)
-#: outputs 7 classes despite the "3P" in its filename — the "3-class problem"
-#: in the DCASE Table 2 ablation refers to *evaluating* in the 3-class space,
-#: not to training a 3-class head. To match the official checkpoint exactly,
-#: set this to False and use post-hoc collapse during evaluation.
+#: Paper-faithful setting: False. The official Geldenhuys checkpoint
+#: (WhaleVAD_ATBFL_3P-c6f6a07a.pt) outputs 7 classes — the "3-class
+#: problem" in DCASE Table 2 refers to *evaluating* in the 3-class
+#: space, not to training a 3-class head.
 USE_3CLASS = False
 
 
@@ -261,23 +260,8 @@ EPOCHS = 150
 #: a single GPU at this model scale.
 BATCH_SIZE = 32
 
-#: Learning rate for AdamW.
-#:
-#: The DCASE 2025 tech report Section 2.6 specifies LR=1e-5. In our
-#: reproduction at LR=1e-5 we observed that the classifier weights
-#: barely moved across 21 epochs (verified by inspecting classifier.bias
-#: which stayed at -2.995 vs an init of -3.000). Per-step gradient
-#: magnitudes for the rare-class biases are on the order of 3e-5, so at
-#: LR=1e-5 the per-step update is 3e-10 — too small to learn within a
-#: practical epoch budget. We therefore deviate to 1e-4 (10x the paper)
-#: which produces visible weight movement.
-#:
-#: The paper's smaller LR may have been viable for them due to:
-#:   - Much longer training horizons (paper does not specify epoch count)
-#:   - The bounding-box auxiliary loss providing additional gradient signal
-#:   - Pack-padded LSTM excluding padded frames (different gradient flow)
-#: We don't have those, so a higher LR is the practical compromise.
-LR = 5e-5
+#: Learning rate for AdamW. Paper Section 2.6 specifies 1e-5.
+LR = 1e-5
 
 #: AdamW weight decay. DCASE tech report value (0.001).
 WEIGHT_DECAY = 0.001
@@ -353,7 +337,7 @@ NUM_WORKERS = 16
 
 #: Random seed, applied to ``random``, ``numpy``, and ``torch`` at the start
 #: of every entry point for reproducibility.
-SEED = 42
+SEED = 7777
 
 
 # ======================================================================

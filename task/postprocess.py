@@ -10,18 +10,21 @@ Post-processing pipeline (Section 5.8 of the paper)
 ---------------------------------------------------
     1. **Stitch**: average overlapping-window predictions back into one
        continuous per-file probability stream.
-    2. **Smooth**: apply a 500 ms median filter along the time axis to
-       remove short spurious spikes.
-    3. **Threshold**: convert per-frame probabilities into binary activations
+    2. **Threshold**: convert per-frame probabilities into binary activations
        using per-class thresholds (tuned on validation data).
-    4. **Collapse**: map the 7 fine-grained labels to 3 coarse labels via
+    3. **Collapse**: map the 7 fine-grained labels to 3 coarse labels via
        ``COLLAPSE_MAP``. (Only relevant in 7-class inference mode; 3-class
        runs already output coarse labels.)
-    5. **Merge**: merge neighbouring events of the same class separated by
+    4. **Merge**: merge neighbouring events of the same class separated by
        less than ``MERGE_GAP_S``.
-    6. **Filter**: discard events with duration outside
+    5. **Filter**: discard events with duration outside
        ``[POST_MIN_DUR_S, POST_MAX_DUR_S]``.
-    7. **Export**: write detections as a challenge-format CSV.
+    6. **Export**: write detections as a challenge-format CSV.
+
+The ``smooth_probabilities`` helper (median filter) is kept in this module
+for backwards compatibility but is no longer invoked by
+``postprocess_predictions``; paper Section 2.9 does not include a
+frame-level smoothing step.
 
 Evaluation
 ----------
@@ -378,6 +381,10 @@ def postprocess_predictions(
     """
     Run the complete post-processing pipeline end-to-end.
 
+    Pipeline per paper Section 2.9: stitch overlapping windows, threshold
+    per class, merge same-class detections, filter by duration. Frame-level
+    smoothing is intentionally omitted to match the paper.
+
     Parameters
     ----------
     all_probs : dict
@@ -393,7 +400,6 @@ def postprocess_predictions(
     file_probs = stitch_segments(all_probs)
     all_dets = []
     for (ds, fn), probs in file_probs.items():
-        probs = smooth_probabilities(probs)  # 500 ms median filter
         all_dets.extend(threshold_to_detections(probs, thresholds, ds, fn))
     return merge_and_filter(all_dets)
 
