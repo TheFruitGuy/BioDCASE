@@ -616,17 +616,6 @@ class TrainingDatasetWithResample(TritonDataset):
         n_neg = int(len(self.positive_segments) * cfg.NEG_RATIO)
         self.negative_segments = build_negative_segments(
             self.annotations, self.manifest, n_segments=n_neg,
-            # 30-60s overrides build_negative_segments' default of 5-30s.
-            # The canonical seed-42 baseline (runs/whalevad_20260502_175547,
-            # F1=0.474) was trained with this override. Dropping it lets
-            # the function defaults take over and shortens the training
-            # segment distribution to 5-30s — which causes the BiLSTM to
-            # specialise to short contexts and degrade catastrophically on
-            # validation when the eval window exceeds 30s. The collar +
-            # positive durations span 1-30s; pairing those with 30-60s
-            # negatives gives the model the full 1-60s context range that
-            # the validation segments (and downstream inference) live in.
-            min_dur_s=30.0, max_dur_s=60.0,
         )
         self.segments = self.positive_segments + self.negative_segments
 

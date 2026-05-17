@@ -999,7 +999,7 @@ class TrainingDatasetWithResample(WhaleDataset):
         n_neg = int(len(self.positive_segments) * cfg.NEG_RATIO)
         self.negative_segments = build_negative_segments(
             self.annotations, self.manifest, n_segments=n_neg,
-        
+
         )
         self.segments = self.positive_segments + self.negative_segments
 
