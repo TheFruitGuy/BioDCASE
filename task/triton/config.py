@@ -168,7 +168,7 @@ COLLAR_MAX_S = 5.0
 #: affects: per-epoch validation F1 (and therefore LR scheduling,
 #: best-checkpoint selection, and the per-class thresholds saved
 #: with the final model), and inference segment length downstream.
-EVAL_SEGMENT_S = 60.0
+EVAL_SEGMENT_S = 30.0
 
 #: Overlap between consecutive validation windows (seconds). Kept
 #: absolute (not a fraction of EVAL_SEGMENT_S) on purpose — the
