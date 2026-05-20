@@ -114,6 +114,8 @@ def parse_args() -> argparse.Namespace:
                    help="Freeze encoder for this many epochs (with --pretrained).")
     p.add_argument("--seed", type=int, default=cfg.SEED,
                    help="Random seed. Overrides cfg.SEED so multi-seed runs differ in init AND in dataloader/negative resampling.")
+    p.add_argument("--batch_size", type=int, default=cfg.BATCH_SIZE,
+                   help="Override cfg.BATCH_SIZE. v2 carries freq through the BPN, so activation memory is ~5x v1; on 11GB cards use 4-8.")
     p.add_argument("--4class-d-split", dest="four_class_d_split",
                    action="store_true",
                    help="Train with 4 output classes (bmabz, bmd, bpd, bp), "
@@ -505,6 +507,7 @@ def main():
               "(bmabz, bmd, bpd, bp), 3-class eval after bmd+bpd collapse")
 
     cfg.SEED = args.seed
+    cfg.BATCH_SIZE = args.batch_size
     set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
