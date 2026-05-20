@@ -88,6 +88,8 @@ from ssl_dataset import build_pretrain_manifest, SSLClipDataset, collate_ssl
 from mean_teacher_core import (
     EMATeacher,
     consistency_loss,
+    consistency_loss_asymmetric,
+    consistency_loss_confident,
     sigmoid_ramp,
     cosine_alpha,
     align_lengths_pair,
@@ -162,6 +164,16 @@ def parse_args():
     p.add_argument("--min-lr", type=float, default=1e-7)
     p.add_argument("--resample-every", type=int, default=5,
                    help="Resample random negatives every N epochs (HNM convention).")
+
+    p.add_argument("--consistency-type", type=str, default="mse",
+                   choices=["mse", "confident", "asymmetric_mse"],
+                   help="MT consistency loss variant.")
+    p.add_argument("--pos-weight", type=float, default=2.0,
+                   help="Teacher-positive multiplier (asymmetric_mse).")
+    p.add_argument("--neg-weight", type=float, default=1.0,
+                   help="Teacher-negative multiplier (asymmetric_mse).")
+    p.add_argument("--conf-threshold", type=float, default=0.7,
+                   help="Teacher confidence threshold (confident & asymmetric_mse).")
 
     # Output / logging
     p.add_argument("--output-dir", type=Path, default=None)
@@ -334,7 +346,20 @@ def train_epoch_mt_hnm(
             logits_u_t = teacher.teacher(spec_weak)
 
         logits_u_s, logits_u_t = align_lengths_pair(logits_u_s, logits_u_t)
-        loss_cons = consistency_loss(logits_u_s, logits_u_t)
+        if args.consistency_type == "mse":
+            loss_cons = consistency_loss(logits_u_s, logits_u_t)
+        elif args.consistency_type == "confident":
+            loss_cons = consistency_loss_confident(
+                logits_u_s, logits_u_t,
+                conf_threshold=args.conf_threshold,
+            )
+        else:  # asymmetric_mse
+            loss_cons = consistency_loss_asymmetric(
+                logits_u_s, logits_u_t,
+                pos_weight=args.pos_weight,
+                neg_weight=args.neg_weight,
+                conf_threshold=args.conf_threshold,
+            )
 
         loss = loss_sup + lambda_weight * loss_cons
         if torch.isnan(loss) or torch.isinf(loss):
