@@ -294,7 +294,8 @@ def apply_temporal_bout_filter(
     target_classes: Iterable[str] = ("d", "bmabz"),
     window_size_sec: float = 3600.0,
     min_calls: int = 3,
-    high_conf_threshold: float = 0.7,
+    high_conf_threshold=0.7,
+    verbose: bool = True,
 ) -> list:
     """
     Keep detections that sit inside a calling bout, drop isolates.
@@ -304,7 +305,7 @@ def apply_temporal_bout_filter(
         let W = { dets of same class on same (dataset, filename) whose
                   start_s ∈ [det.start_s - half, det.start_s + half] }
         keep det iff |W| >= min_calls
-               AND   max(conf in W) >= high_conf_threshold
+               AND   max(conf in W) >= high_conf_threshold(class)
 
     Detections whose class is NOT in `target_classes` (e.g. `bp` by
     default) are passed through untouched.
@@ -316,16 +317,31 @@ def apply_temporal_bout_filter(
     window_size_sec : float
         Total window width. 3600 ⇒ ±0.5 h around each detection.
     min_calls : int
-    high_conf_threshold : float
+    high_conf_threshold : float OR dict[str, float]
+        Either a scalar applied to all target classes, or a per-class
+        dict mapping class name → anchor confidence. Classes not in the
+        dict fall back to a default of 0.7. **The right value depends
+        on your model's score distribution** — if your model rarely
+        outputs >0.5, anchoring at 0.7 will drop everything. Inspect
+        the confidence percentiles at your operating threshold and pick
+        an anchor in the 1.25×–2× operating-threshold range.
+    verbose : bool
+        Print kept/dropped summary. Disable inside tuning loops.
 
     Returns
     -------
     list of Detection (or whatever input type was)  -- a NEW list, never
-    mutates the input. Filtered detections are simply absent; their
-    surviving siblings are NOT modified in any way.
+    mutates the input.
     """
     target_classes = set(target_classes)
     half = window_size_sec / 2.0
+
+    # Normalise high_conf_threshold to a per-class dict.
+    if isinstance(high_conf_threshold, dict):
+        conf_by_cls = {c: float(high_conf_threshold.get(c, 0.7))
+                       for c in target_classes}
+    else:
+        conf_by_cls = {c: float(high_conf_threshold) for c in target_classes}
 
     # Partition: pass-through everything not in target_classes, filter
     # the rest per (dataset, filename, class) group.
@@ -342,6 +358,7 @@ def apply_temporal_bout_filter(
     n_kept_per_class:    dict[str, int] = {c: 0 for c in target_classes}
 
     for (ds, fn, cls), dets in groups.items():
+        anchor = conf_by_cls[cls]
         # Sort once by start_s for O(log n) window lookups.
         dets.sort(key=lambda x: x.start_s)
         starts = [x.start_s for x in dets]
@@ -354,25 +371,25 @@ def apply_temporal_bout_filter(
             if n_in_window < min_calls:
                 n_dropped_per_class[cls] += 1
                 continue
-            # Cheap max over the window slice. (Could maintain a deque
-            # for amortised O(1) but N is small.)
             max_conf_in_window = max(confs[lo:hi])
-            if max_conf_in_window < high_conf_threshold:
+            if max_conf_in_window < anchor:
                 n_dropped_per_class[cls] += 1
                 continue
             kept.append(det)
             n_kept_per_class[cls] += 1
 
-    print(f"[BoutFilter] window={window_size_sec:.0f}s "
-          f"(±{half:.0f}s), min_calls={min_calls}, "
-          f"high_conf≥{high_conf_threshold:.2f}")
-    for cls in sorted(target_classes):
-        k = n_kept_per_class.get(cls, 0)
-        d = n_dropped_per_class.get(cls, 0)
-        total = k + d
-        rate = (d / total * 100) if total else 0.0
-        print(f"            {cls:6} kept={k:5}  dropped={d:5}  "
-              f"({rate:.1f}% dropped)")
+    if verbose:
+        anchor_str = ", ".join(f"{c}≥{conf_by_cls[c]:.2f}"
+                               for c in sorted(target_classes))
+        print(f"[BoutFilter] window={window_size_sec:.0f}s "
+              f"(±{half:.0f}s), min_calls={min_calls}, anchors=[{anchor_str}]")
+        for cls in sorted(target_classes):
+            k = n_kept_per_class.get(cls, 0)
+            d = n_dropped_per_class.get(cls, 0)
+            total = k + d
+            rate = (d / total * 100) if total else 0.0
+            print(f"            {cls:6} kept={k:5}  dropped={d:5}  "
+                  f"({rate:.1f}% dropped)")
 
     # Stable ordering: passthrough first, then filtered survivors,
     # then sort by (dataset, filename, start_s) so downstream code that
@@ -380,6 +397,46 @@ def apply_temporal_bout_filter(
     out = keep_passthrough + kept
     out.sort(key=lambda x: (x.dataset, x.filename, x.start_s))
     return out
+
+
+# =====================================================================
+# Diagnostic — confidence distribution
+# =====================================================================
+
+def report_confidence_percentiles(
+    detections: Sequence,
+    target_classes: Iterable[str] = ("d", "bmabz", "bp"),
+    percentiles: Sequence[float] = (50, 75, 90, 95, 99, 99.5),
+) -> dict[str, dict[float, float]]:
+    """
+    Print per-class confidence percentiles. Use to pick a defensive
+    anchor for the bout filter: if `0.7` doesn't appear in the top
+    rows, your model never outputs 0.7 and the filter will drop
+    everything. Pick an anchor between p75 and p95 of the post-
+    threshold distribution.
+    """
+    by_cls: dict[str, list[float]] = {c: [] for c in target_classes}
+    for d in detections:
+        if d.label in by_cls:
+            by_cls[d.label].append(float(d.confidence))
+
+    result = {}
+    print("[ConfDist] confidence percentiles per class (after operating threshold)")
+    header = "  class  n_events " + "  ".join(
+        f"p{p:>5g}" for p in percentiles) + "    max"
+    print(header)
+    for cls, confs in by_cls.items():
+        if not confs:
+            print(f"  {cls:6} {0:8}   (no events)")
+            result[cls] = {}
+            continue
+        arr = np.asarray(confs)
+        pcts = np.percentile(arr, percentiles)
+        result[cls] = {float(p): float(v) for p, v in zip(percentiles, pcts)}
+        result[cls]["max"] = float(arr.max())
+        cells = "  ".join(f"{v:>5.3f}" for v in pcts)
+        print(f"  {cls:6} {len(confs):8}  {cells}  {arr.max():.3f}")
+    return result
 
 
 # =====================================================================

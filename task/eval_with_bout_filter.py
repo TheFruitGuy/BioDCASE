@@ -62,7 +62,7 @@ from ensemble_predict_cached import (
 )
 
 from postprocess_bout_filter import (
-    apply_temporal_bout_filter, analyze_ici,
+    apply_temporal_bout_filter, analyze_ici, report_confidence_percentiles,
     FrequencyGuardrail, make_default_audio_resolver,
     BIOLOGICAL_BANDS_HZ, NOISE_BANDS_HZ,
 )
@@ -86,7 +86,7 @@ def apply_filters(
     freq_kwargs = freq_kwargs or {}
     out = detections
     if use_temporal:
-        out = apply_temporal_bout_filter(out, **bout_kwargs)
+        out = apply_temporal_bout_filter(out, verbose=verbose, **bout_kwargs)
     if use_freq and guard is not None:
         out = guard.filter(out, verbose=verbose, **freq_kwargs)
     return out
@@ -197,7 +197,16 @@ def parse_args():
     p.add_argument("--bout_window_s", type=float, default=3600.0,
                    help="Total bout-filter window in seconds (default: 3600 = ±0.5h).")
     p.add_argument("--bout_min_calls", type=int, default=3)
-    p.add_argument("--bout_high_conf", type=float, default=0.7)
+    p.add_argument("--bout_high_conf", type=float, default=0.5,
+                   help="Default anchor confidence (used for any target class "
+                        "without a per-class override). 0.7 is too high for "
+                        "well-calibrated sigmoid models; 0.45-0.55 is typical.")
+    p.add_argument("--bout_high_conf_bmabz", type=float, default=None,
+                   help="Per-class anchor for bmabz. Suggested: 0.45.")
+    p.add_argument("--bout_high_conf_d", type=float, default=None,
+                   help="Per-class anchor for d. Suggested: 0.50.")
+    p.add_argument("--bout_high_conf_bp", type=float, default=None,
+                   help="Per-class anchor for bp (only used if bp is in --bout_classes).")
     p.add_argument("--bout_classes", nargs="+", default=["d", "bmabz"],
                    help="Classes the bout filter targets. bp is excluded by default.")
     p.add_argument("--freq_classes", nargs="+", default=["d", "bmabz"],
@@ -294,19 +303,35 @@ def main():
             max_cached_files=32,
         )
 
+    # Per-class anchor dict: overrides win, default fills the rest.
+    high_conf_per_class = {c: args.bout_high_conf for c in args.bout_classes}
+    if args.bout_high_conf_bmabz is not None:
+        high_conf_per_class["bmabz"] = args.bout_high_conf_bmabz
+    if args.bout_high_conf_d is not None:
+        high_conf_per_class["d"] = args.bout_high_conf_d
+    if args.bout_high_conf_bp is not None:
+        high_conf_per_class["bp"] = args.bout_high_conf_bp
+
     bout_kwargs = dict(
         target_classes=tuple(args.bout_classes),
         window_size_sec=args.bout_window_s,
         min_calls=args.bout_min_calls,
-        high_conf_threshold=args.bout_high_conf,
+        high_conf_threshold=high_conf_per_class,
     )
     freq_kwargs = dict(noise_threshold_ratio=args.freq_noise_ratio)
 
+    # --- Diagnostic: confidence percentiles ---
+    print(f"\n{'='*70}\n[CONFIDENCE DIST] post-threshold per-class score percentiles\n{'='*70}")
+    base_events = postprocess_predictions(ens_probs, base_thr)
+    report_confidence_percentiles(
+        base_events, target_classes=("d", "bmabz", "bp"))
+    print("  (anchor recommendation: pick between p75 and p95 of the class "
+          "you want to filter)")
+
     # --- Diagnostic: ICI on the baseline detection set ---
     print(f"\n{'='*70}\n[ICI DIAGNOSTIC] consecutive 'd' intervals on baseline events\n{'='*70}")
-    base_events = postprocess_predictions(ens_probs, base_thr)
     analyze_ici(base_events, target_class="d",
-                score_threshold=args.bout_high_conf * 0.3,  # ~0.2 default
+                score_threshold=args.bout_high_conf * 0.3,  # ~0.15 default
                 show=False, save_path=args.ici_plot_path)
     if "bmabz" in args.bout_classes:
         analyze_ici(base_events, target_class="bmabz",
