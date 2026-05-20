@@ -112,6 +112,8 @@ def parse_args() -> argparse.Namespace:
                    help="Path to a contrastive-pretrained encoder.")
     p.add_argument("--freeze_epochs", type=int, default=0,
                    help="Freeze encoder for this many epochs (with --pretrained).")
+    p.add_argument("--seed", type=int, default=cfg.SEED,
+                   help="Random seed. Overrides cfg.SEED so multi-seed runs differ in init AND in dataloader/negative resampling.")
     p.add_argument("--4class-d-split", dest="four_class_d_split",
                    action="store_true",
                    help="Train with 4 output classes (bmabz, bmd, bpd, bp), "
@@ -502,7 +504,8 @@ def main():
         print("[train_bpn_v2] USE_4CLASS_D_SPLIT enabled — 4 output classes "
               "(bmabz, bmd, bpd, bp), 3-class eval after bmd+bpd collapse")
 
-    set_seed()
+    cfg.SEED = args.seed
+    set_seed(args.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
