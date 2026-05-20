@@ -59,7 +59,7 @@ from postprocess import (
 )
 from spectrogram import SpectrogramExtractor
 
-from ensemble_predict import average_prob_dicts
+from ensemble_predict import average_prob_dicts, tune_thresholds_on_probs
 from ensemble_predict_cached import get_or_compute_probs
 
 
@@ -161,6 +161,14 @@ def parse_args():
     p.add_argument("--d_grid", nargs="+", type=float,
                    default=[0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55],
                    help="D threshold grid for the optional retune.")
+    p.add_argument("--base_thr", nargs=3, type=float, default=None,
+                   metavar=("BMABZ", "D", "BP"),
+                   help="Per-class operating thresholds for the ensemble "
+                        "(bmabz d bp). If unset, --auto_tune is used; if "
+                        "neither, falls back to [0.25, 0.40, 0.40] with a warning.")
+    p.add_argument("--auto_tune", action="store_true",
+                   help="Tune thresholds on the ensemble probs before "
+                        "sweeping merge gaps. Use this on new ensembles.")
     return p.parse_args()
 
 
@@ -219,13 +227,23 @@ def main():
     ens_probs = (all_prob_dicts[0] if len(all_prob_dicts) == 1
                  else average_prob_dicts(all_prob_dicts, weights=weights))
 
-    # --- Baseline thresholds (from your runs, same as eval_with_bout_filter) ---
-    # Reusing the ensemble-tuned values rather than re-running tune_thresholds
-    # so this script is FAST and deterministic. If you change the ensemble
-    # you'll want to re-tune these first via ensemble_predict_cached.py.
-    base_thr = np.array([0.25, 0.40, 0.40], dtype=np.float64)  # bmabz, d, bp
-    print(f"\nUsing baseline thresholds (from prior tuning): "
-          f"bmabz={base_thr[0]:.2f}  d={base_thr[1]:.2f}  bp={base_thr[2]:.2f}")
+    # --- Resolve baseline thresholds for this ensemble ---
+    if args.base_thr is not None:
+        base_thr = np.array(args.base_thr, dtype=np.float64)
+        print(f"\nUsing user-specified baseline thresholds: "
+              f"bmabz={base_thr[0]:.2f}  d={base_thr[1]:.2f}  bp={base_thr[2]:.2f}")
+    elif args.auto_tune:
+        print(f"\n{'='*78}\nAUTO-TUNING thresholds on ensemble probabilities\n{'='*78}")
+        t0 = time.time()
+        base_thr = tune_thresholds_on_probs(ens_probs, gt_events)
+        print(f"  tuned in {time.time()-t0:.1f}s: "
+              f"bmabz={base_thr[0]:.2f}  d={base_thr[1]:.2f}  bp={base_thr[2]:.2f}")
+    else:
+        base_thr = np.array([0.25, 0.40, 0.40], dtype=np.float64)
+        print(f"\n[warn] No --base_thr or --auto_tune given. "
+              f"Falling back to source-ensemble thresholds "
+              f"[{base_thr[0]:.2f}, {base_thr[1]:.2f}, {base_thr[2]:.2f}]. "
+              f"For HNM_PGI or any other ensemble, pass --auto_tune.")
 
     # --- Baseline at cfg.MERGE_GAP_S for reference ---
     print(f"\n{'='*78}\nBASELINE (D merge gap = cfg.MERGE_GAP_S = {cfg.MERGE_GAP_S}s)\n{'='*78}")
