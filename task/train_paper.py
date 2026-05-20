@@ -39,6 +39,7 @@ print("=" * 50 + "\n")
 # ====================================================================
 # 2. PROJECT IMPORTS
 # ====================================================================
+import wandb_utils as wbu
 from dataset import build_dataloaders, load_annotations, collate_fn
 from model import WhaleVAD, WhaleVADLoss, compute_class_weights
 from spectrogram import SpectrogramExtractor
@@ -55,6 +56,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train SOTA Baseline (paper-faithful)")
     parser.add_argument("--run_name", type=str, required=True, help="Name of the run folder")
     parser.add_argument("--epochs", type=int, default=80, help="Total epochs to train")
+    parser.add_argument("--seed", type=int, default=cfg.SEED,
+                        help="Master RNG seed for Python/NumPy/Torch/CUDA and "
+                             "for DataLoader shuffle order. Different seeds let "
+                             "you run multi-seed reproductions.")
     return parser.parse_args()
 
 
@@ -62,11 +67,16 @@ def main():
     args = parse_args()
 
     # 1. Setup Environment
+    # Seed BEFORE build_dataloaders -- TrainingDatasetWithResample draws
+    # the initial negative pool at construction time, so seeding here
+    # makes those negatives reproducible across runs.
+    wbu.seed_everything(args.seed, deterministic=False)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     out_dir = cfg.OUTPUT_DIR / args.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"Starting {args.run_name} on {device}")
+    print(f"Starting {args.run_name} on {device} (seed={args.seed})")
     print(f"Targeting {args.epochs} epochs with LR={cfg.LR} + Cosine Scheduler")
     print(f"Output dir: {out_dir}")
 
@@ -115,6 +125,9 @@ def main():
         # captured its segment list at __iter__ time. To pick up the new
         # negatives we have to rebuild the loader. (Same pattern as
         # production train.py line 553.)
+        # The seeded_dataloader_kwargs derive the loader's RNG from
+        # (master_seed + epoch), so shuffle order is reproducible across
+        # reruns of the same --seed value.
         if (epoch - 1) % RESAMPLE_EVERY == 0:
             print(f"  Resampling negatives for epoch {epoch}")
             train_ds.resample_negatives()
@@ -122,6 +135,7 @@ def main():
                 train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,
                 num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn,
                 pin_memory=True,
+                **wbu.seeded_dataloader_kwargs(args.seed + epoch),
             )
 
         # --- TRAIN ---------------------------------------------------
