@@ -63,6 +63,31 @@ def parse_args():
     return parser.parse_args()
 
 
+def align_lengths(logits, targets, mask):
+    """
+    Reconcile length mismatches between logits and targets.
+
+    The CNN front end can produce a different frame count than the
+    naive ``n_samples // hop_length`` count the dataset uses to paint
+    targets, due to padding and pooling boundary effects. Truncate or
+    zero-pad ``targets``/``mask`` to match ``logits.size(1)``.
+
+    Copied verbatim from production ``train.py``.
+    """
+    T_m, T_t = logits.size(1), targets.size(1)
+    if T_m < T_t:
+        targets = targets[:, :T_m, :]
+        mask = mask[:, :T_m]
+    elif T_m > T_t:
+        pad_t = torch.zeros(targets.size(0), T_m - T_t, targets.size(2),
+                            device=targets.device)
+        targets = torch.cat([targets, pad_t], dim=1)
+        pad_m = torch.zeros(mask.size(0), T_m - T_t, dtype=torch.bool,
+                            device=mask.device)
+        mask = torch.cat([mask, pad_m], dim=1)
+    return targets, mask
+
+
 def main():
     args = parse_args()
 
@@ -152,6 +177,7 @@ def main():
             optimizer.zero_grad()
             spec = spec_extractor(audio)
             logits = model(spec)
+            targets, mask = align_lengths(logits, targets, mask)
             loss = criterion(logits, targets, mask)
 
             loss.backward()
@@ -178,6 +204,7 @@ def main():
 
                 spec = spec_extractor(audio)
                 logits = model(spec)
+                targets, mask = align_lengths(logits, targets, mask)
                 val_loss += criterion(logits, targets, mask).item()
                 n_val += 1
 
