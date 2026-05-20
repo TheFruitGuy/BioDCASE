@@ -18,6 +18,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import CosineAnnealingLR
+from tqdm import tqdm
 
 # ====================================================================
 # 1. RUNTIME CONFIG OVERRIDES (MUST HAPPEN BEFORE PROJECT IMPORTS)
@@ -142,6 +143,9 @@ def main():
     criterion = WhaleVADLoss(pos_weight=pw).to(device)
 
     best_macro_f1 = 0.0
+    best_epoch = 0
+    best_components = [0.0, 0.0, 0.0]
+    best_thresh_at_best = np.full(3, 0.5)
 
     # 4. Training Loop
     for epoch in range(1, args.epochs + 1):
@@ -171,7 +175,7 @@ def main():
         current_lr = optimizer.param_groups[0]['lr']
         print(f"\n[Epoch {epoch}/{args.epochs}] LR: {current_lr:.2e}")
 
-        for audio, targets, mask, metas in train_loader:
+        for audio, targets, mask, metas in tqdm(train_loader, desc="Train", leave=False):
             audio, targets, mask = audio.to(device), targets.to(device), mask.to(device)
 
             optimizer.zero_grad()
@@ -199,7 +203,7 @@ def main():
         n_val = 0
 
         with torch.no_grad():
-            for audio, targets, mask, metas in val_loader:
+            for audio, targets, mask, metas in tqdm(val_loader, desc="Val", leave=False):
                 audio, targets, mask = audio.to(device), targets.to(device), mask.to(device)
 
                 spec = spec_extractor(audio)
@@ -275,9 +279,31 @@ def main():
 
         if epoch_macro_f1 > best_macro_f1:
             best_macro_f1 = epoch_macro_f1
+            best_epoch = epoch
+            best_components = list(macro_f1_components)
+            best_thresh_at_best = best_thresholds.copy()
             state["best_f1"] = best_macro_f1
             torch.save(state, out_dir / "best_model.pt")
             print(f"  *** New Best Collapsed Macro F1 saved! ***")
+
+
+    # --- FINAL SUMMARY ----------------------------------------------
+    print("\n" + "=" * 60)
+    print("TRAINING COMPLETE")
+    print("=" * 60)
+    print(f"Run name:         {args.run_name}")
+    print(f"Seed:             {args.seed}")
+    print(f"Epochs trained:   {args.epochs}")
+    print(f"Best epoch:       {best_epoch}")
+    print(f"Best Macro F1:    {best_macro_f1:.4f} "
+          f"(BMABZ: {best_components[0]:.3f}, "
+          f"D: {best_components[1]:.3f}, "
+          f"BP: {best_components[2]:.3f})")
+    print(f"Tuned thresholds: bmabz={best_thresh_at_best[0]:.2f}, "
+          f"d={best_thresh_at_best[1]:.2f}, "
+          f"bp={best_thresh_at_best[2]:.2f}")
+    print(f"Best checkpoint:  {out_dir / 'best_model.pt'}")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
