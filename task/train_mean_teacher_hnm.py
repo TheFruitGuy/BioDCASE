@@ -299,7 +299,7 @@ def train_epoch_mt_hnm(
     labeled_loader, unlabeled_loader, unlabeled_iter,
     optimizer, device, epoch,
     lambda_weight, alpha,
-    hard_neg_class_map, n_classes, use_pgi,
+    hard_neg_class_map, n_classes, use_pgi, args,
 ):
     student.train()
     freeze_bn_running_stats(student)   # critical — see MT failure notes
