@@ -622,6 +622,7 @@ def main():
             lambda_weight=lambda_w, alpha=alpha,
             hard_neg_class_map=hard_neg_class_map,
             n_classes=n_classes, use_pgi=args.isolate_classes,
+            args=args,
         )
 
         val = validate_teacher(
