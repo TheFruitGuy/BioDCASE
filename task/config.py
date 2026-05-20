@@ -168,7 +168,7 @@ COLLAPSE_MAP = {
 #: in the DCASE Table 2 ablation refers to *evaluating* in the 3-class space,
 #: not to training a 3-class head. To match the official checkpoint exactly,
 #: set this to False and use post-hoc collapse during evaluation.
-USE_3CLASS = True
+USE_3CLASS = False
 
 
 # ======================================================================
