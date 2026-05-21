@@ -3,76 +3,71 @@ Canonical Recipe Training — Email-corrected Reproduction
 ========================================================
 
 Companion to ``train.py``. Implements the WhaleVAD training recipe as
-clarified in Geldenhuys' email of 2026-05-21. The existing ``train.py``
-diverges from the paper in several ways that grew up organically during
-reproduction; this script collapses those deviations back to the
-canonical setup.
+clarified in Geldenhuys' email of 2026-05-21, with CLI flags to adapt
+the same recipe across hardware setups (large-VRAM cluster GPUs, small
+desktop GPUs, mixed-precision-capable cards, etc.).
 
-What this script does differently from ``train.py``
----------------------------------------------------
+Recipe differences from ``train.py``
+------------------------------------
 
-1. **Loss = pure weighted BCE.** ``USE_FOCAL_LOSS`` is forced off, even
-   if ``config.py`` has it on. The paper's Table 2 ``"+ Focal loss"`` row
-   means focal *replaces* weighted BCE, not stacks on top of it. The
-   stacked configuration is not validated by anyone.
+1. **Loss = pure weighted BCE.** Focal modulation is hard-disabled.
+2. **LR = fixed.** No scheduler, no warmup, no decay.
+3. **Epochs = fixed.** No early stopping; the recipe sets the length.
+4. **Multi-GPU = DDP + (optional) SyncBatchNorm.**
+5. **pos_weight = frame-level.** Computed from annotation frames, not files.
+6. **Padding-mask audit** runs on the first training batch.
+7. **No bounding-box head.** Confirmed absent from the paper's 0.440 config.
 
-2. **LR = fixed.** No ``ReduceLROnPlateau``, no warmup, no decay. Paper
-   says LR is held constant. The previous LR bump from 1e-5 to 5e-5 was
-   driven by the small-gradient symptom of focal-on-WBCE; with pure WBCE
-   the paper's 1e-5 should be usable. Default is 1e-5 (``--recipe paper``)
-   with ``--recipe desktop`` available for 1e-3 (Christiaan's smaller-batch
-   suggestion).
+Hardware-adaptation flags
+-------------------------
 
-3. **Epochs = fixed, no early stopping.** Default 20 epochs to match the
-   paper budget. Early stopping is intentionally absent: with the canonical
-   recipe the run length is the recipe.
+``--amp {none,fp16,bf16}``
+    Mixed precision via ``torch.amp.autocast``. ``fp16`` for Turing
+    (2080 Ti and older — no bf16 support); ``bf16`` for Ampere+
+    (A40 / A100 / 3000-series and newer) — same fp32 exponent range,
+    so no GradScaler needed. Default ``none`` (full fp32).
 
-4. **Multi-GPU = DDP + SyncBatchNorm.** Replaces ``nn.DataParallel`` with
-   ``torch.nn.parallel.DistributedDataParallel`` (DDP). All ``BatchNorm2d``
-   layers are converted to ``SyncBatchNorm`` so per-GPU statistics are
-   aggregated across replicas — important on 4× A40 with small per-GPU
-   batches where un-synced BN injects noise.
+``--grad-accum N``
+    Accumulate gradients over N micro-batches before each optimizer step.
+    Effective batch = ``--batch-per-gpu × WORLD_SIZE × --grad-accum``.
+    In DDP, non-boundary micro-batches use ``model.no_sync()`` to avoid
+    wasted gradient all-reduces.
 
-5. **pos_weight computed at frame level.** Replaces ``compute_class_weights``
-   (which counts files) with ``compute_pos_weights_framewise`` from
-   ``dataset_canonical.py`` (which counts the actual frames the BCE loss
-   sees). Padded frames are not present at this stage and so cannot
-   contaminate the count.
-
-6. **Padding-mask audit on the first batch.** A defensive assertion that
-   the boolean mask matches the implied segment lengths and that padded
-   target positions are zero. Catches silent drift between collation and
-   loss; runs once, costs microseconds.
-
-7. **No bounding-box head.** Already absent in this codebase; mentioned
-   here for completeness because the email explicitly confirmed the BB
-   module is *removed* from the final 0.440 configuration (not just
-   omitted at inference).
+``--no-sync-bn``
+    Skip the ``SyncBatchNorm`` conversion that runs by default when
+    ``WORLD_SIZE > 1``. Useful when per-GPU batch is already large
+    (≥64) and local BN stats are low-noise — sync then is pure overhead.
 
 Launching
 ---------
 
-Single-node, 4 GPUs (canonical run on 4× A40)::
+4× A40 (48 GB) canonical run::
 
     torchrun --standalone --nproc_per_node=4 train_canonical.py \\
-        --recipe paper --epochs 20 --batch-per-gpu 32 --seed 42
+        --recipe paper --batch-per-gpu 64 --amp bf16 --seed 42
 
-Single GPU (smoke test or low-budget run)::
+8× 2080 Ti (11 GB) canonical run via fp16 + accumulation::
 
-    torchrun --standalone --nproc_per_node=1 train_canonical.py \\
-        --recipe paper --epochs 20 --batch-per-gpu 32 --seed 42
+    torchrun --standalone --nproc_per_node=8 train_canonical.py \\
+        --recipe paper --batch-per-gpu 16 --grad-accum 2 \\
+        --amp fp16 --seed 42
+    # effective batch = 16 × 8 × 2 = 256
 
-Multi-seed sweep on 4 GPUs (one seed per GPU, parallel)::
+8× 2080 Ti multi-seed sweep (one seed per card, parallel)::
 
-    for s in 42 1337 9999 7777; do
-      CUDA_VISIBLE_DEVICES=$((s % 4)) torchrun --standalone --nproc_per_node=1 \\
-          --master_port=$((29500 + s % 100)) train_canonical.py \\
-          --recipe paper --epochs 20 --batch-per-gpu 64 --seed $s &
+    seeds=(42 1337 9999 7777 11 23 31 47)
+    for i in 0 1 2 3 4 5 6 7; do
+      CUDA_VISIBLE_DEVICES=$i torchrun --standalone --nproc_per_node=1 \\
+          --master_port=$((29500 + i)) train_canonical.py \\
+          --recipe desktop --batch-per-gpu 16 --amp fp16 \\
+          --no-sync-bn --seed ${seeds[$i]} &
     done
     wait
 
-The desktop recipe (``--recipe desktop``) uses ``lr=1e-3`` and ``epochs=15``
-per Christiaan's smaller-batch suggestion.
+Single-GPU smoke test (any hardware)::
+
+    torchrun --standalone --nproc_per_node=1 train_canonical.py \\
+        --recipe paper --epochs 2 --batch-per-gpu 16 --amp fp16 --seed 42
 """
 
 from __future__ import annotations
@@ -80,6 +75,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -95,10 +91,10 @@ from tqdm import tqdm
 import config as cfg
 import wandb_utils as wbu
 from spectrogram import SpectrogramExtractor
-from model import WhaleVAD, WhaleVADLoss
+from model import WhaleVAD
 from dataset import (
     get_file_manifest, load_annotations,
-    build_positive_segments, build_negative_segments, build_val_segments,
+    build_positive_segments, build_val_segments,
     WhaleDataset, TrainingDatasetWithResample, collate_fn,
 )
 from dataset_canonical import (
@@ -111,20 +107,18 @@ from postprocess import (
 
 
 # ======================================================================
-# Recipe presets
+# Recipe and AMP presets
 # ======================================================================
 
 RECIPES = {
-    # Paper recipe: long training, very small LR, large effective batch.
-    # The paper's "very large batch size and long segments" plus L40 VRAM
-    # implied an effective batch well above 128. With 4× A40 at 32/GPU we
-    # land at 128 effective; bump --batch-per-gpu to 64 for 256.
     "paper":   {"lr": 1e-5, "epochs": 20},
-
-    # Desktop recipe (Christiaan's suggestion): 100× the paper LR with a
-    # shorter run, validated on smaller batches. Useful as a fallback or
-    # for sanity-checking the loss path on a single GPU.
     "desktop": {"lr": 1e-3, "epochs": 15},
+}
+
+AMP_DTYPES = {
+    "none": None,
+    "fp16": torch.float16,
+    "bf16": torch.bfloat16,
 }
 
 
@@ -133,21 +127,7 @@ RECIPES = {
 # ======================================================================
 
 def ddp_setup() -> tuple[int, int, int, torch.device]:
-    """
-    Initialize ``torch.distributed`` from torchrun-provided env vars.
-
-    torchrun sets ``RANK``, ``LOCAL_RANK``, ``WORLD_SIZE``, ``MASTER_ADDR``,
-    and ``MASTER_PORT`` automatically. We honour them and bind the current
-    process to the matching local GPU.
-
-    Returns
-    -------
-    rank, local_rank, world_size, device
-    """
     if "RANK" not in os.environ:
-        # Not launched under torchrun. Fall back to single-process mode so
-        # the script remains runnable as ``python train_canonical.py`` for
-        # smoke tests, but with a clear notice.
         print("[ddp_setup] RANK not in env — single-process mode (no DDP)")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         return 0, 0, 1, device
@@ -167,13 +147,11 @@ def ddp_setup() -> tuple[int, int, int, torch.device]:
 
 
 def ddp_cleanup():
-    """Tear down the process group if we initialised one."""
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
 
 def is_main(rank: int) -> bool:
-    """Convenience guard for things that should only run on rank 0."""
     return rank == 0
 
 
@@ -182,58 +160,59 @@ def is_main(rank: int) -> bool:
 # ======================================================================
 
 def parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+
+    # Recipe / training duration
     p.add_argument("--recipe", choices=list(RECIPES), default="paper",
-                   help="Hyperparameter preset (paper or desktop).")
+                   help="Hyperparameter preset.")
     p.add_argument("--epochs", type=int, default=None,
                    help="Override the recipe's epoch count.")
     p.add_argument("--lr", type=float, default=None,
                    help="Override the recipe's learning rate.")
-    p.add_argument("--batch-per-gpu", type=int, default=32,
-                   help="Per-GPU minibatch size (effective batch = "
-                        "--batch-per-gpu × WORLD_SIZE).")
     p.add_argument("--seed", type=int, default=42,
-                   help="Random seed for this run.")
+                   help="Random seed.")
+
+    # Hardware-shape flags
+    p.add_argument("--batch-per-gpu", type=int, default=32,
+                   help="Per-GPU minibatch size.")
+    p.add_argument("--grad-accum", type=int, default=1,
+                   help="Gradient accumulation steps. Effective batch = "
+                        "--batch-per-gpu × WORLD_SIZE × --grad-accum.")
+    p.add_argument("--amp", choices=list(AMP_DTYPES), default="none",
+                   help="Mixed precision dtype. fp16 for Turing (2080 Ti); "
+                        "bf16 for Ampere+ (A40/A100/3000-series).")
+    p.add_argument("--no-sync-bn", action="store_true",
+                   help="Skip SyncBatchNorm conversion. Default is to "
+                        "convert when WORLD_SIZE > 1.")
+    p.add_argument("--num-workers", type=int, default=cfg.NUM_WORKERS,
+                   help="DataLoader worker processes per rank.")
+
+    # Bookkeeping
     p.add_argument("--output-dir", type=str, default=None,
-                   help="Output directory for checkpoints. Defaults to "
+                   help="Output directory. Defaults to "
                         "OUTPUT_DIR/whalevad_canonical_<timestamp>_seed<S>.")
     p.add_argument("--resample-every", type=int, default=1,
                    help="Resample negative pool every N epochs (paper=1).")
-    p.add_argument("--num-workers", type=int, default=cfg.NUM_WORKERS)
     p.add_argument("--no-wandb", action="store_true",
                    help="Disable wandb logging entirely.")
     return p.parse_args()
 
 
 # ======================================================================
-# Loss / weight helpers
+# Loss
 # ======================================================================
 
 class CanonicalWBCELoss(nn.Module):
-    """
-    Pure weighted BCE with a padding mask. No focal modulation.
-
-    Implementation is a stripped-down copy of ``WhaleVADLoss`` that
-    explicitly cannot apply focal — this avoids any chance of a stray
-    ``USE_FOCAL_LOSS=True`` in ``config.py`` quietly re-enabling focal
-    via the shared loss module.
-
-    Parameters
-    ----------
-    pos_weight : torch.Tensor, shape (num_classes,)
-        Per-class positive-class weight for ``BCEWithLogitsLoss``.
-    """
+    """Pure weighted BCE with a padding mask. No focal modulation, ever."""
 
     def __init__(self, pos_weight: torch.Tensor):
         super().__init__()
         self.register_buffer("pos_weight", pos_weight)
 
-    def forward(
-        self,
-        logits: torch.Tensor,                  # (B, T, C)
-        targets: torch.Tensor,                 # (B, T, C)
-        padding_mask: torch.Tensor | None,     # (B, T) bool
-    ) -> torch.Tensor:
+    def forward(self, logits, targets, padding_mask):
         pw = self.pos_weight.view(1, 1, -1)
         bce = nn.functional.binary_cross_entropy_with_logits(
             logits, targets, pos_weight=pw, reduction="none",
@@ -247,7 +226,6 @@ class CanonicalWBCELoss(nn.Module):
 
 
 def align_lengths(logits, targets, mask):
-    """Reconcile small T-mismatches between logits and (targets, mask)."""
     T_m, T_t = logits.size(1), targets.size(1)
     if T_m < T_t:
         targets = targets[:, :T_m, :]
@@ -263,54 +241,104 @@ def align_lengths(logits, targets, mask):
 
 
 # ======================================================================
-# Train / validate
+# Train epoch with AMP + gradient accumulation
 # ======================================================================
 
 def train_epoch(model, spec, loader, criterion, optimizer, device, epoch,
-                rank: int, total_epochs: int, audit_first_batch: bool):
+                rank: int, total_epochs: int, audit_first_batch: bool,
+                amp_dtype: torch.dtype | None, scaler,
+                grad_accum: int):
+    """
+    One training epoch with optional AMP and gradient accumulation.
+
+    Gradient accumulation:
+      - ``optimizer.zero_grad()`` runs only at the start of each cycle.
+      - Per-micro-batch loss is divided by ``grad_accum`` so the sum
+        across a cycle equals the mean over the full effective batch.
+      - In DDP, ``model.no_sync()`` is used on non-boundary micro-batches
+        to skip the gradient all-reduce until the cycle completes.
+
+    Mixed precision:
+      - ``torch.amp.autocast`` wraps the model forward and the loss.
+      - For ``fp16`` we use a ``GradScaler`` to prevent gradient underflow.
+      - For ``bf16`` no scaler is needed (bf16 has fp32's exponent range).
+      - Spectrogram extraction stays in fp32 — STFT can be numerically
+        sensitive and is cheap, so there's no reason to cast it.
+    """
     model.train()
     total_loss, n = 0.0, 0
     audited = not audit_first_batch
+    use_amp = amp_dtype is not None
     pbar = tqdm(loader, desc=f"Epoch {epoch}/{total_epochs}",
                 disable=not is_main(rank), leave=False)
 
-    for audio, targets, mask, metas in pbar:
+    optimizer.zero_grad(set_to_none=True)
+    n_batches = len(loader)
+
+    for batch_idx, (audio, targets, mask, metas) in enumerate(pbar):
         if not audited:
-            # Run the assertion on a real batch before any GPU transfer.
-            # Failure here aborts training with a clear error rather than
-            # silently leaking gradient through padded positions.
             assert_mask_is_correct(audio, targets, mask, metas)
             if is_main(rank):
-                print("[mask audit] first batch passed — padding mask "
-                      "matches implied segment lengths and padded targets "
-                      "are zero.")
+                print("[mask audit] first batch passed.")
             audited = True
 
         audio = audio.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        s = spec(audio)
-        logits = model(s)
-        targets, mask = align_lengths(logits, targets, mask)
-        loss = criterion(logits, targets, mask)
+        is_step_boundary = (
+            ((batch_idx + 1) % grad_accum == 0)
+            or (batch_idx == n_batches - 1)
+        )
+        sync_ctx = (
+            model.no_sync()
+            if (isinstance(model, DDP) and not is_step_boundary)
+            else nullcontext()
+        )
 
-        if torch.isnan(loss) or torch.isinf(loss):
-            if is_main(rank):
-                print("*** NaN / Inf loss — skipping batch ***")
-            continue
+        with sync_ctx:
+            # STFT in fp32; only the network forward + loss run under AMP.
+            s = spec(audio)
+            amp_ctx = (
+                torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
+                if use_amp else nullcontext()
+            )
+            with amp_ctx:
+                logits = model(s)
+                targets_a, mask_a = align_lengths(logits, targets, mask)
+                loss = criterion(logits, targets_a, mask_a) / grad_accum
 
-        loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
-        optimizer.step()
+            if torch.isnan(loss) or torch.isinf(loss):
+                if is_main(rank):
+                    print(f"*** NaN/Inf loss at batch {batch_idx} — "
+                          f"dropping accumulation cycle ***")
+                if is_step_boundary:
+                    optimizer.zero_grad(set_to_none=True)
+                continue
 
-        total_loss += loss.item()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
+
+        if is_step_boundary:
+            if scaler is not None:
+                scaler.unscale_(optimizer)
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP)
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+
+        # Multiply back by grad_accum so logged loss is comparable across
+        # different --grad-accum settings.
+        total_loss += loss.item() * grad_accum
         n += 1
         if is_main(rank):
-            pbar.set_postfix(loss=f"{loss.item():.4f}")
+            pbar.set_postfix(loss=f"{loss.item() * grad_accum:.4f}")
 
-    # Reduce mean train loss across ranks for an honest log line.
     if dist.is_initialized():
         t = torch.tensor([total_loss, float(n)], device=device)
         dist.all_reduce(t, op=dist.ReduceOp.SUM)
@@ -318,17 +346,18 @@ def train_epoch(model, spec, loader, criterion, optimizer, device, epoch,
     return total_loss / max(n, 1)
 
 
+# ======================================================================
+# Validation
+# ======================================================================
+
 @torch.no_grad()
 def validate(model, spec, loader, criterion, device,
-             thresholds, val_annotations, file_start_dts):
-    """
-    Validation runs on rank 0 only (the val loader is constructed without
-    a distributed sampler). Returns the same dict shape ``train.py`` uses
-    so existing tuning helpers keep working.
-    """
+             thresholds, val_annotations, file_start_dts,
+             amp_dtype: torch.dtype | None):
     model.eval()
     total_loss, nb = 0.0, 0
     all_probs: dict = {}
+    use_amp = amp_dtype is not None
 
     for audio, targets, mask, metas in tqdm(loader, desc="Validate",
                                             leave=False):
@@ -337,12 +366,17 @@ def validate(model, spec, loader, criterion, device,
         mask = mask.to(device)
 
         s = spec(audio)
-        logits = model(s)
-        targets, mask = align_lengths(logits, targets, mask)
-        total_loss += criterion(logits, targets, mask).item()
+        amp_ctx = (torch.amp.autocast(device_type="cuda", dtype=amp_dtype)
+                   if use_amp else nullcontext())
+        with amp_ctx:
+            logits = model(s)
+            targets_a, mask_a = align_lengths(logits, targets, mask)
+            loss = criterion(logits, targets_a, mask_a)
+        total_loss += loss.item()
         nb += 1
 
-        probs = torch.sigmoid(logits).cpu().numpy()
+        # Cast probs back to fp32 for numerically stable post-processing.
+        probs = torch.sigmoid(logits.float()).cpu().numpy()
         hop = spec.hop_length
         for j, meta in enumerate(metas):
             key = (meta["dataset"], meta["filename"], meta["start_sample"])
@@ -364,7 +398,6 @@ def validate(model, spec, loader, criterion, device,
             end_s=(row["end_datetime"] - fsd).total_seconds(),
         ))
 
-    # Per-class threshold sweep (same coarse grid as train.py).
     used = np.asarray(thresholds.cpu().numpy(), dtype=np.float64).copy()
     grids = [
         np.arange(0.20, 0.85, 0.05),
@@ -416,13 +449,19 @@ def main():
     recipe = RECIPES[args.recipe]
     lr = args.lr if args.lr is not None else recipe["lr"]
     epochs = args.epochs if args.epochs is not None else recipe["epochs"]
+    amp_dtype = AMP_DTYPES[args.amp]
+
+    # Warn early if bf16 is requested on hardware that doesn't support it.
+    if args.amp == "bf16" and torch.cuda.is_available():
+        if not torch.cuda.is_bf16_supported():
+            print("*** WARNING: --amp bf16 requested but device does not "
+                  "support bf16. Use --amp fp16 on Turing (2080 Ti / older).")
 
     rank, local_rank, world_size, device = ddp_setup()
     try:
-        # Deterministic seeding per rank: same model init across ranks
-        # (which DDP requires), but different worker/shuffle seeds so each
-        # replica sees a different slice each epoch.
         wbu.seed_everything(args.seed, deterministic=False)
+
+        effective_batch = args.batch_per_gpu * world_size * args.grad_accum
 
         # ------------------------------------------------------------------
         # Wandb (rank 0 only)
@@ -432,23 +471,27 @@ def main():
             run = wbu.init_phase(
                 "canonical",
                 extra_tags=["wbce_only", "fixed_lr", "ddp",
-                            f"recipe_{args.recipe}", f"seed_{args.seed}"],
+                            f"recipe_{args.recipe}", f"seed_{args.seed}",
+                            f"amp_{args.amp}"],
                 config={
-                    "recipe":          args.recipe,
-                    "lr":              lr,
-                    "epochs":          epochs,
-                    "batch_per_gpu":   args.batch_per_gpu,
-                    "world_size":      world_size,
-                    "effective_batch": args.batch_per_gpu * world_size,
-                    "seed":            args.seed,
-                    "use_focal_loss":  False,
+                    "recipe":           args.recipe,
+                    "lr":               lr,
+                    "epochs":           epochs,
+                    "batch_per_gpu":    args.batch_per_gpu,
+                    "grad_accum":       args.grad_accum,
+                    "world_size":       world_size,
+                    "effective_batch":  effective_batch,
+                    "amp":              args.amp,
+                    "sync_bn":          (not args.no_sync_bn) and world_size > 1,
+                    "seed":             args.seed,
+                    "use_focal_loss":   False,
                     "use_weighted_bce": True,
-                    "pos_weight_unit": "frame",
-                    "resample_every":  args.resample_every,
-                    "use_3class":      cfg.USE_3CLASS,
-                    "n_classes":       cfg.n_classes(),
-                    "lstm_hidden":     cfg.LSTM_HIDDEN,
-                    "lstm_layers":     cfg.LSTM_LAYERS,
+                    "pos_weight_unit":  "frame",
+                    "resample_every":   args.resample_every,
+                    "use_3class":       cfg.USE_3CLASS,
+                    "n_classes":        cfg.n_classes(),
+                    "lstm_hidden":      cfg.LSTM_HIDDEN,
+                    "lstm_layers":      cfg.LSTM_LAYERS,
                 },
             )
 
@@ -487,7 +530,6 @@ def main():
             print(f"Training: {len(pos_segs)} pos + "
                   f"{len(train_ds.negative_segments)} neg")
 
-        # Distributed sampler shards the dataset across ranks every epoch.
         train_sampler = DistributedSampler(
             train_ds, num_replicas=world_size, rank=rank,
             shuffle=True, seed=args.seed,
@@ -501,9 +543,6 @@ def main():
             collate_fn=collate_fn, pin_memory=True,
         )
 
-        # Validation: only rank 0 needs it; we evaluate event-level F1 on
-        # the full validation set so sharding it across ranks would just
-        # complicate the post-processing path.
         val_loader = None
         val_annotations = None
         file_start_dts = None
@@ -530,19 +569,16 @@ def main():
         spec_extractor = SpectrogramExtractor().to(device)
         model = WhaleVAD(num_classes=cfg.n_classes()).to(device)
 
-        # Dummy forward to materialize the lazy projection layer BEFORE
-        # wrapping in DDP — otherwise DDP would record a parameter set
-        # that excludes the lazy layer and complain when it appears.
+        # Materialize the lazy projection layer before DDP wrapping.
         with torch.no_grad():
             dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
             _ = model(spec_extractor(dummy))
 
-        # SyncBatchNorm: turn every BN into one that reduces statistics
-        # across DDP replicas. Critical when batch-per-GPU is small —
-        # otherwise each replica's BN running stats see only its local
-        # 32 samples and inject per-replica noise.
-        if world_size > 1:
+        use_sync_bn = (world_size > 1) and (not args.no_sync_bn)
+        if use_sync_bn:
             model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+
+        if world_size > 1:
             model = DDP(model, device_ids=[local_rank],
                         find_unused_parameters=False)
 
@@ -554,26 +590,17 @@ def main():
         # ------------------------------------------------------------------
         # Loss with frame-level pos_weight
         # ------------------------------------------------------------------
-        # Compute on the current (positives + negatives) set. Negatives
-        # will be resampled later but the weight ratios are stable enough
-        # across resamples that re-computing every epoch isn't needed —
-        # the dominant signal is the positive-class scarcity, which is
-        # fixed by the data.
         if is_main(rank):
             print("\nComputing frame-level pos_weight (canonical):")
         pos_weight = compute_pos_weights_framewise(
             train_ds.segments, verbose=is_main(rank),
         ).to(device)
-
-        # Broadcast to all ranks so every replica uses the exact same
-        # weight tensor (it depends on the negative sample, which differs
-        # by random state per rank).
         if world_size > 1:
             dist.broadcast(pos_weight, src=0)
         criterion = CanonicalWBCELoss(pos_weight=pos_weight).to(device)
 
         # ------------------------------------------------------------------
-        # Optimizer — fixed LR, no scheduler
+        # Optimizer + GradScaler (fp16 only)
         # ------------------------------------------------------------------
         optimizer = AdamW(
             model.parameters(),
@@ -581,12 +608,30 @@ def main():
             weight_decay=cfg.WEIGHT_DECAY,
             betas=(cfg.BETA1, cfg.BETA2),
         )
+
+        # bf16 has fp32's exponent range so it doesn't need scaling;
+        # fp32 obviously doesn't either. Only fp16 needs the scaler.
+        scaler = (torch.amp.GradScaler("cuda") if args.amp == "fp16"
+                  else None)
+
         if is_main(rank):
-            print(f"Optimizer: AdamW lr={lr:.0e} wd={cfg.WEIGHT_DECAY} "
-                  f"(no scheduler, no warmup)")
-            print(f"Effective batch: {args.batch_per_gpu * world_size} "
-                  f"({args.batch_per_gpu}/GPU × {world_size} GPUs)")
-            print(f"Epochs: {epochs} (no early stopping)\n")
+            print(f"\n{'=' * 60}")
+            print("Canonical recipe configuration")
+            print(f"{'=' * 60}")
+            print(f"  recipe:           {args.recipe}")
+            print(f"  loss:             pure weighted BCE (no focal)")
+            print(f"  pos_weight unit:  frame")
+            print(f"  lr:               {lr:.0e}  (fixed, no scheduler)")
+            print(f"  epochs:           {epochs}  (no early stopping)")
+            print(f"  batch/gpu:        {args.batch_per_gpu}")
+            print(f"  grad accum:       {args.grad_accum}")
+            print(f"  world size:       {world_size}")
+            print(f"  effective batch:  {effective_batch}")
+            print(f"  AMP:              {args.amp} "
+                  f"({'with scaler' if scaler else 'no scaler'})")
+            print(f"  SyncBatchNorm:    {use_sync_bn}")
+            print(f"  seed:             {args.seed}")
+            print(f"{'=' * 60}\n")
 
         # ------------------------------------------------------------------
         # Training loop
@@ -598,31 +643,21 @@ def main():
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
 
-            # Resample negatives (paper says every epoch). Rebuilding the
-            # sampler is required because train_ds.segments was replaced.
             if (epoch - 1) % args.resample_every == 0:
                 if is_main(rank):
                     print(f"\n[epoch {epoch}] resampling negatives")
-                # Only rank 0 actually draws negatives; all ranks rebuild
-                # the loader against the new segments. To keep ranks in
-                # sync we re-seed deterministically from (seed, epoch).
-                if is_main(rank):
-                    train_ds.resample_negatives()
-                # Sync: replace segments on every rank from rank 0's copy.
-                # The simplest portable approach is to have each rank do
-                # its own resample with the same seed.
                 seed_for_epoch = args.seed + epoch
                 import random
                 random.seed(seed_for_epoch)
                 np.random.seed(seed_for_epoch)
-                if not is_main(rank):
-                    train_ds.resample_negatives()
-                # Rebuild sampler + loader against the new segment list.
+                train_ds.resample_negatives()
+
                 train_sampler = DistributedSampler(
                     train_ds, num_replicas=world_size, rank=rank,
                     shuffle=True, seed=args.seed + epoch,
                 ) if world_size > 1 else None
-                train_sampler.set_epoch(epoch) if train_sampler else None
+                if train_sampler:
+                    train_sampler.set_epoch(epoch)
                 train_loader = DataLoader(
                     train_ds, batch_size=args.batch_per_gpu,
                     shuffle=(train_sampler is None),
@@ -640,14 +675,16 @@ def main():
                 model, spec_extractor, train_loader, criterion, optimizer,
                 device, epoch, rank, epochs,
                 audit_first_batch=(epoch == 1),
+                amp_dtype=amp_dtype, scaler=scaler,
+                grad_accum=args.grad_accum,
             )
 
-            # Validation on rank 0 only; other ranks wait at the barrier.
             if is_main(rank):
                 val = validate(
                     model.module if isinstance(model, DDP) else model,
                     spec_extractor, val_loader, criterion, device,
                     thresholds, val_annotations, file_start_dts,
+                    amp_dtype=amp_dtype,
                 )
                 thresholds = torch.tensor(val["thresholds"], device=device,
                                           dtype=torch.float32)
@@ -673,7 +710,6 @@ def main():
                         payload[f"val/threshold/{cname}"] = float(val["thresholds"][ci])
                     wandb.log(payload, step=epoch)
 
-                # Checkpointing — always unwrap DDP first.
                 model_state = (model.module.state_dict()
                                if isinstance(model, DDP)
                                else model.state_dict())
@@ -684,6 +720,9 @@ def main():
                     "thresholds":       thresholds.cpu(),
                     "recipe":           args.recipe,
                     "lr":               lr,
+                    "amp":              args.amp,
+                    "grad_accum":       args.grad_accum,
+                    "effective_batch":  effective_batch,
                     "seed":             args.seed,
                 }
                 torch.save(ckpt, run_dir / "latest_model.pt")
@@ -693,12 +732,11 @@ def main():
                     torch.save(ckpt, run_dir / "best_model.pt")
                     print(f"  *** New best F1: {best_f1:.3f}")
 
-            # Barrier so non-rank-0 workers don't race ahead.
             if dist.is_initialized():
                 dist.barrier()
 
         # ------------------------------------------------------------------
-        # Post-training threshold tuning + final checkpoint (rank 0 only)
+        # Post-training threshold tuning + final checkpoint (rank 0)
         # ------------------------------------------------------------------
         if is_main(rank):
             print(f"\n{'=' * 60}\nTuning thresholds on best model"
@@ -720,6 +758,9 @@ def main():
                 "best_f1":          best_f1,
                 "recipe":           args.recipe,
                 "lr":               lr,
+                "amp":              args.amp,
+                "grad_accum":       args.grad_accum,
+                "effective_batch":  effective_batch,
                 "seed":             args.seed,
             }, run_dir / "final_model.pt")
 
@@ -731,12 +772,12 @@ def main():
                 wandb.summary["best_f1"]          = float(best_f1)
                 wandb.summary["final_thresholds"] = list(map(float, tuned))
                 wandb.summary["epochs_run"]       = epochs
-                wandb.summary["effective_batch"]  = args.batch_per_gpu * world_size
+                wandb.summary["effective_batch"]  = effective_batch
+                wandb.summary["amp"]              = args.amp
                 wandb.summary["verdict"] = (
                     f"Canonical (WBCE-only, fixed LR={lr:.0e}, "
-                    f"{epochs} epochs, effective batch "
-                    f"{args.batch_per_gpu * world_size}) finished at "
-                    f"F1 {best_f1:.3f}."
+                    f"{epochs} epochs, effective batch {effective_batch}, "
+                    f"AMP={args.amp}) → F1 {best_f1:.3f}."
                 )
                 art = wandb.Artifact(
                     f"canonical-{run.name}", type="model",
@@ -746,6 +787,8 @@ def main():
                         "lr":       float(lr),
                         "seed":     int(args.seed),
                         "epochs":   int(epochs),
+                        "amp":      args.amp,
+                        "effective_batch": int(effective_batch),
                     },
                 )
                 art.add_file(str(run_dir / "best_model.pt"))
