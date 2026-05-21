@@ -123,6 +123,44 @@ AMP_DTYPES = {
 
 
 # ======================================================================
+# Recipe / batch sanity check
+# ======================================================================
+# The email gives us two validated operating points, not a continuous
+# scaling law. These thresholds bracket "obviously wrong" combinations
+# of recipe and effective batch size — between them is an underspecified
+# middle ground that the email does not cover. The warnings nudge but do
+# not block; pass --lr to override the recipe LR explicitly if you know
+# what you're doing.
+
+PAPER_MIN_EFFECTIVE_BATCH = 128    # below this, "very large batch" is a stretch
+DESKTOP_MAX_EFFECTIVE_BATCH = 64   # above this, the desktop LR is likely too aggressive
+
+
+def warn_if_recipe_batch_mismatch(
+    recipe: str, effective_batch: int, lr: float, lr_overridden: bool,
+) -> None:
+    """Print a startup warning if the recipe / effective_batch combo is suspect."""
+    if lr_overridden:
+        # User explicitly chose an LR; assume they know what they want.
+        return
+    if recipe == "paper" and effective_batch < PAPER_MIN_EFFECTIVE_BATCH:
+        print("*** WARNING: --recipe paper sets lr=1e-5, which Christiaan "
+              "validated only with 'very large' batches.")
+        print(f"    Your effective batch is {effective_batch}, "
+              f"below the heuristic floor of {PAPER_MIN_EFFECTIVE_BATCH}.")
+        print("    Consider --recipe desktop (lr=1e-3) for small-batch "
+              "regimes, or pass --lr explicitly if you've validated a "
+              "middle ground yourself.\n")
+    elif recipe == "desktop" and effective_batch > DESKTOP_MAX_EFFECTIVE_BATCH:
+        print("*** WARNING: --recipe desktop sets lr=1e-3, which Christiaan "
+              "validated only on 'smaller batches'.")
+        print(f"    Your effective batch is {effective_batch}, "
+              f"above the heuristic ceiling of {DESKTOP_MAX_EFFECTIVE_BATCH}.")
+        print("    Consider --recipe paper (lr=1e-5) for large-batch "
+              "regimes, or pass --lr explicitly.\n")
+
+
+# ======================================================================
 # DDP plumbing
 # ======================================================================
 
@@ -462,6 +500,16 @@ def main():
         wbu.seed_everything(args.seed, deterministic=False)
 
         effective_batch = args.batch_per_gpu * world_size * args.grad_accum
+
+        # Heuristic warning if recipe and effective batch look mismatched.
+        # The email validates two endpoints (paper: 1e-5 with very large
+        # batch; desktop: 1e-3 with smaller batch). The space between is
+        # underspecified — flag it loudly so users can decide consciously.
+        if is_main(rank):
+            warn_if_recipe_batch_mismatch(
+                args.recipe, effective_batch, lr,
+                lr_overridden=(args.lr is not None),
+            )
 
         # ------------------------------------------------------------------
         # Wandb (rank 0 only)
