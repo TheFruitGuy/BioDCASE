@@ -238,6 +238,14 @@ def parse_args():
     p.add_argument("--num-workers", type=int, default=cfg.NUM_WORKERS,
                    help="DataLoader worker processes per rank.")
 
+    # Class-mode override
+    p.add_argument("--classes", type=int, choices=[3, 7], default=None,
+                   help="Override cfg.USE_3CLASS. 3 = train 3-class directly "
+                        "(easier, what cfg.USE_3CLASS=True does); 7 = train "
+                        "on the full fine-grained label set then collapse to "
+                        "3 at evaluation (matches the official Geldenhuys "
+                        "checkpoint canonically). If unset, uses cfg.USE_3CLASS.")
+
     # Bookkeeping
     p.add_argument("--output-dir", type=str, default=None,
                    help="Output directory. Defaults to "
@@ -527,6 +535,28 @@ def main():
     epochs = args.epochs if args.epochs is not None else recipe["epochs"]
     amp_dtype = AMP_DTYPES[args.amp]
 
+    # Class-mode override. Must happen BEFORE any code that reads
+    # ``cfg.USE_3CLASS``, ``cfg.n_classes()``, or ``cfg.class_to_idx()`` —
+    # which includes WhaleDataset's __getitem__ (chooses label_3class vs
+    # label), the model's output head (sized via cfg.n_classes()), our
+    # frame-level pos_weight helper, and postprocess.collapse_probs_to_3class
+    # (which is a no-op when USE_3CLASS=True but does real work when False).
+    # Mutating cfg here makes all of them consistent for the run.
+    if args.classes is not None:
+        new_value = (args.classes == 3)
+        if new_value != cfg.USE_3CLASS:
+            print(f"*** OVERRIDE: setting cfg.USE_3CLASS = {new_value} "
+                  f"(was {cfg.USE_3CLASS}). Training on {args.classes} "
+                  f"classes.")
+            if args.classes == 7:
+                print("    7-class training matches the official Geldenhuys "
+                      "checkpoint. Eval will collapse 7→3 via "
+                      "collapse_probs_to_3class for F1 scoring.")
+            cfg.USE_3CLASS = new_value
+        else:
+            print(f"--classes {args.classes} matches cfg.USE_3CLASS "
+                  f"({cfg.USE_3CLASS}); no override applied.")
+
     # Warn early if bf16 is requested on hardware that doesn't support it.
     if args.amp == "bf16" and torch.cuda.is_available():
         if not torch.cuda.is_bf16_supported():
@@ -558,7 +588,8 @@ def main():
                 "canonical",
                 extra_tags=["wbce_only", "fixed_lr", "ddp",
                             f"recipe_{args.recipe}", f"seed_{args.seed}",
-                            f"amp_{args.amp}"],
+                            f"amp_{args.amp}",
+                            f"classes_{cfg.n_classes()}"],
                 config={
                     "recipe":           args.recipe,
                     "lr":               lr,
@@ -576,6 +607,7 @@ def main():
                     "resample_every":   args.resample_every,
                     "use_3class":       cfg.USE_3CLASS,
                     "n_classes":        cfg.n_classes(),
+                    "classes_overridden": args.classes is not None,
                     "lstm_hidden":      cfg.LSTM_HIDDEN,
                     "lstm_layers":      cfg.LSTM_LAYERS,
                 },
@@ -707,6 +739,8 @@ def main():
             print(f"  recipe:           {args.recipe}")
             print(f"  loss:             pure weighted BCE (no focal)")
             print(f"  pos_weight unit:  frame")
+            print(f"  classes:          {cfg.n_classes()}  "
+                  f"({'3-class direct' if cfg.USE_3CLASS else '7-class with eval collapse'})")
             print(f"  lr:               {lr:.0e}  (fixed, no scheduler)")
             print(f"  epochs:           {epochs}  (no early stopping)")
             print(f"  batch/gpu:        {args.batch_per_gpu}")
