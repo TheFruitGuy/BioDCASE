@@ -466,6 +466,29 @@ PHASE_REGISTRY: dict[str, dict] = {
             "per_epoch_threshold_tuning",
         ],
     ),
+    "canonical": dict(
+            parent=None,
+            hypothesis=("Email-corrected reproduction recipe per Geldenhuys "
+                        "2026-05-21. Strips the focal-on-WBCE stacking bug "
+                        "in train.py and reverts to the actual published "
+                        "recipe: pure weighted BCE (no focal), frame-level "
+                        "pos_weight (not file-level), fixed LR 1e-5, no "
+                        "scheduler, no warmup, ~20 epochs, no early stopping, "
+                        "DDP + SyncBatchNorm for multi-GPU, padding-mask "
+                        "audited on first batch. Target: published F1=0.443 "
+                        "with the canonical recipe rather than the "
+                        "focal-on-WBCE deviation that reproduced at 0.469."),
+            interventions=[
+                "wbce_only",
+                "frame_level_pos_weight",
+                "fixed_lr",
+                "no_scheduler",
+                "ddp_sync_bn",
+                "padding_mask_audited",
+                "no_bb_head",
+                "no_early_stopping",
+            ],
+        ),
 }
 
 
