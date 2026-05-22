@@ -12,6 +12,14 @@ Useful when the same checkpoints appear in multiple ensemble combinations
 
 Optional FP16 autocast for ~1.5–2× speedup on the inference pass when
 GPUs are free.
+
+Variable evaluation segment length
+----------------------------------
+``--segment-s`` (default 30s) controls the tile length used for
+validation. Different lengths produce different probability tensors, so
+each cache file is keyed by ``(checkpoint, segment_s)``. 30s keeps the
+legacy filename for backward compatibility; other lengths get a
+``_seg<N>`` suffix.
 """
 
 from __future__ import annotations
@@ -53,12 +61,25 @@ def parse_args():
                    help="FP16 autocast during inference. ~1.5–2× speedup, "
                         "negligible accuracy hit (<0.001 F1 typically).")
     p.add_argument("--batch_size", type=int, default=cfg.BATCH_SIZE)
+    p.add_argument("--segment-s", type=float, default=cfg.EVAL_SEGMENT_S,
+                   help="Evaluation tile length in seconds. Cache files "
+                        "are keyed by this so different lengths don't "
+                        "collide. 30s keeps the legacy filename.")
+    p.add_argument("--overlap-s", type=float, default=cfg.EVAL_OVERLAP_S,
+                   help="Overlap between consecutive tiles in seconds.")
     return p.parse_args()
 
 
-def cache_path_for(ckpt_path: Path, cache_dir: Path) -> Path:
-    """One pickle per source checkpoint, keyed by parent dir name."""
-    return cache_dir / f"{ckpt_path.parent.name}_probs.pkl"
+def cache_path_for(ckpt_path: Path, cache_dir: Path,
+                   segment_s: float = 30.0) -> Path:
+    """One pickle per (checkpoint, segment_length) pair.
+
+    30s keeps the legacy name (no suffix) so existing caches remain
+    reusable. Other lengths get a ``_seg<N>`` suffix so they don't
+    collide with the 30s cache or with each other.
+    """
+    seg_tag = "" if abs(segment_s - 30.0) < 1e-6 else f"_seg{int(segment_s)}"
+    return cache_dir / f"{ckpt_path.parent.name}{seg_tag}_probs.pkl"
 
 
 def load_cached_probs(path: Path):
@@ -78,9 +99,14 @@ def save_probs_to_cache(probs, path: Path):
 
 @torch.no_grad()
 def get_or_compute_probs(ckpt_path, spec_extractor, val_loader, device,
-                         cache_dir, no_cache=False, use_fp16=False):
-    """Cache hit → load pickle. Cache miss → run inference, save, return."""
-    cp = cache_path_for(Path(ckpt_path), cache_dir)
+                         cache_dir, no_cache=False, use_fp16=False,
+                         segment_s=30.0):
+    """Cache hit → load pickle. Cache miss → run inference, save, return.
+
+    ``segment_s`` is used both to pick the cache filename and to size the
+    dummy input that materialises the lazy CNN projection layer.
+    """
+    cp = cache_path_for(Path(ckpt_path), cache_dir, segment_s=segment_s)
     if not no_cache and cp.exists():
         print(f"  cache hit: {cp.name}")
         return load_cached_probs(cp)
@@ -93,7 +119,7 @@ def get_or_compute_probs(ckpt_path, spec_extractor, val_loader, device,
 
     # Materialize lazy projection layer before load_state_dict.
     with torch.no_grad():
-        dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
+        dummy = torch.randn(1, int(cfg.SAMPLE_RATE * segment_s), device=device)
         _ = model(spec_extractor(dummy))
     model.load_state_dict(ckpt["model_state_dict"], strict=False)
     model.eval()
@@ -148,17 +174,22 @@ def main():
     cache_dir = Path(args.cache_dir)
     print(f"Cache dir: {cache_dir} (no_cache={args.no_cache}, "
           f"use_fp16={args.use_fp16})")
+    print(f"Eval tiles: {args.segment_s:.0f}s segments, "
+          f"{args.overlap_s:.1f}s overlap")
 
     # Validation loader is shared across all checkpoints.
     print("\nLoading validation data...")
     val_anns = load_annotations(cfg.VAL_DATASETS)
     val_manifest = get_file_manifest(cfg.VAL_DATASETS)
-    val_segs = build_val_segments(val_manifest, val_anns)
+    val_segs = build_val_segments(val_manifest, val_anns,
+                                  segment_s=args.segment_s,
+                                  overlap_s=args.overlap_s)
     val_loader = DataLoader(
         WhaleDataset(val_segs), batch_size=args.batch_size, shuffle=False,
         num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
     )
-    print(f"  {len(val_segs)} 30s tiles")
+    print(f"  {len(val_segs)} {args.segment_s:.0f}s tiles "
+          f"({args.overlap_s:.1f}s overlap)")
 
     file_start_dts = {
         (r["dataset"], r["filename"]): r["start_dt"]
@@ -186,7 +217,8 @@ def main():
         print(f"\n[{i+1}/{len(args.checkpoints)}] {ckpt_path}")
         probs = get_or_compute_probs(
             ckpt_path, spec_extractor, val_loader, device,
-            cache_dir, no_cache=args.no_cache, use_fp16=args.use_fp16)
+            cache_dir, no_cache=args.no_cache, use_fp16=args.use_fp16,
+            segment_s=args.segment_s)
         all_prob_dicts.append(probs)
 
         if args.per_model_eval:
