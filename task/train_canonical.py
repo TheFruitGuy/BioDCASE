@@ -454,6 +454,14 @@ def validate(model, spec, loader, criterion, device,
         np.concatenate([np.arange(0.05, 0.5, 0.05),
                         np.arange(0.5, 0.85, 0.10)]),
     ]
+    # Threshold sweep has two nested loops (3 classes × ~14 grid points each
+    # = ~42 iterations). Each calls postprocess_predictions + compute_metrics
+    # over the whole val set, so the wall-clock can be a few minutes once the
+    # model starts predicting positives. Surface progress so the user knows
+    # it's not hung.
+    total_iters = sum(len(g) for g in grids)
+    sweep_pbar = tqdm(total=total_iters, desc="Tuning thresholds",
+                      leave=False)
     for c, name in enumerate(cfg.CALL_TYPES_3):
         best_f1, best_t = -1.0, used[c]
         for t in grids[c]:
@@ -464,11 +472,28 @@ def validate(model, spec, loader, criterion, device,
             f1 = m.get(name, {}).get("f1", 0.0)
             if f1 > best_f1:
                 best_f1, best_t = f1, t
+            sweep_pbar.update(1)
+            sweep_pbar.set_postfix(cls=name, t=f"{t:.2f}",
+                                   best_f1=f"{best_f1:.3f}")
         used[c] = best_t
+    sweep_pbar.close()
 
     pred_events = postprocess_predictions(all_probs, used)
     metrics = compute_metrics(pred_events, gt_events, iou_threshold=0.3)
     overall_f1 = metrics.get("overall", {}).get("f1", 0.0)
+
+    # BioDCASE scores on **macro F1** (mean of per-class F1s), not micro.
+    # The "overall" entry returned by compute_metrics is computed from
+    # total TP/FP/FN across classes which is the micro number — useful
+    # but not the official metric. Compute macro explicitly and treat it
+    # as the headline.
+    per_class_f1s = []
+    for cname in cfg.CALL_TYPES_3:
+        m = metrics.get(cname)
+        if m is not None:
+            per_class_f1s.append(m.get("f1", 0.0))
+    macro_f1 = (sum(per_class_f1s) / len(per_class_f1s)
+                if per_class_f1s else 0.0)
 
     print(f"\n  Event-level F1 (tuned thresholds):")
     for c, name in enumerate(cfg.CALL_TYPES_3):
@@ -478,12 +503,15 @@ def validate(model, spec, loader, criterion, device,
         print(f"    {name.upper():6} t={used[c]:.2f}  "
               f"TP={m['tp']:5} FP={m['fp']:6} FN={m['fn']:6}  "
               f"P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}")
-    print(f"    OVERALL F1={overall_f1:.3f}")
+    print(f"    MACRO F1   ={macro_f1:.3f}  (official BioDCASE metric)")
+    print(f"    OVERALL F1 ={overall_f1:.3f}  (micro — TP/FP/FN summed)")
 
     return {
-        "loss": total_loss / max(nb, 1),
-        "mean_f1": overall_f1,
-        "per_class": metrics,
+        "loss":       total_loss / max(nb, 1),
+        "mean_f1":    macro_f1,    # headline for best-model tracking (= macro)
+        "macro_f1":   macro_f1,
+        "overall_f1": overall_f1,
+        "per_class":  metrics,
         "thresholds": used.tolist(),
     }
 
@@ -748,17 +776,19 @@ def main():
                                           dtype=torch.float32)
                 print(f"\n  Train loss: {train_loss:.4f}  "
                       f"Val loss: {val['loss']:.4f}")
-                print(f"  Mean F1: {val['mean_f1']:.3f}  "
-                      f"Best F1: {best_f1:.3f}")
+                print(f"  Macro F1: {val['macro_f1']:.3f}  "
+                      f"(Overall/micro: {val['overall_f1']:.3f})  "
+                      f"Best Macro F1: {best_f1:.3f}")
 
                 if run is not None:
                     import wandb
                     payload = {
-                        "epoch":         epoch,
-                        "lr":            optimizer.param_groups[0]["lr"],
-                        "train/loss":    train_loss,
-                        "val/loss":      val["loss"],
-                        "val/f1_macro":  val["mean_f1"],
+                        "epoch":          epoch,
+                        "lr":             optimizer.param_groups[0]["lr"],
+                        "train/loss":     train_loss,
+                        "val/loss":       val["loss"],
+                        "val/f1_macro":   val["macro_f1"],    # BioDCASE metric
+                        "val/f1_overall": val["overall_f1"],  # micro, for reference
                     }
                     for ci, cname in enumerate(cfg.CALL_TYPES_3):
                         pc = val["per_class"].get(cname, {})
@@ -799,16 +829,22 @@ def main():
         if is_main(rank):
             print(f"\n{'=' * 60}\nTuning thresholds on best model"
                   f"\n{'=' * 60}")
+            print("(This runs a finer-grained sweep over the full val set "
+                  "and can take several minutes — no progress bar from the "
+                  "external tuner, so be patient.)")
             best_ckpt = torch.load(run_dir / "best_model.pt",
                                    map_location=device, weights_only=False)
             base_model = (model.module if isinstance(model, DDP) else model)
             base_model.load_state_dict(best_ckpt["model_state_dict"])
 
+            tune_start = time.time()
             tuned = tune_thresholds_event_level(
                 base_model, spec_extractor, val_loader, device,
                 val_annotations, file_start_dts,
             )
-            print(f"Tuned thresholds: {tuned.tolist()}")
+            tune_elapsed = time.time() - tune_start
+            print(f"Tuned thresholds: {tuned.tolist()} "
+                  f"(took {tune_elapsed:.1f}s)")
 
             torch.save({
                 "model_state_dict": base_model.state_dict(),
@@ -822,12 +858,12 @@ def main():
                 "seed":             args.seed,
             }, run_dir / "final_model.pt")
 
-            print(f"\nDone. Best F1 (default thresholds): {best_f1:.3f}")
+            print(f"\nDone. Best Macro F1 (BioDCASE official): {best_f1:.3f}")
             print(f"Run dir: {run_dir}")
 
             if run is not None:
                 import wandb
-                wandb.summary["best_f1"]          = float(best_f1)
+                wandb.summary["best_f1_macro"]    = float(best_f1)
                 wandb.summary["final_thresholds"] = list(map(float, tuned))
                 wandb.summary["epochs_run"]       = epochs
                 wandb.summary["effective_batch"]  = effective_batch
@@ -835,7 +871,7 @@ def main():
                 wandb.summary["verdict"] = (
                     f"Canonical (WBCE-only, fixed LR={lr:.0e}, "
                     f"{epochs} epochs, effective batch {effective_batch}, "
-                    f"AMP={args.amp}) → F1 {best_f1:.3f}."
+                    f"AMP={args.amp}) → Macro F1 {best_f1:.3f}."
                 )
                 art = wandb.Artifact(
                     f"canonical-{run.name}", type="model",
