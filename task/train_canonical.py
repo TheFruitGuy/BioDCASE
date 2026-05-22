@@ -76,6 +76,7 @@ import argparse
 import os
 import time
 from contextlib import nullcontext
+from datetime import timedelta
 from pathlib import Path
 
 import numpy as np
@@ -175,7 +176,16 @@ def ddp_setup() -> tuple[int, int, int, torch.device]:
     world_size = int(os.environ["WORLD_SIZE"])
 
     backend = "nccl" if torch.cuda.is_available() else "gloo"
-    dist.init_process_group(backend=backend, init_method="env://")
+    # Default NCCL watchdog timeout is 10 min, which is too short here: only
+    # rank 0 runs validation while ranks 1+ wait at dist.barrier(). With ~80k
+    # val segments and per-class threshold sweeping that grows as the model
+    # learns to predict positives, validation can take >10 min. Bump the
+    # process-group timeout to 60 min so the barrier survives.
+    dist.init_process_group(
+        backend=backend,
+        init_method="env://",
+        timeout=timedelta(minutes=60),
+    )
     torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}")
 
