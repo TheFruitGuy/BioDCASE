@@ -52,7 +52,7 @@ def compute_pos_weights_framewise(
     n_classes: int | None = None,
     frame_stride_s: float | None = None,
     sample_rate: int | None = None,
-    normalize_min_to_one: bool = True,
+    normalize_min_to_one: bool = False,
     verbose: bool = True,
 ) -> torch.Tensor:
     """
