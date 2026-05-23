@@ -84,7 +84,7 @@ from train_phase_hnm import (
     HnmTrainingDataset,
     logits_bce_focal_loss,
 )
-from train_phase0e import PHASE0E_SEGMENT_S
+from segment_length_core import PHASE0E_SEGMENT_S
 
 from ssl_dataset import build_pretrain_manifest, SSLClipDataset, collate_ssl
 from mean_teacher_core import (
@@ -465,7 +465,7 @@ def main():
     pos_segs = build_positive_segments(train_anns, train_manifest)
 
     # Extend positives to fixed 30s (same as HNM_D pipeline)
-    from train_phase0e import extend_segment_to_fixed_length
+    from segment_length_core import extend_segment_to_fixed_length
     manifest_idx = train_manifest.set_index(["dataset", "filename"])
     pos_segs = [
         extend_segment_to_fixed_length(
