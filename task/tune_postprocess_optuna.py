@@ -3,80 +3,96 @@ Per-Class Post-Processing Tuner (Optuna)
 ========================================
 
 Optuna search over the per-class post-processing hyperparameter space
-defined in Geldenhuys et al. (arXiv:2510.21280v2) Table IV. Computes the
-validation probabilities once per checkpoint (auto-detecting baseline
-``WhaleVAD`` vs ``WhaleVADBPN``), combines them, then runs N trials over
-the cached probabilities — each trial is just CPU post-processing, no
-GPU.
+defined in Geldenhuys et al. (arXiv:2510.21280v2) Table IV. Reuses the
+per-checkpoint probability cache built by ``ensemble_predict_cached.py``
+— same cache file naming (``<run_dir>{_segN}_probs.pkl``), same
+already-3-class probs on disk. With caches hit, this script is fully
+CPU-bound: each trial is just postprocess + scoring.
 
 The objective is **macro F1** (mean of per-class event-level F1 at IoU
-0.3), matching the metric you've been comparing against the 0.516 macro.
-The script prints the per-class breakdown for the best trial and writes
-the result to a JSON file that ``inference.py`` will auto-load on the
-next run.
+0.3) — the BioDCASE Task 2 official metric. The script prints the
+per-class breakdown for the best trial and writes the result to a JSON
+file that ``inference.py`` will auto-load on the next run.
 
-Three combination modes
------------------------
+Four combination modes
+----------------------
 1. **Single checkpoint**: ``--checkpoint X.pt`` — tune for one model.
 
 2. **Plain ensemble**: ``--checkpoints A B C [...] [--weights w1 w2 w3 ...]``
    — weighted average across all classes.
 
-3. **Hybrid ensemble** (matches ``hybrid_ensemble_predict.py``):
+3. **Hybrid (single-D-source)** — preserved from the BPN workflow:
    ``--checkpoints A B C D --weights 1 1 1 2 --d-from 3``
-   — BMABZ and BP averaged across all models with the given weights,
-   D-class taken ONLY from the model at index ``--d-from``. This is the
-   combination the user has been validating with at macro 0.516; tuning
-   on top of it adds class-dependent post-processing.
+   BMABZ + BP averaged across all models, D taken ONLY from the model
+   at index ``--d-from``. Matches ``hybrid_ensemble_predict.py``.
 
-Baseline enqueue
-----------------
-Before the TPE search starts, trial 0 is hard-coded to the per-class
-coordinate-descent threshold-only configuration (paper "baseline-
-postprocess" condition). This guarantees the search cannot return a
-config worse than the threshold-only macro F1 — Optuna remembers trial 0
-and ``best_trial`` is at least that good.
+4. **Per-class hybrid (weight vectors)** — for the PGI/AMSE split that
+   reached macro 0.490 in ``ensemble_predict_cached.py``:
+   ``--weights-bmabz w1...wN --weights-d w1...wN --weights-bp w1...wN``
+   One weight per checkpoint per class; ``0`` excludes a checkpoint
+   from that class. Vectors are normalized per row. Mutually exclusive
+   with ``--weights`` and ``--d-from``.
 
 Examples
 --------
-Hybrid ensemble (replicates the validated 4-model setup)::
+Per-class hybrid at 60s tiles (PGI for BMABZ+BP, AMSE MT for D)::
+
+    python tune_postprocess_optuna.py --use-fp16 --segment-s 60 \\
+        --checkpoints \\
+            runs/hnm_pgi_whalevad_<s1>/best_model.pt \\
+            ... 4 more PGI ckpts ... \\
+            runs/mt_hnm_pgi_amse_whalevad_<s1>/best_model.pt \\
+            ... 4 more AMSE ckpts ... \\
+        --weights-bmabz 1 1 1 1 1  0 0 0 0 0 \\
+        --weights-d     0 0 0 0 0  1 1 1 1 1 \\
+        --weights-bp    1 1 1 1 1  0 0 0 0 0 \\
+        --n-trials 500 --per-model-eval
+
+BPN-style hybrid (single D source)::
 
     CUDA_VISIBLE_DEVICES=1 python tune_postprocess_optuna.py \\
-        --checkpoints \\
-            runs/whalevad_20260504_152450/best_model.pt \\
-            runs/phase5_20260506_204358/best_model.pt \\
-            runs/whalevad_20260507_191223/best_model.pt \\
-            runs/phase5_20260507_211504/best_model.pt \\
-        --weights 1 1 1 2 \\
-        --d-from 3 \\
-        --n-trials 500 \\
-        --per-model-eval
+        --checkpoints A.pt B.pt C.pt D.pt \\
+        --weights 1 1 1 2 --d-from 3 \\
+        --n-trials 500 --per-model-eval
 
 Single checkpoint::
 
     python tune_postprocess_optuna.py \\
         --checkpoint runs/whalevad_XXXX/best_model.pt --n-trials 300
 
+Cache reuse
+-----------
+``--segment-s`` (default ``cfg.EVAL_SEGMENT_S``) and ``--cache-dir``
+(default ``runs/prob_cache``) must match what ``ensemble_predict_cached.py``
+used to build the cache. With matching values, cache hits load the
+already-3-class probs from disk in milliseconds; cache misses run
+inference once and write to the same cache that the predictor will
+reuse later. ``--no-cache`` forces full recomputation.
+
 The output path defaults to ``cfg.POSTPROCESS_CONFIG_PATH`` declared in
-``config.py``, so passing ``--output`` is only needed if you want to
-keep multiple tuned configs around.
+``config.py``; pass ``--output`` only to keep multiple tuned configs.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import time
 import warnings
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import torch
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 import config as cfg
 from spectrogram import SpectrogramExtractor
-from dataset import build_dataloaders, load_annotations, get_file_manifest
+from dataset import (
+    WhaleDataset, build_val_segments, collate_fn,
+    get_file_manifest, load_annotations,
+)
 from postprocess import (
     Detection, compute_metrics, postprocess_predictions,
     collapse_probs_to_3class,
@@ -93,13 +109,23 @@ from postprocess_per_class import (
     SEARCH_THRESHOLD_RANGE,
 )
 
-# Reuse the BPN-aware helpers and the per-class hybrid combiner from the
+# Reuse the BPN-aware helpers and the single-D-source combiner from the
 # hybrid ensemble script, so this tuner sees exactly the same probability
 # stream that the inference path produces.
 from hybrid_ensemble_predict import (
     build_model_for_ckpt,
     predict_probabilities,
     hybrid_combine,
+)
+
+# Reuse the on-disk cache contract from ensemble_predict_cached.py.
+# Same filename scheme (``<run_dir>{_segN}_probs.pkl``), same float16
+# storage, same 3-class semantics on disk — so caches built by the
+# predictor are readable here and vice versa.
+from ensemble_predict_cached import (
+    cache_path_for,
+    load_cached_probs,
+    save_probs_to_cache,
 )
 
 try:
@@ -115,31 +141,50 @@ CLASS_NAMES = list(cfg.CALL_TYPES_3)
 
 
 # ======================================================================
-# Probability collection (BPN-aware, mirrors hybrid_ensemble_predict.py)
+# Probability collection: cache-aware, BPN-aware
 # ======================================================================
 
 @torch.no_grad()
-def collect_probs_for_ckpt(
+def get_or_compute_probs(
     ckpt_path: str,
     spec_extractor: SpectrogramExtractor,
-    val_loader,
+    val_loader_fn,
     device: torch.device,
+    cache_dir: Path,
+    segment_s: float = 30.0,
+    no_cache: bool = False,
+    use_fp16: bool = False,
 ) -> dict[tuple, np.ndarray]:
     """
-    Load any checkpoint type (WhaleVAD baseline or WhaleVADBPN) and run
-    inference on the full val loader.
+    Cache hit → load pickle. Cache miss → run inference, save, return.
 
-    Same logic as ``hybrid_ensemble_predict.main``: detect type, init
-    lazy ``feat_proj`` via dummy forward, ``load_state_dict(strict=False)``
-    so BPN/non-BPN keys can be tolerated, and return a dict keyed by
-    ``(dataset, filename, start_sample)``.
+    Cache contract mirrors ``ensemble_predict_cached.py``: pickles store
+    already-3-class probs in float16, keyed by ``(checkpoint, segment_s)``
+    via :func:`cache_path_for`. 30s segments keep the legacy filename
+    (no suffix); other lengths get ``_segN``.
+
+    ``val_loader_fn`` is a zero-arg callable that returns the DataLoader.
+    Deferred construction means cache-only runs never pay the manifest
+    scan cost.
     """
+    cp = cache_path_for(Path(ckpt_path), cache_dir, segment_s=segment_s)
+    if not no_cache and cp.exists():
+        print(f"  cache hit: {cp.name}")
+        return load_cached_probs(cp)
+
+    print(f"  cache miss, running inference...")
+    t0 = time.time()
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     model, model_type = build_model_for_ckpt(ckpt, device)
-    print(f"  type: {model_type}")
+    print(f"    type: {model_type}")
 
+    # Materialize lazy projection layer before load_state_dict — sized
+    # to the eval tile length so the cached CNN+BiLSTM matches what the
+    # predictor will produce.
     with torch.no_grad():
-        dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
+        dummy = torch.randn(
+            1, int(cfg.SAMPLE_RATE * segment_s), device=device,
+        )
         _ = model(spec_extractor(dummy))
 
     missing, unexpected = model.load_state_dict(
@@ -153,10 +198,25 @@ def collect_probs_for_ckpt(
         if non_bpn_missing:
             print(f"  WARNING ({Path(ckpt_path).name}): missing non-BPN "
                   f"keys: {len(non_bpn_missing)}")
+    model.eval()
 
-    probs = predict_probabilities(
-        model, model_type, spec_extractor, val_loader, device,
-    )
+    val_loader = val_loader_fn()
+    if use_fp16 and device.type == "cuda":
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            probs = predict_probabilities(
+                model, model_type, spec_extractor, val_loader, device,
+            )
+    else:
+        probs = predict_probabilities(
+            model, model_type, spec_extractor, val_loader, device,
+        )
+    probs = collapse_probs_to_3class(probs)
+
+    print(f"    computed in {time.time()-t0:.0f}s, "
+          f"{len(probs)} segment prob arrays")
+    if not no_cache:
+        save_probs_to_cache(probs, cp)
+        print(f"    cached → {cp}")
 
     del model
     if torch.cuda.is_available():
@@ -197,6 +257,66 @@ def average_prob_dicts(
     return out
 
 
+def average_prob_dicts_per_class(
+    prob_dicts: list[dict[tuple, np.ndarray]],
+    weights_per_class: np.ndarray,
+) -> dict[tuple, np.ndarray]:
+    """
+    Per-class weighted average — the combiner behind the new
+    ``--weights-bmabz/-d/-bp`` flags.
+
+    Parameters
+    ----------
+    prob_dicts : list of dict[key -> ndarray (T, C)]
+        One dict per checkpoint. Caches from ``ensemble_predict_cached``
+        store already-3-class probs, so C = 3 in normal use.
+    weights_per_class : ndarray of shape ``(n_classes, n_models)``
+        Row c is the (already-normalized) weight vector across models
+        for class c. Each row should sum to 1; rows that sum to zero
+        are caught upstream.
+
+    Returns
+    -------
+    dict mapping each common key to ``(T, C)`` ndarray with
+    ``out[:, c] = sum_m weights_per_class[c, m] * prob_dicts[m][:, c]``,
+    truncated to the shortest T across models.
+
+    A zero weight excludes a model from that class entirely — this is
+    the mechanism for "PGI ensemble for BMABZ + BP, AMSE MT ensemble
+    for D" and similar per-class hybrids.
+    """
+    if not prob_dicts:
+        return {}
+    n_models = len(prob_dicts)
+    n_classes = weights_per_class.shape[0]
+    assert weights_per_class.shape == (n_classes, n_models), (
+        f"weights_per_class shape {weights_per_class.shape} does not "
+        f"match (n_classes={n_classes}, n_models={n_models})"
+    )
+
+    common_keys = set(prob_dicts[0].keys())
+    for d in prob_dicts[1:]:
+        common_keys &= set(d.keys())
+    n_dropped = len(prob_dicts[0]) - len(common_keys)
+    if n_dropped > 0:
+        print(f"  WARNING: {n_dropped} keys missing from at least one "
+              f"model; dropping them from the per-class ensemble.")
+
+    # Broadcasting shape: (M, 1, C) against stacked (M, T, C) → (M, T, C).
+    w_bc = weights_per_class.T[:, None, :].astype(np.float32)
+
+    out: dict[tuple, np.ndarray] = {}
+    for key in common_keys:
+        arrs = [d[key] for d in prob_dicts]
+        min_T = min(a.shape[0] for a in arrs)
+        stacked = np.stack(
+            [a[:min_T, :n_classes].astype(np.float32) for a in arrs],
+            axis=0,
+        )  # (M, T, C)
+        out[key] = (stacked * w_bc).sum(axis=0)  # (T, C)
+    return out
+
+
 def build_gt_events(val_annotations, file_start_dts) -> list[Detection]:
     """Build the 3-class ground-truth event list for evaluation."""
     gt: list[Detection] = []
@@ -229,43 +349,25 @@ def macro_f1(metrics: dict[str, dict[str, float]]) -> float:
 
 
 # ======================================================================
-# Coordinate-descent threshold tune (configurable step)
+# Per-model individual scoring (parity with --per-model-eval in hybrid)
 # ======================================================================
-
-def _build_cd_grid(step: float) -> list[np.ndarray]:
-    """
-    Build the per-class coordinate-descent threshold grids. BMABZ uses
-    [0.20, 0.85]; D and BP use a finer grid below 0.5 (where rare-class
-    optima tend to sit) and a coarser grid above. Granularity is set by
-    ``step`` — the BMABZ step is the input value; D/BP use ``step``
-    below 0.5 and ``2 * step`` above 0.5 (matches the structure used
-    elsewhere in the pipeline).
-    """
-    s = float(step)
-    coarse = max(s * 2, 0.05)
-    return [
-        np.arange(0.20, 0.85, s),                                       # bmabz
-        np.concatenate([np.arange(0.05, 0.5, s),
-                        np.arange(0.5, 0.85, coarse)]),                 # d
-        np.concatenate([np.arange(0.05, 0.5, s),
-                        np.arange(0.5, 0.85, coarse)]),                 # bp
-    ]
-
 
 def quick_per_class_threshold_tune(
     all_probs: dict[tuple, np.ndarray],
     gt_events: list[Detection],
-    step: float = 0.05,
 ) -> tuple[np.ndarray, dict]:
     """
     Coordinate-descent threshold sweep for individual-model F1 reference.
-    Same grid shape as ``hybrid_ensemble_predict.tune_thresholds_on_probs``
-    but with a configurable step (default 0.05 to match train.py and
-    ensemble_predict.py; pass 0.025 for a finer search if D-class F1 is
-    suspected to sit between the 0.05 grid points).
+    Same grid as ``hybrid_ensemble_predict.tune_thresholds_on_probs``.
     """
     thresholds = np.array([0.5, 0.5, 0.5], dtype=np.float64)
-    grids = _build_cd_grid(step)
+    grids = [
+        np.arange(0.20, 0.85, 0.05),
+        np.concatenate([np.arange(0.05, 0.5, 0.05),
+                        np.arange(0.5, 0.85, 0.10)]),
+        np.concatenate([np.arange(0.05, 0.5, 0.05),
+                        np.arange(0.5, 0.85, 0.10)]),
+    ]
     for c, name in enumerate(CLASS_NAMES):
         best_f1, best_t = -1.0, thresholds[c]
         for t in grids[c]:
@@ -327,7 +429,7 @@ def make_objective(
             # Sample the gap and subtract — keeps off_thr bounded in
             # [0.0, on_thr] without needing constraint sampling.
             off_gap = trial.suggest_float(
-                f"{cls}_off_gap", 0.0, on_thr, step=on_step,
+                f"{cls}_off_gap", 0.0, on_thr, step=0.05,
             )
             off_thr = round(on_thr - off_gap, 2)
             cfg_obj.off_thresholds[cls] = off_thr
@@ -355,80 +457,6 @@ def make_objective(
         return macro_f1(metrics)
 
     return objective
-
-
-# ======================================================================
-# Baseline-trial enqueue helpers
-# ======================================================================
-
-def _snap_to_grid(val: float, lo: float, hi: float, step: float) -> float:
-    """
-    Clip ``val`` to ``[lo, hi]`` and snap to the nearest grid point of
-    size ``step`` starting at ``lo``. Required because Optuna's
-    ``enqueue_trial`` rejects values that don't fall on the declared
-    grid; cfg defaults may sit between grid points after the bounds
-    were tightened for class-appropriateness (especially BP max_dur).
-    """
-    clipped = float(min(max(val, lo), hi))
-    n = round((clipped - lo) / step)
-    snapped = lo + n * step
-    # Re-clip after rounding (corner case near upper bound).
-    snapped = float(min(max(snapped, lo), hi))
-    # Round to the step's decimal places for clean JSON.
-    decimals = max(0, -int(np.floor(np.log10(step))))
-    return round(snapped, decimals)
-
-
-def _build_baseline_trial_params(
-    cd_thresholds: np.ndarray,
-) -> dict[str, Any]:
-    """
-    Construct the parameter dict that reproduces (or comes as close as
-    the search-space grid allows to) the coordinate-descent threshold-
-    only baseline. Used to seed Optuna trial 0 so the search cannot
-    return a config worse than threshold-only.
-
-    Per class:
-        median_ms     = 0           (no smoothing — matches global cfg)
-        on_thr        = cd_thresholds[c]
-        off_gap       = 0.0         (no hysteresis — single-threshold)
-        hangover_ms   = 0
-        merge_gap_s   = cfg.MERGE_GAP_S, snapped
-        min_dur_s     = cfg.POST_MIN_DUR_S, snapped to per-class grid
-        max_dur_s     = cfg.POST_MAX_DUR_S, snapped to per-class grid
-
-    Note: with the widened SEARCH ranges (POST_MIN_DUR_S=0.5 is reachable
-    for all classes, POST_MAX_DUR_S=30.0 is reachable for d/bp), the
-    snapping is a no-op for most classes. BP max_dur is the one place
-    where 30.0 may snap to the upper bound of the bp range (e.g. 30.0
-    is already reachable with the widened range). Verify with a manual
-    sanity check if the enqueued trial's macro F1 doesn't match the CD
-    baseline within ~0.002.
-    """
-    on_lo, on_hi, on_step = SEARCH_THRESHOLD_RANGE
-    params: dict[str, Any] = {}
-    for c, cls in enumerate(CLASS_NAMES):
-        # Frame-level: no smoothing, no hangover, no hysteresis.
-        params[f"{cls}_median_ms"] = 0
-        params[f"{cls}_on_thr"] = _snap_to_grid(
-            float(cd_thresholds[c]), on_lo, on_hi, on_step,
-        )
-        params[f"{cls}_off_gap"] = 0.0
-        params[f"{cls}_hangover_ms"] = 0
-        # Event-level: snap cfg defaults to per-class grids.
-        mg_lo, mg_hi, mg_step = SEARCH_MERGE_GAP_S[cls]
-        params[f"{cls}_merge_gap_s"] = _snap_to_grid(
-            cfg.MERGE_GAP_S, mg_lo, mg_hi, mg_step,
-        )
-        mn_lo, mn_hi, mn_step = SEARCH_MIN_DUR_S[cls]
-        params[f"{cls}_min_dur_s"] = _snap_to_grid(
-            cfg.POST_MIN_DUR_S, mn_lo, mn_hi, mn_step,
-        )
-        mx_lo, mx_hi, mx_step = SEARCH_MAX_DUR_S[cls]
-        params[f"{cls}_max_dur_s"] = _snap_to_grid(
-            cfg.POST_MAX_DUR_S, mx_lo, mx_hi, mx_step,
-        )
-    return params
 
 
 # ======================================================================
@@ -475,8 +503,10 @@ def _build_config_from_best_params(params: dict[str, Any]) -> PerClassPostproces
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Optuna search over per-class post-processing "
-                    "hyperparameters. Operates on cached val "
-                    "probabilities so each trial is cheap.",
+                    "hyperparameters. Reuses the per-checkpoint cache "
+                    "built by ensemble_predict_cached.py so each trial "
+                    "is CPU-only when caches exist.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--checkpoint", type=str,
@@ -484,18 +514,33 @@ def parse_args() -> argparse.Namespace:
     src.add_argument("--checkpoints", nargs="+",
                      help="Multiple checkpoints — combined into an "
                           "ensemble before tuning. Use --d-from for "
-                          "the per-class hybrid combination.")
+                          "single-D-source hybrid, or "
+                          "--weights-bmabz/-d/-bp for per-class hybrid.")
 
     p.add_argument("--weights", nargs="+", type=float, default=None,
                    help="Optional per-checkpoint ensemble weights "
                         "(only valid with --checkpoints). Must match "
-                        "in length; normalised to sum to 1.")
+                        "in length; normalised to sum to 1. Mutually "
+                        "exclusive with --weights-<class> flags.")
     p.add_argument("--d-from", type=int, default=None,
                    help="0-indexed position in --checkpoints of the "
                         "model to use for D-class predictions. When "
                         "set, BMABZ/BP are weighted-averaged across "
                         "all models but D is taken from this single "
-                        "model — matches hybrid_ensemble_predict.py.")
+                        "model — matches hybrid_ensemble_predict.py. "
+                        "Mutually exclusive with --weights-<class>.")
+
+    # Per-class weight vectors. If any is set, all three must be set,
+    # and --weights / --d-from must not be set.
+    p.add_argument("--weights-bmabz", nargs="+", type=float, default=None,
+                   help="Per-checkpoint weights for the BMABZ class. "
+                        "Use 0 to exclude. Length must equal "
+                        "--checkpoints. Vectors are normalized per row.")
+    p.add_argument("--weights-d", nargs="+", type=float, default=None,
+                   help="Per-checkpoint weights for the D class.")
+    p.add_argument("--weights-bp", nargs="+", type=float, default=None,
+                   help="Per-checkpoint weights for the BP class.")
+
     p.add_argument("--per-model-eval", action="store_true",
                    help="Score each checkpoint individually (with its "
                         "own coordinate-descent thresholds) before the "
@@ -503,27 +548,36 @@ def parse_args() -> argparse.Namespace:
                         "Mirrors --per-model-eval in "
                         "hybrid_ensemble_predict.py.")
 
+    # ---- Cache + inference config (matches ensemble_predict_cached) ----
+    p.add_argument("--segment-s", type=float, default=cfg.EVAL_SEGMENT_S,
+                   help="Eval tile length in seconds. Cache files are "
+                        "keyed by this — must match what "
+                        "ensemble_predict_cached.py used to build the "
+                        "cache (default: cfg.EVAL_SEGMENT_S). 30s keeps "
+                        "the legacy filename for backward compat.")
+    p.add_argument("--overlap-s", type=float, default=cfg.EVAL_OVERLAP_S,
+                   help="Overlap between consecutive eval tiles in "
+                        "seconds. Only used on cache miss.")
+    p.add_argument("--cache-dir", type=str, default="runs/prob_cache",
+                   help="Directory of per-checkpoint cached probs. "
+                        "Reuses caches built by "
+                        "ensemble_predict_cached.py.")
+    p.add_argument("--no-cache", action="store_true",
+                   help="Force re-inference even if cache exists.")
+    p.add_argument("--use-fp16", action="store_true",
+                   help="FP16 autocast during inference (cache-miss "
+                        "path only). ~1.5-2x speedup, <0.001 F1 hit.")
+    p.add_argument("--batch-size", type=int, default=cfg.BATCH_SIZE,
+                   help="Batch size for inference (cache-miss path "
+                        "only).")
+
+    # ---- Optuna config ----
     p.add_argument("--n-trials", type=int, default=300,
                    help="Number of Optuna trials. 200-500 typical.")
     p.add_argument("--timeout", type=int, default=None,
                    help="Optional wall-clock cap (seconds).")
     p.add_argument("--seed", type=int, default=cfg.SEED,
                    help="Seed for the TPE sampler.")
-    p.add_argument("--cd-step", type=float, default=0.025,
-                   help="Step size for the coordinate-descent baseline "
-                        "threshold sweep. Default 0.025 (finer than the "
-                        "0.05 used elsewhere in the pipeline; cheap on "
-                        "cached probs and gives a more precise baseline "
-                        "anchor). Use 0.05 for parity with train.py / "
-                        "ensemble_predict.py.")
-    p.add_argument("--no-baseline-enqueue", action="store_true",
-                   help="Skip seeding trial 0 with the threshold-only "
-                        "coordinate-descent config. Without seeding, "
-                        "Optuna's first ~10 trials are pure random and "
-                        "the search can fail to recover the threshold-"
-                        "only baseline within the trial budget — only "
-                        "use this if you intentionally want unbiased "
-                        "exploration.")
     p.add_argument("--output", type=str,
                    default=str(cfg.POSTPROCESS_CONFIG_PATH),
                    help=f"Output JSON. Defaults to "
@@ -541,6 +595,44 @@ def main() -> None:
     if args.quiet:
         optuna.logging.set_verbosity(optuna.logging.WARNING)
     warnings.filterwarnings("ignore", category=FutureWarning, module="torch")
+
+    # ------------------------------------------------------------------
+    # CLI validation
+    # ------------------------------------------------------------------
+    per_class_w = [args.weights_bmabz, args.weights_d, args.weights_bp]
+    any_pc = any(w is not None for w in per_class_w)
+    all_pc = all(w is not None for w in per_class_w)
+    per_class_mode = False
+
+    if any_pc:
+        if not all_pc:
+            raise SystemExit(
+                "If any --weights-<class> flag is set, all three "
+                "(--weights-bmabz, --weights-d, --weights-bp) must be "
+                "set together."
+            )
+        if args.checkpoints is None:
+            raise SystemExit(
+                "--weights-<class> requires --checkpoints (multiple)."
+            )
+        if args.weights is not None:
+            raise SystemExit(
+                "--weights-<class> flags are mutually exclusive with "
+                "--weights."
+            )
+        if args.d_from is not None:
+            raise SystemExit(
+                "--weights-<class> flags are mutually exclusive with "
+                "--d-from."
+            )
+        n = len(args.checkpoints)
+        for cname, w in zip(("bmabz", "d", "bp"), per_class_w):
+            if len(w) != n:
+                raise SystemExit(
+                    f"--weights-{cname} has {len(w)} values, "
+                    f"need {n} (one per checkpoint)."
+                )
+        per_class_mode = True
 
     # --d-from is meaningful only with --checkpoints
     if args.d_from is not None and args.checkpoints is None:
@@ -562,11 +654,17 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
+    cache_dir = Path(args.cache_dir)
+    print(f"Cache dir: {cache_dir} (no_cache={args.no_cache}, "
+          f"use_fp16={args.use_fp16})")
+    print(f"Eval tiles: {args.segment_s:.0f}s segments, "
+          f"{args.overlap_s:.1f}s overlap")
+
     # ------------------------------------------------------------------
-    # Load val data once
+    # Load val data once. The val_loader is built lazily — if every
+    # cache hits we never pay for the DataLoader construction.
     # ------------------------------------------------------------------
     print("\nLoading validation data...")
-    _, _, val_loader = build_dataloaders()
     val_annotations = load_annotations(cfg.VAL_DATASETS)
     val_manifest = get_file_manifest(cfg.VAL_DATASETS)
     file_start_dts = {
@@ -577,34 +675,62 @@ def main() -> None:
     gt_events = build_gt_events(val_annotations, file_start_dts)
     print(f"  {len(gt_events)} ground-truth events")
 
+    _val_loader_cache: list = []  # closure-friendly memo for the loader
+
+    def get_val_loader():
+        """Build the segment-aware val loader on first call; reuse after."""
+        if _val_loader_cache:
+            return _val_loader_cache[0]
+        val_segs = build_val_segments(
+            val_manifest, val_annotations,
+            segment_s=args.segment_s,
+            overlap_s=args.overlap_s,
+        )
+        loader = DataLoader(
+            WhaleDataset(val_segs), batch_size=args.batch_size,
+            shuffle=False, num_workers=cfg.NUM_WORKERS,
+            collate_fn=collate_fn, pin_memory=True,
+        )
+        print(f"  built val loader: {len(val_segs)} "
+              f"{args.segment_s:.0f}s tiles "
+              f"({args.overlap_s:.1f}s overlap)")
+        _val_loader_cache.append(loader)
+        return loader
+
     # ------------------------------------------------------------------
-    # Compute per-checkpoint val probabilities (BPN-aware)
+    # Compute per-checkpoint val probabilities (cache-aware, BPN-aware)
     # ------------------------------------------------------------------
     individual_metrics: list[dict] = []
     if args.checkpoint is not None:
         print(f"\nCollecting probabilities from {args.checkpoint}")
-        probs = collect_probs_for_ckpt(
-            args.checkpoint, spec_extractor, val_loader, device,
+        all_probs = get_or_compute_probs(
+            args.checkpoint, spec_extractor, get_val_loader, device,
+            cache_dir, segment_s=args.segment_s,
+            no_cache=args.no_cache, use_fp16=args.use_fp16,
         )
-        all_probs = collapse_probs_to_3class(probs)
         ckpt_descriptor = args.checkpoint
         combination_label = "single checkpoint"
     else:
         prob_dicts: list[dict[tuple, np.ndarray]] = []
         for i, ckpt in enumerate(args.checkpoints):
-            is_d = (args.d_from is not None and i == args.d_from)
-            marker = "  ← D source" if is_d else ""
+            if per_class_mode:
+                marker = ""
+            elif args.d_from is not None and i == args.d_from:
+                marker = "  ← D source"
+            else:
+                marker = ""
             print(f"\n[{i+1}/{len(args.checkpoints)}] Loading {ckpt}{marker}")
-            probs = collect_probs_for_ckpt(
-                ckpt, spec_extractor, val_loader, device,
+            probs = get_or_compute_probs(
+                ckpt, spec_extractor, get_val_loader, device,
+                cache_dir, segment_s=args.segment_s,
+                no_cache=args.no_cache, use_fp16=args.use_fp16,
             )
-            probs = collapse_probs_to_3class(probs)
             prob_dicts.append(probs)
 
             if args.per_model_eval:
-                print(f"  individual threshold tune (step={args.cd_step}):")
+                print(f"  individual threshold tune:")
                 ind_thr, ind_metrics = quick_per_class_threshold_tune(
-                    probs, gt_events, step=args.cd_step,
+                    probs, gt_events,
                 )
                 individual_metrics.append({
                     "path": ckpt,
@@ -615,10 +741,37 @@ def main() -> None:
                 })
                 print(f"    micro F1={individual_metrics[-1]['f1']:.3f}  "
                       f"macro F1={individual_metrics[-1]['macro_f1']:.3f}  "
-                      f"thr={[f'{t:.3f}' for t in ind_thr]}")
+                      f"thr={[f'{t:.2f}' for t in ind_thr]}")
 
         # Combine.
-        if args.d_from is not None:
+        if per_class_mode:
+            raw = np.array(
+                [args.weights_bmabz, args.weights_d, args.weights_bp],
+                dtype=np.float64,
+            )
+            row_sums = raw.sum(axis=1, keepdims=True)
+            if np.any(row_sums <= 0):
+                bad = [c for c, s in zip(CLASS_NAMES, row_sums.ravel())
+                       if s <= 0]
+                raise SystemExit(
+                    f"Per-class weights for {bad} sum to zero — no "
+                    f"models would contribute to that class."
+                )
+            weights_per_class = (raw / row_sums).astype(np.float32)
+            print(f"\nPER-CLASS HYBRID combination "
+                  f"(rows = classes, cols = checkpoints in input order):")
+            for c, row in zip(CLASS_NAMES, weights_per_class):
+                pretty = ", ".join("%.2f" % w for w in row)
+                print(f"  {c:6}: [{pretty}]")
+            all_probs = average_prob_dicts_per_class(
+                prob_dicts, weights_per_class,
+            )
+            combination_label = (
+                f"per-class hybrid "
+                f"(weights_bmabz/d/bp, normalized; "
+                f"{len(args.checkpoints)} ckpts)"
+            )
+        elif args.d_from is not None:
             weights = (args.weights if args.weights is not None
                        else [1.0] * len(prob_dicts))
             print(f"\nHYBRID combination:")
@@ -673,17 +826,15 @@ def main() -> None:
               f"baseline macro {base_macro:.4f} by "
               f"{abs(sanity_macro - base_macro):.4f}; expected to match.")
 
-    # 3. Per-class coordinate-descent threshold tune. With --cd-step 0.025
-    #    (default) this is the finer-grid baseline; with 0.05 it matches
-    #    the rest of the pipeline. Used both for the progression report
-    #    and as the seed config for Optuna trial 0.
+    # 3. Per-class coordinate-descent threshold tune — your current 0.516
+    #    baseline corresponds to roughly this number on the hybrid probs.
     cd_thresholds, cd_metrics = quick_per_class_threshold_tune(
-        all_probs, gt_events, step=args.cd_step,
+        all_probs, gt_events,
     )
     _print_metrics_table(
         cd_metrics,
-        f"per-class threshold-only tune (step={args.cd_step}, thresholds="
-        f"{[f'{t:.3f}' for t in cd_thresholds]})",
+        f"per-class threshold-only tune (thresholds="
+        f"{[f'{t:.2f}' for t in cd_thresholds]})",
     )
     cd_macro = macro_f1(cd_metrics)
 
@@ -700,20 +851,6 @@ def main() -> None:
         sampler=sampler,
         study_name=args.study_name,
     )
-
-    # Seed trial 0 with the threshold-only configuration so the search
-    # has a known-good anchor. Without this, TPE starts with ~10 random
-    # trials and can fail to find the threshold-only operating point
-    # within 500 trials in a 21-dim space (observed empirically).
-    if not args.no_baseline_enqueue:
-        baseline_params = _build_baseline_trial_params(cd_thresholds)
-        study.enqueue_trial(baseline_params)
-        enqueued_thrs = [baseline_params[f"{c}_on_thr"] for c in CLASS_NAMES]
-        print(f"\n  Enqueued trial 0 = threshold-only baseline "
-              f"(on_thr={enqueued_thrs}). "
-              f"Expected trial-0 macro F1 ≈ {cd_macro:.4f}.")
-        print(f"  Subsequent trials cannot regress below this value.")
-
     study.optimize(
         make_objective(all_probs, gt_events),
         n_trials=args.n_trials,
@@ -744,15 +881,6 @@ def main() -> None:
           f"(Δ vs default: {best_macro - base_macro:+.4f}, "
           f"Δ vs thr-only: {best_macro - cd_macro:+.4f})")
 
-    # Sanity check: with the baseline enqueue, full ≥ threshold-only is
-    # guaranteed (Optuna keeps the best trial across all trials).
-    if not args.no_baseline_enqueue and best_macro < cd_macro - 1e-4:
-        print(f"\n  NOTE: full macro ({best_macro:.4f}) regressed below "
-              f"threshold-only ({cd_macro:.4f}) despite baseline enqueue. "
-              f"This indicates the snapped trial-0 params did not exactly "
-              f"reproduce the CD result (probably due to grid mismatch on "
-              f"one of merge_gap / min_dur / max_dur).")
-
     print("\n  Per-class config:")
     for cls in CLASS_NAMES:
         print(f"    {cls}:")
@@ -771,9 +899,17 @@ def main() -> None:
         print(f"  {'#':<3}  {'micro':>6}  {'macro':>6}  path")
         for i, im in enumerate(individual_metrics):
             short = Path(im["path"]).parent.name
-            marker = " ← D source" if (
-                args.d_from is not None and i == args.d_from
-            ) else ""
+            if per_class_mode:
+                contribs = [
+                    c for c, row in zip(CLASS_NAMES, weights_per_class)
+                    if row[i] > 0
+                ]
+                marker = (f"  [{','.join(contribs)}]" if contribs
+                          else "  [excluded from all classes]")
+            elif args.d_from is not None and i == args.d_from:
+                marker = "  ← D source"
+            else:
+                marker = ""
             print(f"  {i+1:<3}  {im['f1']:>6.3f}  {im['macro_f1']:>6.3f}  "
                   f"{short}{marker}")
         print(f"  {'TUN':<3}  "
@@ -788,10 +924,17 @@ def main() -> None:
         "weights": (list(args.weights) if args.weights is not None
                     else None),
         "d_from": args.d_from,
+        "weights_per_class": (
+            {
+                "bmabz": list(args.weights_bmabz),
+                "d": list(args.weights_d),
+                "bp": list(args.weights_bp),
+            } if per_class_mode else None
+        ),
+        "segment_s": float(args.segment_s),
+        "overlap_s": float(args.overlap_s),
         "combination": combination_label,
         "n_trials": int(args.n_trials),
-        "cd_step": float(args.cd_step),
-        "baseline_enqueued": (not args.no_baseline_enqueue),
         "macro_f1_default": float(base_macro),
         "macro_f1_threshold_only": float(cd_macro),
         "macro_f1_tuned": float(best_macro),
