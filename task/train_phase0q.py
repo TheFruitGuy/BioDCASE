@@ -181,7 +181,7 @@ def main():
         "training_classes": 3,
         "eval_classes": 3,
         "loss": "BCEWithLogitsLoss",
-        "pos_weight_source": "framewise_canonical",
+        "pos_weight_source": "framewise_canonical_raw",
     })
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
@@ -284,19 +284,23 @@ def main():
     # helper does this directly from Segment objects, so collation-time
     # padding cannot bias the count.
     #
-    # ``normalize_min_to_one=True`` keeps the most-common class at weight
-    # 1.0 (rather than down-weighting it below 1.0), matching the
-    # convention used by model.compute_class_weights. This is the
-    # convention that earlier phase scripts assumed; departing from it
-    # would conflate "frame-level vs file-level" with "normalised vs
-    # un-normalised" and muddy the diagnosis.
+    # ``normalize_min_to_one=False`` keeps the raw N_neg/N_pos ratio per
+    # class — the strict canonical pos_weight as defined by the
+    # BCEWithLogitsLoss docs. The min-to-one rescaling that
+    # model.compute_class_weights does is a workaround for the file-level
+    # proxy producing odd magnitudes, not part of the canonical recipe.
+    # With raw ratios the rare classes (d, bp) will get aggressively
+    # up-weighted — that's the whole point: if frame-level weighting
+    # works, this is the form in which it should work. The trade-off is
+    # that loss magnitudes are larger overall, so watch for training
+    # instability in the second-half stability metric below.
     print(f"\n{'=' * 60}")
-    print("Computing frame-level pos_weight (canonical recipe)")
+    print("Computing frame-level pos_weight (canonical recipe, raw ratio)")
     print(f"{'=' * 60}")
     pos_weight = compute_pos_weights_framewise(
         train_segments,
         n_classes=3,
-        normalize_min_to_one=True,
+        normalize_min_to_one=False,
         verbose=True,
     ).to(device)
     print(f"\n  pos_weight (device tensor): {pos_weight.cpu().tolist()}")
