@@ -99,6 +99,7 @@ import sys
 import time
 import warnings
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -151,6 +152,13 @@ from ensemble_predict_cached import (
 try:
     import optuna
     from optuna.samplers import TPESampler
+    from optuna.storages import JournalStorage
+    try:
+        # Optuna ≥ 4.0 moved JournalFileBackend to the storages submodule
+        # and renamed it from JournalFileStorage. Support both.
+        from optuna.storages.journal import JournalFileBackend as _JournalFileBackend
+    except ImportError:
+        from optuna.storages import JournalFileStorage as _JournalFileBackend
 except ImportError:
     print("ERROR: optuna is required for this script. Install with:")
     print("    pip install optuna")
@@ -658,7 +666,15 @@ def _print_metrics_table(metrics: dict, title: str) -> None:
 
 
 def _build_config_from_best_params(params: dict[str, Any]) -> PerClassPostprocessConfig:
-    """Reconstruct a config from Optuna's flat ``params`` dict."""
+    """
+    Reconstruct a config from Optuna's flat ``params`` dict.
+
+    Reads the ratio-parameterised hysteresis (``{cls}_off_gap_ratio``)
+    introduced to keep TPE-multivariate from falling back to random
+    sampling on a dynamic upper bound. Falls back to the legacy
+    ``{cls}_off_gap`` key if a study from before that change is loaded
+    via JournalFileStorage.
+    """
     cfg_obj = PerClassPostprocessConfig(
         median_kernel_ms={}, on_thresholds={}, off_thresholds={},
         hangover_kernel_ms={}, merge_gap_s={},
@@ -667,14 +683,102 @@ def _build_config_from_best_params(params: dict[str, Any]) -> PerClassPostproces
     for cls in CLASS_NAMES:
         cfg_obj.median_kernel_ms[cls] = int(params[f"{cls}_median_ms"])
         on_thr = float(params[f"{cls}_on_thr"])
-        off_gap = float(params[f"{cls}_off_gap"])
         cfg_obj.on_thresholds[cls] = round(on_thr, 2)
-        cfg_obj.off_thresholds[cls] = round(on_thr - off_gap, 2)
+
+        # Prefer the ratio param; fall back to absolute gap for legacy.
+        ratio_key = f"{cls}_off_gap_ratio"
+        gap_key = f"{cls}_off_gap"
+        if ratio_key in params:
+            off_gap_ratio = float(params[ratio_key])
+            cfg_obj.off_thresholds[cls] = round(
+                on_thr * (1.0 - off_gap_ratio), 2,
+            )
+        elif gap_key in params:  # legacy study
+            off_gap = float(params[gap_key])
+            cfg_obj.off_thresholds[cls] = round(on_thr - off_gap, 2)
+        else:
+            raise KeyError(
+                f"Neither {ratio_key!r} nor {gap_key!r} found in best "
+                f"params; cannot reconstruct off-threshold for {cls}."
+            )
+
         cfg_obj.hangover_kernel_ms[cls] = int(params[f"{cls}_hangover_ms"])
         cfg_obj.merge_gap_s[cls] = float(params[f"{cls}_merge_gap_s"])
         cfg_obj.min_dur_s[cls] = float(params[f"{cls}_min_dur_s"])
         cfg_obj.max_dur_s[cls] = float(params[f"{cls}_max_dur_s"])
     return cfg_obj
+
+
+# ======================================================================
+# Seed-trial construction
+# ======================================================================
+#
+# Optuna's 21-dim search space (7 params × 3 classes) needs hundreds of
+# trials to converge from cold. In a previous 200-trial run it ended at
+# macro 0.478 — below the threshold-only baseline of 0.490 — because
+# random startup plus the destructive parts of the search space
+# (aggressive min_dur_s, heavy median_kernel_ms) dragged the explored
+# region away from good configs. Seeding the study with one trial that
+# replicates the threshold-only result anchors TPE's posterior to a
+# known-good neighbourhood and ensures the final best is never worse
+# than the threshold-only baseline (the seeded trial itself is a lower
+# bound on the study's best value).
+
+def _snap_to_categorical(value: float, choices: list) -> Any:
+    """Pick the value in ``choices`` closest to ``value``."""
+    return min(choices, key=lambda c: abs(float(c) - float(value)))
+
+
+def _snap_to_range(value: float, lo: float, hi: float, step: float) -> float:
+    """Clamp + round to the nearest grid point on ``[lo, hi]`` step ``step``."""
+    value = max(lo, min(hi, float(value)))
+    n = round((value - lo) / step)
+    return round(lo + n * step, 4)
+
+
+def _build_seed_trial_params(
+    cd_thresholds: np.ndarray,
+) -> dict[str, Any]:
+    """
+    Build an Optuna params dict that approximates the threshold-only
+    baseline. Postprocess hyperparameters are snapped to the SEARCH_*
+    grids so Optuna can accept the trial without remap warnings:
+
+    - ``median_ms``: snap of ``cfg.SMOOTH_KERNEL_MS``
+    - ``on_thr``:    snap of the cd-tuned per-class threshold
+    - ``off_gap_ratio``: 0.0 (no hysteresis — off = on, matching the
+                         simple threshold sweep)
+    - ``hangover_ms``: 0
+    - ``merge_gap_s``: snap of ``cfg.MERGE_GAP_S``
+    - ``min_dur_s``:   snap of ``cfg.POST_MIN_DUR_S``
+    - ``max_dur_s``:   snap of ``cfg.POST_MAX_DUR_S``
+
+    The resulting trial should score within ε of the per-class
+    threshold-only baseline number printed earlier in the run, modulo
+    grid-snapping rounding on the duration parameters.
+    """
+    seed: dict[str, Any] = {}
+    for c, cls in enumerate(CLASS_NAMES):
+        seed[f"{cls}_median_ms"] = _snap_to_categorical(
+            cfg.SMOOTH_KERNEL_MS, SEARCH_MEDIAN_KERNEL_MS,
+        )
+        seed[f"{cls}_on_thr"] = _snap_to_range(
+            float(cd_thresholds[c]), *SEARCH_THRESHOLD_RANGE,
+        )
+        seed[f"{cls}_off_gap_ratio"] = 0.0
+        seed[f"{cls}_hangover_ms"] = _snap_to_categorical(
+            0, SEARCH_HANGOVER_KERNEL_MS,
+        )
+        seed[f"{cls}_merge_gap_s"] = _snap_to_range(
+            cfg.MERGE_GAP_S, *SEARCH_MERGE_GAP_S[cls],
+        )
+        seed[f"{cls}_min_dur_s"] = _snap_to_range(
+            cfg.POST_MIN_DUR_S, *SEARCH_MIN_DUR_S[cls],
+        )
+        seed[f"{cls}_max_dur_s"] = _snap_to_range(
+            cfg.POST_MAX_DUR_S, *SEARCH_MAX_DUR_S[cls],
+        )
+    return seed
 
 
 # ======================================================================
@@ -777,7 +881,35 @@ def parse_args() -> argparse.Namespace:
                         f"cfg.POSTPROCESS_CONFIG_PATH "
                         f"({cfg.POSTPROCESS_CONFIG_PATH}).")
     p.add_argument("--study-name", type=str, default=None,
-                   help="Optional name for the Optuna study.")
+                   help="Optional name for the Optuna study. Also used "
+                        "to derive the default storage path when "
+                        "--storage-path is omitted.")
+    p.add_argument("--storage-path", type=str, default=None,
+                   help="Path to an Optuna JournalFileStorage log. When "
+                        "set, the study is persisted across runs and "
+                        "can be resumed after a crash. Auto-derived to "
+                        "runs/optuna_studies/{study_name}.log when "
+                        "--study-name is set and this flag is omitted. "
+                        "Pass --no-storage to force in-memory.")
+    p.add_argument("--no-storage", action="store_true",
+                   help="Force in-memory study even if --storage-path "
+                        "or --study-name would otherwise auto-enable "
+                        "JournalFileStorage. The 2025-05-23 200-trial "
+                        "run that crashed at reconstruction time was "
+                        "lost because of in-memory studies, so the "
+                        "default now prefers persistence.")
+    p.add_argument("--no-resume", action="store_true",
+                   help="When storage is enabled, ignore any existing "
+                        "study at that path and start fresh. By default "
+                        "Optuna loads the existing study and continues.")
+    p.add_argument("--no-seed-trial", action="store_true",
+                   help="Skip enqueueing the threshold-only baseline as "
+                        "the first Optuna trial. The seed trial anchors "
+                        "TPE near the cd-tuned thresholds so the final "
+                        "best is never worse than the threshold-only "
+                        "baseline (the prior 200-trial run finished at "
+                        "0.478, below its own 0.490 threshold-only "
+                        "starting point — the seed fixes that).")
     p.add_argument("--quiet", action="store_true",
                    help="Suppress Optuna's per-trial INFO logs.")
     return p.parse_args()
@@ -1090,12 +1222,74 @@ def main() -> None:
     print(f"OPTUNA SEARCH ({args.n_trials} trials, "
           f"combination: {combination_label})")
     print("=" * 64)
+
+    # -- Storage (JournalFileStorage if requested or auto-derived) -----
+    storage = None
+    storage_path: Path | None = None
+    if not args.no_storage:
+        if args.storage_path is not None:
+            storage_path = Path(args.storage_path)
+        elif args.study_name:
+            storage_path = (
+                Path("runs/optuna_studies") / f"{args.study_name}.log"
+            )
+        # else: leave storage_path=None → in-memory.
+        if storage_path is not None:
+            storage_path.parent.mkdir(parents=True, exist_ok=True)
+            storage = JournalStorage(_JournalFileBackend(str(storage_path)))
+            print(f"Storage: JournalFileStorage at {storage_path}")
+            if args.no_resume and storage_path.exists():
+                print(f"  --no-resume set; existing log will be ignored "
+                      f"by passing load_if_exists=False")
+        else:
+            print("Storage: in-memory (study will be lost on crash). "
+                  "Pass --study-name or --storage-path to persist.")
+    else:
+        print("Storage: in-memory (--no-storage)")
+
+    # -- Study name resolution -----------------------------------------
+    # When persisting, Optuna requires a stable name. Auto-generate one
+    # so re-running with the same parameters lands in the same log.
+    study_name = args.study_name
+    if storage is not None and study_name is None:
+        study_name = storage_path.stem if storage_path else None
+
     sampler = TPESampler(seed=args.seed, multivariate=True)
     study = optuna.create_study(
         direction="maximize",
         sampler=sampler,
-        study_name=args.study_name,
+        study_name=study_name,
+        storage=storage,
+        load_if_exists=(storage is not None and not args.no_resume),
     )
+
+    # -- Seed the study with the threshold-only baseline ---------------
+    # The 21-dim search space won't converge from cold in ~200 trials;
+    # without an anchor the run can end below the cd_macro baseline (it
+    # did, at 0.478 vs 0.490 on 2025-05-23). Enqueue exactly one trial
+    # that replicates the threshold-only configuration so TPE has a
+    # known-good point in its posterior from the very first iteration.
+    n_existing_trials = len(study.trials)
+    if not args.no_seed_trial:
+        seed_params = _build_seed_trial_params(cd_thresholds)
+        already_seeded = any(
+            all(t.params.get(k) == v for k, v in seed_params.items())
+            for t in study.trials
+        )
+        if already_seeded:
+            print(f"Seed trial already present in existing study "
+                  f"({n_existing_trials} trials); skipping re-enqueue.")
+        else:
+            print(f"Seeding Optuna with threshold-only baseline as "
+                  f"trial {n_existing_trials + 1}:")
+            for k, v in seed_params.items():
+                print(f"    {k:<22} = {v}")
+            study.enqueue_trial(seed_params)
+
+    if n_existing_trials > 0 and not args.no_resume:
+        print(f"Resuming study at {n_existing_trials} existing trials; "
+              f"will run up to {args.n_trials} additional new trials.")
+
     study.optimize(
         make_objective(all_probs, gt_events),
         n_trials=args.n_trials,
@@ -1187,6 +1381,10 @@ def main() -> None:
         "delta_vs_default": float(best_macro - base_macro),
         "delta_vs_threshold_only": float(best_macro - cd_macro),
         "study_name": args.study_name,
+        "storage_path": (str(storage_path)
+                         if storage_path is not None else None),
+        "seed_trial_enqueued": (not args.no_seed_trial),
+        "n_existing_trials_at_start": n_existing_trials,
         "per_class_f1": {
             cls: float(best_metrics.get(cls, {}).get("f1", 0.0))
             for cls in CLASS_NAMES
