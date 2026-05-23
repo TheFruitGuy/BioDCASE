@@ -62,7 +62,9 @@ from spectrogram import SpectrogramExtractor
 from train_phase0e import extend_segment_to_fixed_length, PHASE0E_SEGMENT_S
 from ensemble_predict import (
     build_model_for_ckpt, predict_probabilities,
-    tune_thresholds_on_probs, evaluate_with_thresholds,
+)
+from validation_core import (
+    tune_thresholds_per_class, evaluate_with_thresholds, macro_f1,
 )
 
 
@@ -105,6 +107,12 @@ def parse_args():
     p.add_argument("--select_by", type=str, default="macro",
                    choices=["macro", "overall"],
                    help="Checkpoint selection criterion (default: macro).")
+    p.add_argument("--val-workers", type=int, default=1,
+                   help="Number of CPU worker processes for the per-class "
+                        "threshold sweep at validation time. 1 = sequential "
+                        "(legacy behaviour). Recommended: min(13, cpu_count) "
+                        "since the within-class grid has ~13 points. "
+                        "Linux-only (fork); pass 1 on macOS/Windows.")
     return p.parse_args()
 
 
@@ -361,7 +369,7 @@ def train_epoch(model, model_type, spec_extractor, loader,
 @torch.no_grad()
 def validate_hnm(model, model_type, spec_extractor, val_loader, device,
                  gt_events, baseline_criterion, pos_weight, n_classes,
-                 tune_thresholds=True):
+                 tune_thresholds=True, val_workers=1):
     model.eval()
     total_loss, n = 0.0, 0
     for audio, targets, mask, _ in val_loader:
@@ -381,14 +389,19 @@ def validate_hnm(model, model_type, spec_extractor, val_loader, device,
     all_probs = collapse_probs_to_3class(all_probs)
 
     if tune_thresholds:
-        thresholds = tune_thresholds_on_probs(all_probs, gt_events)
+        # Coordinate-descent grid sweep over per-class thresholds. With
+        # val_workers > 1, the ~13 trials per class run in parallel via
+        # fork-based worker processes — same picks, ~10× faster wall.
+        thresholds = tune_thresholds_per_class(
+            all_probs, gt_events,
+            parallel_workers=val_workers,
+        )
     else:
         thresholds = np.array(cfg.DEFAULT_THRESHOLDS, dtype=np.float64)
 
     metrics = evaluate_with_thresholds(all_probs, gt_events, thresholds)
     overall_f1 = metrics.get("overall", {}).get("f1", 0.0)
-    macro_f1 = float(np.mean([metrics.get(c, {}).get("f1", 0.0)
-                              for c in cfg.CALL_TYPES_3]))
+    macro = macro_f1(metrics)
 
     print(f"  Val (loss={val_loss:.4f}):")
     for c, name in enumerate(cfg.CALL_TYPES_3):
@@ -397,12 +410,12 @@ def validate_hnm(model, model_type, spec_extractor, val_loader, device,
               f"TP={m.get('tp', 0):5} FP={m.get('fp', 0):6} "
               f"FN={m.get('fn', 0):6}  P={m.get('precision', 0):.3f} "
               f"R={m.get('recall', 0):.3f} F1={m.get('f1', 0):.3f}")
-    print(f"    OVERALL F1={overall_f1:.3f}  MACRO F1={macro_f1:.3f}")
+    print(f"    OVERALL F1={overall_f1:.3f}  MACRO F1={macro:.3f}")
 
     per_class_only = {k: v for k, v in metrics.items()
                       if k in cfg.CALL_TYPES_3}
 
-    return {"loss": val_loss, "overall_f1": overall_f1, "macro_f1": macro_f1,
+    return {"loss": val_loss, "overall_f1": overall_f1, "macro_f1": macro,
             "per_class": per_class_only, "thresholds": thresholds.tolist()}
 
 
@@ -628,7 +641,7 @@ def main():
     print(f"\n{'=' * 60}\nInitial validation (epoch 0)\n{'=' * 60}")
     val0 = validate_hnm(model, model_type, spec_extractor, val_loader, device,
                         gt_events, baseline_criterion, pos_weight, n_classes,
-                        tune_thresholds=True)
+                        tune_thresholds=True, val_workers=args.val_workers)
 
     val0_log = dict(val0)
     val0_log["f1"] = val0[f"{args.select_by}_f1"]
@@ -662,7 +675,8 @@ def main():
             use_class_mask=args.isolate_classes)
         val = validate_hnm(model, model_type, spec_extractor, val_loader,
                            device, gt_events, baseline_criterion, pos_weight,
-                           n_classes, tune_thresholds=True)
+                           n_classes, tune_thresholds=True,
+                           val_workers=args.val_workers)
 
         selected_f1 = val[f"{args.select_by}_f1"]
         improved = selected_f1 > best_f1

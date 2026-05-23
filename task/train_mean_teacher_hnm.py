@@ -69,8 +69,10 @@ from dataset import (
     build_val_segments, collate_fn, get_file_manifest, load_annotations,
 )
 from postprocess import (
-    postprocess_predictions, compute_metrics, Detection,
-    collapse_probs_to_3class,
+    Detection, collapse_probs_to_3class,
+)
+from validation_core import (
+    tune_thresholds_per_class, evaluate_with_thresholds, macro_f1,
 )
 
 # HNM machinery — reused as-is from your existing pipeline
@@ -181,6 +183,12 @@ def parse_args():
     p.add_argument("--no-wandb", action="store_true")
     p.add_argument("--select_by", type=str, default="macro",
                    choices=["macro", "overall"])
+    p.add_argument("--val-workers", type=int, default=1,
+                   help="Number of CPU worker processes for the per-class "
+                        "threshold sweep at validation time. 1 = sequential "
+                        "(legacy behaviour). Recommended: min(13, cpu_count) "
+                        "since the within-class grid has ~13 points. "
+                        "Linux-only (fork); pass 1 on macOS/Windows.")
     return p.parse_args()
 
 
@@ -202,7 +210,7 @@ def set_seed(seed: int):
 @torch.no_grad()
 def validate_teacher(teacher_module, spec_extractor, val_loader, criterion,
                      device, thresholds, val_annotations, file_start_dts,
-                     select_by="macro"):
+                     select_by="macro", val_workers=1):
     teacher_module.eval()
     total_loss, n_batches = 0.0, 0
     all_probs: dict = {}
@@ -242,33 +250,23 @@ def validate_teacher(teacher_module, spec_extractor, val_loader, criterion,
             end_s=(row["end_datetime"] - fsd).total_seconds(),
         ))
 
-    used_thresholds = np.asarray(thresholds.cpu().numpy(), dtype=np.float64).copy()
-    grids = [
-        np.arange(0.20, 0.85, 0.05),
-        np.concatenate([np.arange(0.05, 0.5, 0.05),
-                        np.arange(0.5, 0.85, 0.10)]),
-        np.concatenate([np.arange(0.05, 0.5, 0.05),
-                        np.arange(0.5, 0.85, 0.10)]),
-    ]
-    for c, name in enumerate(cfg.CALL_TYPES_3):
-        best_f1, best_t = -1.0, used_thresholds[c]
-        for t in grids[c]:
-            trial = used_thresholds.copy()
-            trial[c] = t
-            preds = postprocess_predictions(all_probs, trial)
-            m = compute_metrics(preds, gt_events, iou_threshold=0.3)
-            f1 = m.get(name, {}).get("f1", 0.0)
-            if f1 > best_f1:
-                best_f1 = f1
-                best_t = t
-        used_thresholds[c] = best_t
+    # Coordinate-descent threshold sweep — uses the previous epoch's
+    # tuned thresholds as a warm start. With val_workers > 1, the
+    # ~13 trials per class run in parallel via fork-based workers
+    # (same picks, ~10× faster wall).
+    start_thresholds = np.asarray(
+        thresholds.cpu().numpy(), dtype=np.float64,
+    )
+    used_thresholds = tune_thresholds_per_class(
+        all_probs, gt_events,
+        start=start_thresholds,
+        parallel_workers=val_workers,
+    )
 
-    pred_events = postprocess_predictions(all_probs, used_thresholds)
-    metrics = compute_metrics(pred_events, gt_events, iou_threshold=0.3)
+    metrics = evaluate_with_thresholds(all_probs, gt_events, used_thresholds)
     overall_f1 = metrics.get("overall", {}).get("f1", 0.0)
-    macro_f1 = float(np.mean([metrics.get(c, {}).get("f1", 0.0)
-                              for c in cfg.CALL_TYPES_3]))
-    selection_f1 = macro_f1 if select_by == "macro" else overall_f1
+    macro = macro_f1(metrics)
+    selection_f1 = macro if select_by == "macro" else overall_f1
 
     print(f"\n  Teacher event-level (tuned thresholds):")
     for c, name in enumerate(cfg.CALL_TYPES_3):
@@ -278,13 +276,13 @@ def validate_teacher(teacher_module, spec_extractor, val_loader, criterion,
         print(f"    {name.upper():6} t={used_thresholds[c]:.2f}  "
               f"TP={m['tp']:5} FP={m['fp']:6} FN={m['fn']:6}  "
               f"P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}")
-    print(f"    OVERALL F1={overall_f1:.3f}  MACRO F1={macro_f1:.3f}")
+    print(f"    OVERALL F1={overall_f1:.3f}  MACRO F1={macro:.3f}")
 
     return {
         "loss": total_loss / max(n_batches, 1),
         "selection_f1": selection_f1,
         "overall_f1": overall_f1,
-        "macro_f1": macro_f1,
+        "macro_f1": macro,
         "per_class": metrics,
         "thresholds": used_thresholds.tolist(),
     }
@@ -631,6 +629,7 @@ def main():
             criterion=baseline_criterion, device=device,
             thresholds=thresholds, val_annotations=val_anns,
             file_start_dts=file_start_dts, select_by=args.select_by,
+            val_workers=args.val_workers,
         )
         thresholds = torch.tensor(val["thresholds"], device=device).float()
         scheduler.step(val["selection_f1"])
