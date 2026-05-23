@@ -610,13 +610,9 @@ def make_objective(
             on_thr = _suggest_range(trial, f"{cls}_on_thr", on_lo, on_hi, on_step)
             cfg_obj.on_thresholds[cls] = on_thr
 
-            # off_thr ≤ on_thr (paper: hysteresis terminates at lower thr).
-            # Sample the gap and subtract — keeps off_thr bounded in
-            # [0.0, on_thr] without needing constraint sampling.
-            off_gap = trial.suggest_float(
-                f"{cls}_off_gap", 0.0, on_thr, step=0.05,
-            )
-            off_thr = round(on_thr - off_gap, 2)
+            
+            off_gap_ratio = trial.suggest_float(f"{cls}_off_gap_ratio", 0.0, 1.0, step=0.05)
+            off_thr = round(on_thr * (1.0 - off_gap_ratio), 2)
             cfg_obj.off_thresholds[cls] = off_thr
 
             cfg_obj.hangover_kernel_ms[cls] = trial.suggest_categorical(
