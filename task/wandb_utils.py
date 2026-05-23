@@ -498,6 +498,19 @@ PHASE_REGISTRY: dict[str, dict] = {
                         "conceptual problem with weighted BCE."),
             interventions=["framewise_weighted_bce"],
         ),
+    "0r": dict(
+        parent="0m",
+        hypothesis=(
+            "Author-confirmed weighted BCE on top of 0m: per-class "
+            "wc = N/Pc normalised by SEGMENT count (annotation count, "
+            "not file count). 0h/0i/0o used file-count weights, which "
+            "Christiaan flagged by email as a bug class. No focal loss "
+            "(per email: focal REPLACES weighted BCE in the paper, "
+            "not stacked). Tests whether the segment-count fix resolves "
+            "the 0h/0i/0o negative results and lifts macro F1."
+        ),
+        interventions=["weighted_bce_segments"],
+    ),
 }
 
 
