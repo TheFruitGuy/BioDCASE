@@ -207,11 +207,19 @@ def compute_pos_weight_7class_segments(
 
 def main():
     """Run Phase 0r end-to-end."""
-    assert not cfg.USE_3CLASS, (
-        "Phase 0r requires cfg.USE_3CLASS=False (same as 0m). Flip it "
-        "in config.py before running so WhaleDataset emits 7-channel "
-        "targets."
-    )
+    # ------------------------------------------------------------------
+    # Flip cfg.USE_3CLASS to False so WhaleDataset emits 7-channel
+    # targets (same regime as Phase 0m). Doing this in-script rather
+    # than asserting against config.py means the run is self-contained
+    # — no editing config.py between phases. Matches train_phase0n's
+    # pattern. validate_7to3 (imported from train_phase0m) toggles
+    # USE_3CLASS to True inside the postprocess call and restores it,
+    # so the rest of the training loop sees the 7-class setting.
+    # ------------------------------------------------------------------
+    if cfg.USE_3CLASS:
+        print("Setting cfg.USE_3CLASS = False for Phase 0r (7-class "
+              "training, was True in config.py)")
+    cfg.USE_3CLASS = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
