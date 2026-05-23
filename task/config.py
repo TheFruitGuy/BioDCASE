@@ -190,7 +190,7 @@ EVAL_SEGMENT_S = 30.0
 #: Overlap between consecutive validation windows in seconds. Overlapping
 #: windows are averaged during stitching to smooth predictions at segment
 #: boundaries.
-EVAL_OVERLAP_S = 4.0
+EVAL_OVERLAP_S = 2.0
 
 #: Minimum call duration (seconds). Annotations shorter than this are
 #: filtered out during segment construction. Paper uses 500 ms.
