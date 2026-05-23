@@ -489,6 +489,15 @@ PHASE_REGISTRY: dict[str, dict] = {
                 "no_early_stopping",
             ],
         ),
+    "0q": dict(
+            parent="0p",
+            hypothesis=("Frame-level pos_weight (canonical recipe) on top of "
+                        "0p's 3-class direct training. Tests whether the 0h/0i "
+                        "weighted-BCE drop was a stats bug — file-level counts "
+                        "don't match per-frame BCE math — rather than a "
+                        "conceptual problem with weighted BCE."),
+            interventions=["framewise_weighted_bce"],
+        ),
 }
 
 
