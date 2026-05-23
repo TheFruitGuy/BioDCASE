@@ -246,6 +246,18 @@ def parse_args():
                         "3 at evaluation (matches the official Geldenhuys "
                         "checkpoint canonically). If unset, uses cfg.USE_3CLASS.")
 
+    # Loss-form override
+    p.add_argument("--use-focal", action="store_true",
+                   help="Apply focal modulation on top of weighted BCE "
+                        "(stacked loss). Deviates from the author's email-"
+                        "corrected recipe but matches your original train.py "
+                        "configuration that produced F1=0.469. Empirically "
+                        "necessary on this dataset to lift D-class F1 above "
+                        "the ~0.1 ceiling that pure WBCE plateaus at.")
+    p.add_argument("--focal-gamma", type=float, default=2.0,
+                   help="Focusing parameter γ. Only used if --use-focal. "
+                        "γ=0 reduces to pure WBCE. Standard γ=2.0.")
+
     # Bookkeeping
     p.add_argument("--output-dir", type=str, default=None,
                    help="Output directory. Defaults to "
@@ -279,6 +291,60 @@ class CanonicalWBCELoss(nn.Module):
             denom = mask.sum() * logits.size(-1) + 1e-8
             return bce.sum() / denom
         return bce.mean()
+
+
+class FocalWBCELoss(nn.Module):
+    """
+    Focal modulation stacked on top of weighted BCE — the configuration
+    that worked on this codebase (your original ``train.py`` reproduction
+    at F1=0.469).
+
+    Loss per (frame, class) cell:
+        p_t      = p   if y == 1 else (1 - p)
+        focal_w  = (1 - p_t) ** gamma
+        wbce     = pos_weight * y * -log(p) + (1 - y) * -log(1 - p)
+        loss     = focal_w * wbce
+
+    This down-weights easy examples (where p_t is high) so the gradient
+    is dominated by hard examples. On this dataset the D-class is the
+    hardest class and pure WBCE gives it insufficient signal — focal
+    modulation appears to be necessary to push D-class F1 above ~0.1.
+
+    With gamma = 0.0 this collapses to pure WBCE, so the flag is a clean
+    on/off switch over the same loss surface.
+    """
+
+    def __init__(self, pos_weight: torch.Tensor, gamma: float = 2.0):
+        super().__init__()
+        self.register_buffer("pos_weight", pos_weight)
+        self.gamma = float(gamma)
+
+    def forward(self, logits, targets, padding_mask):
+        pw = self.pos_weight.view(1, 1, -1)
+        # Per-cell WBCE in nat, no reduction.
+        wbce = nn.functional.binary_cross_entropy_with_logits(
+            logits, targets, pos_weight=pw, reduction="none",
+        )
+
+        # Focal modulation. We need p_t = sigmoid(logits) for y=1
+        # and 1 - sigmoid(logits) for y=0. Numerically-stable form:
+        # use logsigmoid to avoid an extra sigmoid + log.
+        with torch.no_grad():
+            # log(p_t) is a stable quantity; we then exp() to get p_t.
+            log_p = nn.functional.logsigmoid(logits)
+            log_1mp = nn.functional.logsigmoid(-logits)
+            log_pt = targets * log_p + (1.0 - targets) * log_1mp
+            pt = log_pt.exp().clamp_min(1e-8)
+            focal_w = (1.0 - pt).pow(self.gamma)
+
+        loss = focal_w * wbce
+
+        if padding_mask is not None:
+            mask = padding_mask.unsqueeze(-1).float()
+            loss = loss * mask
+            denom = mask.sum() * logits.size(-1) + 1e-8
+            return loss.sum() / denom
+        return loss.mean()
 
 
 def align_lengths(logits, targets, mask):
@@ -586,7 +652,8 @@ def main():
         if is_main(rank) and not args.no_wandb:
             run = wbu.init_phase(
                 "canonical",
-                extra_tags=["wbce_only", "fixed_lr", "ddp",
+                extra_tags=["wbce_only" if not args.use_focal else "focal_wbce",
+                            "fixed_lr", "ddp",
                             f"recipe_{args.recipe}", f"seed_{args.seed}",
                             f"amp_{args.amp}",
                             f"classes_{cfg.n_classes()}"],
@@ -601,7 +668,8 @@ def main():
                     "amp":              args.amp,
                     "sync_bn":          (not args.no_sync_bn) and world_size > 1,
                     "seed":             args.seed,
-                    "use_focal_loss":   False,
+                    "use_focal_loss":   bool(args.use_focal),
+                    "focal_gamma":      args.focal_gamma if args.use_focal else 0.0,
                     "use_weighted_bce": True,
                     "pos_weight_unit":  "frame",
                     "resample_every":   args.resample_every,
@@ -715,7 +783,11 @@ def main():
         ).to(device)
         if world_size > 1:
             dist.broadcast(pos_weight, src=0)
-        criterion = CanonicalWBCELoss(pos_weight=pos_weight).to(device)
+        criterion = (
+            FocalWBCELoss(pos_weight=pos_weight, gamma=args.focal_gamma)
+            if args.use_focal else
+            CanonicalWBCELoss(pos_weight=pos_weight)
+        ).to(device)
 
         # ------------------------------------------------------------------
         # Optimizer + GradScaler (fp16 only)
@@ -737,7 +809,10 @@ def main():
             print("Canonical recipe configuration")
             print(f"{'=' * 60}")
             print(f"  recipe:           {args.recipe}")
-            print(f"  loss:             pure weighted BCE (no focal)")
+            if args.use_focal:
+                print(f"  loss:             focal × weighted BCE (γ={args.focal_gamma})")
+            else:
+                print(f"  loss:             pure weighted BCE (no focal)")
             print(f"  pos_weight unit:  frame")
             print(f"  classes:          {cfg.n_classes()}  "
                   f"({'3-class direct' if cfg.USE_3CLASS else '7-class with eval collapse'})")
