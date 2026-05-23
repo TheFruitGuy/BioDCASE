@@ -610,7 +610,7 @@ def make_objective(
             on_thr = _suggest_range(trial, f"{cls}_on_thr", on_lo, on_hi, on_step)
             cfg_obj.on_thresholds[cls] = on_thr
 
-            
+
             off_gap_ratio = trial.suggest_float(f"{cls}_off_gap_ratio", 0.0, 1.0, step=0.05)
             off_thr = round(on_thr * (1.0 - off_gap_ratio), 2)
             cfg_obj.off_thresholds[cls] = off_thr
