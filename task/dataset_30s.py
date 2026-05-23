@@ -779,7 +779,7 @@ class TrainingDatasetWithResample(WhaleDataset):
         resampled negatives reintroduce the train/val length mismatch
         every epoch.
         """
-        from train_phase0e import extend_all_segments, PHASE0E_SEGMENT_S
+        from segment_length_core import extend_all_segments, PHASE0E_SEGMENT_S
         n_neg = int(len(self.positive_segments) * cfg.NEG_RATIO)
         self.negative_segments = build_negative_segments(
             self.annotations, self.manifest, n_segments=n_neg,
@@ -816,7 +816,7 @@ def build_dataloaders():
     # and validated on 30s tiles, producing wildly miscalibrated
     # confidence at eval. Forcing 30s training segments fixed the
     # oscillation in Phase 0f-0g (F1=0.385 stable on official val).
-    from train_phase0e import extend_all_segments, PHASE0E_SEGMENT_S
+    from segment_length_core import extend_all_segments, PHASE0E_SEGMENT_S
     pos_segs = extend_all_segments(pos_segs, train_manifest, PHASE0E_SEGMENT_S)
     train_ds = TrainingDatasetWithResample(pos_segs, train_manifest, train_annotations)
     print(f"Training: {len(pos_segs)} positive + "

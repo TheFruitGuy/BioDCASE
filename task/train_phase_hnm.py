@@ -59,7 +59,7 @@ from dataset import (
 from model import WhaleVADLoss, compute_class_weights
 from postprocess import Detection, collapse_probs_to_3class
 from spectrogram import SpectrogramExtractor
-from train_phase0e import extend_segment_to_fixed_length, PHASE0E_SEGMENT_S
+from segment_length_core import extend_segment_to_fixed_length, PHASE0E_SEGMENT_S
 from ensemble_predict import (
     build_model_for_ckpt, predict_probabilities,
 )
