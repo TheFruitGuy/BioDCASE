@@ -33,6 +33,24 @@ Four combination modes
    from that class. Vectors are normalized per row. Mutually exclusive
    with ``--weights`` and ``--d-from``.
 
+Per-model eval parallelism
+--------------------------
+``--per-model-eval`` runs ``quick_per_class_threshold_tune`` for each
+checkpoint as a diagnostic. At 60s tiles this is ~40 grid trials ×
+~15s = ~10 min/model — fully CPU-bound. ``--parallel-eval-workers N``
+(default 1) switches to flat-phase scheduling: for each of the three
+coordinate-descent phases (BMABZ → D → BP), all
+``n_models × ~13 thresholds`` independent trials are submitted to one
+worker pool. Because within-class trials are independent (they only
+differ in one threshold slot), N can usefully exceed the number of
+models. Across-class trials must remain sequential — phase k+1 needs
+each model's best phase-k threshold.
+
+Rule of thumb: set N to ``min(os.cpu_count(), n_checkpoints × 13)``.
+Workers share the parent's probability dicts via fork (copy-on-write),
+so the memory overhead is one address-space snapshot regardless of
+worker count. Linux only.
+
 Examples
 --------
 Per-class hybrid at 60s tiles (PGI for BMABZ+BP, AMSE MT for D)::
@@ -46,7 +64,7 @@ Per-class hybrid at 60s tiles (PGI for BMABZ+BP, AMSE MT for D)::
         --weights-bmabz 1 1 1 1 1  0 0 0 0 0 \\
         --weights-d     0 0 0 0 0  1 1 1 1 1 \\
         --weights-bp    1 1 1 1 1  0 0 0 0 0 \\
-        --n-trials 500 --per-model-eval
+        --n-trials 500 --per-model-eval --parallel-eval-workers 10
 
 BPN-style hybrid (single D source)::
 
@@ -76,9 +94,11 @@ The output path defaults to ``cfg.POSTPROCESS_CONFIG_PATH`` declared in
 from __future__ import annotations
 
 import argparse
+import multiprocessing as mp
 import sys
 import time
 import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
@@ -388,6 +408,171 @@ def quick_per_class_threshold_tune(
 
 
 # ======================================================================
+# Parallel per-model eval — flat-phase scheduling
+# ======================================================================
+#
+# quick_per_class_threshold_tune is coordinate descent over three
+# classes; within each class the ~13 grid trials are independent
+# (all use the same other-class thresholds, varying only one). So the
+# natural parallel structure is:
+#
+#   phase 1 (BMABZ): n_models × n_BMABZ_thresholds independent trials
+#   phase 2 (D):     n_models × n_D_thresholds       independent trials
+#                    (using each model's best BMABZ from phase 1)
+#   phase 3 (BP):    n_models × n_BP_thresholds      independent trials
+#                    (using each model's best BMABZ + best D)
+#   final:           n_models                        full-metrics evals
+#
+# Flat-phase scheduling submits each phase as a single flat task list
+# to ONE worker pool — so with N workers and 130 tasks/phase, each
+# phase takes ceil(130/N) × trial_time. This is strictly better than
+# per-model parallelism whenever N > n_models (otherwise equivalent).
+#
+# Workers access the prob dicts via module-level globals inherited
+# from the parent at fork time (no pickling of the ~26 MB per-model
+# probability dict). Only `fork` start method is supported.
+
+_WORKER_PROB_DICTS: list = []
+_WORKER_GT_EVENTS: list = []
+
+
+def _grid_trial_task(
+    payload: tuple[int, int, float, np.ndarray],
+) -> tuple[int, int, float, float]:
+    """
+    Worker: evaluate one (model_idx, class_idx, threshold) grid trial.
+
+    ``trial_thresholds`` is the full ``[t0, t1, t2]`` vector with the
+    class_idx slot already set to ``threshold_value``; the other two
+    slots are the model's current-best from earlier phases.
+    Returns the class-c F1 only — that's all coordinate descent needs.
+    """
+    model_idx, class_idx, threshold_value, trial_thresholds = payload
+    probs = _WORKER_PROB_DICTS[model_idx]
+    preds = postprocess_predictions(probs, trial_thresholds)
+    metrics = compute_metrics(preds, _WORKER_GT_EVENTS, iou_threshold=0.3)
+    class_name = CLASS_NAMES[class_idx]
+    f1 = float(metrics.get(class_name, {}).get("f1", 0.0))
+    return model_idx, class_idx, float(threshold_value), f1
+
+
+def _final_eval_task(
+    payload: tuple[int, str, np.ndarray],
+) -> tuple[int, str, np.ndarray, dict]:
+    """
+    Worker: final per-model eval with the tuned thresholds.
+
+    Computes the full metrics dict (overall + per-class) so the
+    individual-model summary table can report micro/macro F1.
+    """
+    model_idx, ckpt_path, final_thresholds = payload
+    probs = _WORKER_PROB_DICTS[model_idx]
+    preds = postprocess_predictions(probs, final_thresholds)
+    metrics = compute_metrics(preds, _WORKER_GT_EVENTS, iou_threshold=0.3)
+    return model_idx, ckpt_path, final_thresholds, metrics
+
+
+def parallel_per_model_threshold_tune(
+    n_models: int,
+    ckpt_paths: list[str],
+    n_workers: int,
+    ctx,
+) -> list[dict]:
+    """
+    Flat-phase parallel implementation of per-model threshold tuning.
+
+    Same grids and same coordinate-descent semantics as
+    ``quick_per_class_threshold_tune``, but with all (model, threshold)
+    trials inside a class flattened into a single task list. Three
+    sequential phases (one per class), then a final eval phase.
+
+    Requires ``_WORKER_PROB_DICTS`` and ``_WORKER_GT_EVENTS`` to be
+    populated in the parent before this is called (workers inherit
+    them via fork).
+
+    Returns a list of dicts, one per model, in input order, with the
+    same shape as the sequential path's ``individual_metrics`` entries.
+    """
+    grids = [
+        np.arange(0.20, 0.85, 0.05),
+        np.concatenate([np.arange(0.05, 0.5, 0.05),
+                        np.arange(0.5, 0.85, 0.10)]),
+        np.concatenate([np.arange(0.05, 0.5, 0.05),
+                        np.arange(0.5, 0.85, 0.10)]),
+    ]
+    # Initial thresholds: 0.5 for every class, every model.
+    model_thresholds = [
+        np.array([0.5, 0.5, 0.5], dtype=np.float64) for _ in range(n_models)
+    ]
+
+    total_grid = sum(len(g) for g in grids) * n_models
+    print(f"  Plan: {len(grids)} sequential phases × "
+          f"{n_models} models × ~{len(grids[0])} thresholds = "
+          f"{total_grid} grid trials + {n_models} final evals, "
+          f"on {n_workers} workers")
+
+    t_start = time.time()
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
+        # ------------------ three coordinate-descent phases ------------
+        for class_idx, class_name in enumerate(CLASS_NAMES):
+            t0 = time.time()
+            tasks: list = []
+            for m in range(n_models):
+                for t in grids[class_idx]:
+                    trial = model_thresholds[m].copy()
+                    trial[class_idx] = float(t)
+                    tasks.append((m, class_idx, float(t), trial))
+
+            # Track best (f1, threshold) per model for this class.
+            best_per_model: list[tuple[float, float]] = [
+                (-1.0, 0.5) for _ in range(n_models)
+            ]
+            futures = [pool.submit(_grid_trial_task, task)
+                       for task in tasks]
+            for fut in as_completed(futures):
+                m, _, t_val, f1 = fut.result()
+                if f1 > best_per_model[m][0]:
+                    best_per_model[m] = (f1, t_val)
+
+            for m in range(n_models):
+                model_thresholds[m][class_idx] = best_per_model[m][1]
+
+            chosen = [f"{best_per_model[m][1]:.2f}"
+                      for m in range(n_models)]
+            print(f"  phase {class_idx+1}/3 [{class_name:6}]: "
+                  f"{len(tasks)} trials in {time.time()-t0:.0f}s   "
+                  f"chosen={chosen}")
+
+        # ------------------ final per-model full-metrics eval ----------
+        t0 = time.time()
+        final_tasks = [
+            (m, ckpt_paths[m], model_thresholds[m].copy())
+            for m in range(n_models)
+        ]
+        futures = [pool.submit(_final_eval_task, task)
+                   for task in final_tasks]
+        results: list = [None] * n_models
+        for fut in as_completed(futures):
+            m, ckpt_path, final_thr, metrics = fut.result()
+            results[m] = {
+                "path": ckpt_path,
+                "thresholds": final_thr,
+                "metrics": metrics,
+                "f1": metrics.get("overall", {}).get("f1", 0.0),
+                "macro_f1": float(np.mean(
+                    [metrics.get(c, {}).get("f1", 0.0)
+                     for c in CLASS_NAMES]
+                )),
+            }
+        print(f"  final eval: {n_models} per-model metrics in "
+              f"{time.time()-t0:.0f}s")
+
+    print(f"  total parallel tune wall time: "
+          f"{time.time()-t_start:.0f}s")
+    return results
+
+
+# ======================================================================
 # Optuna objective
 # ======================================================================
 
@@ -544,9 +729,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--per-model-eval", action="store_true",
                    help="Score each checkpoint individually (with its "
                         "own coordinate-descent thresholds) before the "
-                        "ensemble step. Adds ~10 sec per model. "
-                        "Mirrors --per-model-eval in "
-                        "hybrid_ensemble_predict.py.")
+                        "ensemble step. Pure CPU; ~10 min/model at 60s "
+                        "tiles. Use --parallel-eval-workers to fan out "
+                        "across processes.")
+    p.add_argument("--parallel-eval-workers", type=int, default=1,
+                   help="Number of worker processes for parallel "
+                        "per-model threshold tuning (only used with "
+                        "--per-model-eval). Uses flat-phase scheduling: "
+                        "each of three sequential coordinate-descent "
+                        "phases (BMABZ, D, BP) submits "
+                        "n_models × ~13 independent trials to one pool, "
+                        "so N can usefully exceed the number of "
+                        "checkpoints. Set N to "
+                        "min(cpu_count, n_ckpts × 13) for max speedup. "
+                        "Workers share probs via fork (no pickling). "
+                        "Default 1 = sequential. Linux only.")
 
     # ---- Cache + inference config (matches ensemble_predict_cached) ----
     p.add_argument("--segment-s", type=float, default=cfg.EVAL_SEGMENT_S,
@@ -650,6 +847,8 @@ def main() -> None:
                 f"len(weights)={len(args.weights)} must equal "
                 f"len(checkpoints)={len(args.checkpoints)}."
             )
+    if args.parallel_eval_workers < 1:
+        raise SystemExit("--parallel-eval-workers must be >= 1.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -698,9 +897,15 @@ def main() -> None:
         return loader
 
     # ------------------------------------------------------------------
-    # Compute per-checkpoint val probabilities (cache-aware, BPN-aware)
+    # Compute per-checkpoint val probabilities (cache-aware, BPN-aware).
+    # When --parallel-eval-workers > 1, defer the per-model tune until
+    # all probs are loaded, then fan out across worker processes.
     # ------------------------------------------------------------------
+    inline_per_model_eval = (
+        args.per_model_eval and args.parallel_eval_workers <= 1
+    )
     individual_metrics: list[dict] = []
+
     if args.checkpoint is not None:
         print(f"\nCollecting probabilities from {args.checkpoint}")
         all_probs = get_or_compute_probs(
@@ -727,7 +932,7 @@ def main() -> None:
             )
             prob_dicts.append(probs)
 
-            if args.per_model_eval:
+            if inline_per_model_eval:
                 print(f"  individual threshold tune:")
                 ind_thr, ind_metrics = quick_per_class_threshold_tune(
                     probs, gt_events,
@@ -742,6 +947,50 @@ def main() -> None:
                 print(f"    micro F1={individual_metrics[-1]['f1']:.3f}  "
                       f"macro F1={individual_metrics[-1]['macro_f1']:.3f}  "
                       f"thr={[f'{t:.2f}' for t in ind_thr]}")
+
+        # Parallel per-model tune (only if requested and not inlined).
+        if args.per_model_eval and args.parallel_eval_workers > 1:
+            try:
+                ctx = mp.get_context("fork")
+            except (ValueError, RuntimeError) as exc:
+                raise SystemExit(
+                    f"--parallel-eval-workers > 1 requires the 'fork' "
+                    f"multiprocessing start method (Linux). Got: {exc}. "
+                    f"Use --parallel-eval-workers 1 on this platform."
+                )
+            n_workers = args.parallel_eval_workers
+            print(f"\nParallel per-model threshold tune "
+                  f"(flat-phase scheduling):")
+
+            # Populate module globals BEFORE pool creation so forked
+            # workers inherit them (copy-on-write, no pickling).
+            global _WORKER_PROB_DICTS, _WORKER_GT_EVENTS
+            _WORKER_PROB_DICTS = prob_dicts
+            _WORKER_GT_EVENTS = gt_events
+
+            individual_metrics = parallel_per_model_threshold_tune(
+                n_models=len(prob_dicts),
+                ckpt_paths=list(args.checkpoints),
+                n_workers=n_workers,
+                ctx=ctx,
+            )
+
+            # Echo per-model summary in input order — matches the
+            # sequential path's printout.
+            print()
+            for i, im in enumerate(individual_metrics):
+                short = Path(im["path"]).parent.name
+                print(f"  #{i+1} {short}: "
+                      f"micro={im['f1']:.3f} "
+                      f"macro={im['macro_f1']:.3f} "
+                      f"thr={[f'{t:.2f}' for t in im['thresholds']]}")
+
+            # Drop the global references — Optuna doesn't need them and
+            # we don't want them keeping ~260 MB alive longer than
+            # necessary. (The actual probs are still alive via the
+            # local prob_dicts; this just unbinds the global names.)
+            _WORKER_PROB_DICTS = []
+            _WORKER_GT_EVENTS = []
 
         # Combine.
         if per_class_mode:
@@ -933,6 +1182,7 @@ def main() -> None:
         ),
         "segment_s": float(args.segment_s),
         "overlap_s": float(args.overlap_s),
+        "parallel_eval_workers": int(args.parallel_eval_workers),
         "combination": combination_label,
         "n_trials": int(args.n_trials),
         "macro_f1_default": float(base_macro),
