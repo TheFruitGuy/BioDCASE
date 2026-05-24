@@ -56,9 +56,12 @@ Usage
 -----
 ::
 
-    python train_phase12a.py                 # train, no W&B
-    python train_phase12a.py --wandb         # train and log to W&B
-    python train_phase12a.py --wandb --wandb-mode offline
+    python train_phase12a.py
+    python train_phase12a.py --epochs 40 --seed 1337
+
+W&B logging is unconditional — every run lands on the dashboard. To
+run offline (e.g. on a node without internet), set
+``WANDB_MODE=offline`` in the environment; wandb honours that natively.
 """
 
 from __future__ import annotations
@@ -92,6 +95,11 @@ from train_final import (
     validate,
     resample_negatives_for_epoch,
 )
+
+# W&B logging is unconditional: every phase 12a run lands on the
+# dashboard. Set ``WANDB_MODE=offline`` in the environment if you need
+# offline behaviour (wandb honours that natively).
+import wandb_utils as wbu
 
 
 # ======================================================================
@@ -137,11 +145,6 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Train phase 12a (FDConv on the final recipe)."
     )
-    p.add_argument("--wandb", action="store_true",
-                   help="Log this run to Weights & Biases.")
-    p.add_argument("--wandb-mode", default="online",
-                   choices=["online", "offline", "disabled"],
-                   help="W&B run mode (only used when --wandb is set).")
     p.add_argument("--epochs", type=int, default=cfg.EPOCHS,
                    help=f"Number of training epochs (default {cfg.EPOCHS}).")
     p.add_argument("--seed", type=int, default=cfg.SEED,
@@ -175,38 +178,35 @@ def main():
         train_sites, device, verbose=True,
     )
 
-    # --- optional W&B run -------------------------------------------------
-    # Same config payload as train_final, plus FDConv-specific keys so
-    # the wandb dashboard shows what changed vs. the final baseline.
-    run = None
-    wbu = None
-    if args.wandb:
-        import wandb_utils as wbu
-        run = wbu.init_phase("12a", config={
-            "lr": cfg.LR,
-            "weight_decay": cfg.WEIGHT_DECAY,
-            "batch_size": cfg.BATCH_SIZE,
-            "threshold": cfg.THRESHOLD,
-            "seed": seed,
-            "neg_ratio": cfg.NEG_RATIO,
-            "neg_resample_each_epoch": True,
-            "segment_s": cfg.TRAIN_SEGMENT_S,
-            "epochs": args.epochs,
-            "train_sites": train_sites,
-            "val_sites": val_sites,
-            "lstm_hidden": cfg.LSTM_HIDDEN,
-            "lstm_layers": cfg.LSTM_LAYERS,
-            "pos_weight": weight_info["pos_weight"],
-            "pos_weight_counts": weight_info["annotation_counts"],
-            "pos_weight_ratio": weight_info["weight_ratio"],
-            # FDConv-specific config — single-axis change vs. "final".
-            "arch_change":         "fdconv_aggregation",
-            "fdconv_K":            PHASE12A_K,
-            "fdconv_reduction":    PHASE12A_REDUCTION,
-            "fdconv_positions":    list(PHASE12A_POSITIONS),
-            "fdconv_layer_count":  len(PHASE12A_POSITIONS),
-            "fdconv_total_layers": 3,  # there are 3 depthwise convs
-        }, mode=args.wandb_mode)
+    # --- W&B run ---------------------------------------------------------
+    # Always logged. Same config payload as train_final, plus FDConv-
+    # specific keys so the wandb dashboard shows what changed vs. the
+    # final baseline.
+    run = wbu.init_phase("12a", config={
+        "lr": cfg.LR,
+        "weight_decay": cfg.WEIGHT_DECAY,
+        "batch_size": cfg.BATCH_SIZE,
+        "threshold": cfg.THRESHOLD,
+        "seed": seed,
+        "neg_ratio": cfg.NEG_RATIO,
+        "neg_resample_each_epoch": True,
+        "segment_s": cfg.TRAIN_SEGMENT_S,
+        "epochs": args.epochs,
+        "train_sites": train_sites,
+        "val_sites": val_sites,
+        "lstm_hidden": cfg.LSTM_HIDDEN,
+        "lstm_layers": cfg.LSTM_LAYERS,
+        "pos_weight": weight_info["pos_weight"],
+        "pos_weight_counts": weight_info["annotation_counts"],
+        "pos_weight_ratio": weight_info["weight_ratio"],
+        # FDConv-specific config — single-axis change vs. "final".
+        "arch_change":         "fdconv_aggregation",
+        "fdconv_K":            PHASE12A_K,
+        "fdconv_reduction":    PHASE12A_REDUCTION,
+        "fdconv_positions":    list(PHASE12A_POSITIONS),
+        "fdconv_layer_count":  len(PHASE12A_POSITIONS),
+        "fdconv_total_layers": 3,  # there are 3 depthwise convs
+    })
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path(cfg.OUTPUT_DIR) / f"phase12a_{timestamp}"
@@ -269,8 +269,7 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel parameters: {n_params:,}  "
           f"(FDConv variant of model_final.WhaleVAD)")
-    if run is not None:
-        run.config.update({"n_params": n_params}, allow_val_change=True)
+    run.config.update({"n_params": n_params}, allow_val_change=True)
 
     criterion = nn.BCEWithLogitsLoss(
         reduction="none", pos_weight=pos_weight,
@@ -332,8 +331,7 @@ def main():
         macro = sum(val["per_class"][n]["f1"] for n in cfg.CALL_TYPES_3) / 3
         print(f"    OVERALL F1={val['f1']:.3f}  MACRO F1={macro:.3f}")
 
-        if run is not None:
-            wbu.log_epoch_3class(epoch, train_loss, val)
+        wbu.log_epoch_3class(epoch, train_loss, val)
 
         history.append({
             "epoch": epoch,
@@ -388,11 +386,10 @@ def main():
         f"best micro F1 {max(f1s):.3f}, best macro F1 {max(macros):.3f}; "
         f"second-half mean F1 swing {mean_swing:.3f}."
     )
-    if run is not None:
-        wbu.finalize_phase(
-            history, verdict=verdict,
-            best_ckpt=run_dir / "phase12a_best.pt",
-        )
+    wbu.finalize_phase(
+        history, verdict=verdict,
+        best_ckpt=run_dir / "phase12a_best.pt",
+    )
 
 
 if __name__ == "__main__":
