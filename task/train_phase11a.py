@@ -54,9 +54,11 @@ Usage
 -----
 ::
 
-    python train_phase11a.py                 # no W&B
-    python train_phase11a.py --wandb         # log to W&B as phase 11a
-    python train_phase11a.py --wandb --T_fast 5 --T_slow 25
+    python train_phase11a.py                          # online W&B (default)
+    python train_phase11a.py --wandb-mode offline     # offline (no network)
+    python train_phase11a.py --T_fast 5 --T_slow 25   # sweep PCEN T
+
+W&B logging is always on; ``--wandb-mode`` selects online/offline/disabled.
 """
 
 from __future__ import annotations
@@ -263,11 +265,12 @@ def parse_args() -> argparse.Namespace:
         description="Phase 11a: train the final recipe with a two-stream "
                     "PCEN frontend."
     )
-    p.add_argument("--wandb", action="store_true",
-                   help="Log this run to Weights & Biases as phase 11a.")
+    # W&B logging is always on for phase-ladder runs so every rung lands in
+    # the dashboard; only the run mode is configurable (offline if no
+    # network, disabled to suppress entirely for smoke tests).
     p.add_argument("--wandb-mode", default="online",
                    choices=["online", "offline", "disabled"],
-                   help="W&B run mode (only used when --wandb is set).")
+                   help="W&B run mode (default online).")
     p.add_argument("--epochs", type=int, default=cfg.EPOCHS,
                    help=f"Number of training epochs (default {cfg.EPOCHS}).")
     p.add_argument("--seed", type=int, default=cfg.SEED,
@@ -315,38 +318,35 @@ def main():
     print(f"\nComputing 7-class pos_weight over {len(train_sites)} sites...")
     pos_weight, weight_info = compute_pos_weight(train_sites, device, verbose=True)
 
-    # --- optional W&B run ---
-    run = None
-    wbu = None
-    if args.wandb:
-        import wandb_utils as wbu  # noqa: F401 (rebound for closures below)
-        run = wbu.init_phase("11a", config={
-            "lr":             cfg.LR,
-            "weight_decay":   cfg.WEIGHT_DECAY,
-            "batch_size":     cfg.BATCH_SIZE,
-            "threshold":      cfg.THRESHOLD,
-            "seed":           seed,
-            "neg_ratio":      cfg.NEG_RATIO,
-            "neg_resample_each_epoch": True,
-            "segment_s":      cfg.TRAIN_SEGMENT_S,
-            "epochs":         args.epochs,
-            "train_sites":    train_sites,
-            "val_sites":      val_sites,
-            "lstm_hidden":    cfg.LSTM_HIDDEN,
-            "lstm_layers":    cfg.LSTM_LAYERS,
-            "pos_weight":     weight_info["pos_weight"],
-            "pos_weight_counts": weight_info["annotation_counts"],
-            "pos_weight_ratio": weight_info["weight_ratio"],
-            # Phase 11a specific
-            "frontend":       "two_stream_pcen",
-            "feat_channels":  4,
-            "pcen_T_fast":    args.T_fast,
-            "pcen_T_slow":    args.T_slow,
-            "pcen_alpha":     args.alpha,
-            "pcen_delta":     args.delta,
-            "pcen_r":         args.r,
-            "pcen_trainable": False,
-        }, mode=args.wandb_mode)
+    # --- W&B run (always on for phase-ladder tracking) ---
+    import wandb_utils as wbu
+    run = wbu.init_phase("11a", config={
+        "lr":             cfg.LR,
+        "weight_decay":   cfg.WEIGHT_DECAY,
+        "batch_size":     cfg.BATCH_SIZE,
+        "threshold":      cfg.THRESHOLD,
+        "seed":           seed,
+        "neg_ratio":      cfg.NEG_RATIO,
+        "neg_resample_each_epoch": True,
+        "segment_s":      cfg.TRAIN_SEGMENT_S,
+        "epochs":         args.epochs,
+        "train_sites":    train_sites,
+        "val_sites":      val_sites,
+        "lstm_hidden":    cfg.LSTM_HIDDEN,
+        "lstm_layers":    cfg.LSTM_LAYERS,
+        "pos_weight":     weight_info["pos_weight"],
+        "pos_weight_counts": weight_info["annotation_counts"],
+        "pos_weight_ratio": weight_info["weight_ratio"],
+        # Phase 11a specific
+        "frontend":       "two_stream_pcen",
+        "feat_channels":  4,
+        "pcen_T_fast":    args.T_fast,
+        "pcen_T_slow":    args.T_slow,
+        "pcen_alpha":     args.alpha,
+        "pcen_delta":     args.delta,
+        "pcen_r":         args.r,
+        "pcen_trainable": False,
+    }, mode=args.wandb_mode)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path(cfg.OUTPUT_DIR) / f"phase11a_{timestamp}"
@@ -411,8 +411,7 @@ def main():
     print(f"\nModel parameters: {n_params:,}")
     print(f"PCEN s_fast={spec_extractor.s_fast:.5f}  "
           f"s_slow={spec_extractor.s_slow:.5f}")
-    if run is not None:
-        run.config.update({"n_params": n_params}, allow_val_change=True)
+    run.config.update({"n_params": n_params}, allow_val_change=True)
 
     criterion = nn.BCEWithLogitsLoss(
         reduction="none", pos_weight=pos_weight,
@@ -472,8 +471,7 @@ def main():
         macro = sum(val["per_class"][n]["f1"] for n in cfg.CALL_TYPES_3) / 3
         print(f"    OVERALL F1={val['f1']:.3f}  MACRO F1={macro:.3f}")
 
-        if run is not None:
-            wbu.log_epoch_3class(epoch, train_loss, val)
+        wbu.log_epoch_3class(epoch, train_loss, val)
 
         history.append({
             "epoch":       epoch,
@@ -531,9 +529,8 @@ def main():
         f"best micro F1 {max(f1s):.3f}, best macro F1 {max(macros):.3f}; "
         f"second-half mean F1 swing {mean_swing:.3f}."
     )
-    if run is not None:
-        wbu.finalize_phase(history, verdict=verdict,
-                           best_ckpt=run_dir / "phase11a_best.pt")
+    wbu.finalize_phase(history, verdict=verdict,
+                       best_ckpt=run_dir / "phase11a_best.pt")
 
 
 if __name__ == "__main__":
