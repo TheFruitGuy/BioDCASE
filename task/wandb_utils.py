@@ -593,22 +593,27 @@ PHASE_REGISTRY: dict[str, dict] = {
         interventions=["multi_res_stft"],
     ),
     "11a": dict(
-        parent="baseline",
+        parent="final",
         hypothesis=(
-            "Two-stream PCEN frontend (T_fast=5s, T_slow=25s) replacing "
-            "|STFT| with per-band AGC matched to the BMABZ-vs-D/BP duration "
-            "spread observed in the training data (P95 = 12.89 s for BMABZ "
-            "vs ~4 s for D and BP). Cos/sin phase channels unchanged, so "
-            "the CNN input goes from 3 to 4 channels. PCEN scalars "
-            "(alpha=0.98, delta=2.0, r=0.5) fixed at Wang et al. 2017 "
-            "defaults; the IIR uses analytical warm-start initialisation "
-            "via per-band mean of the first 1s. Same-day de-risk before "
-            "committing to LEAF: if PCEN alone moves macro F1 outside the "
-            "seed-noise band, the frontend bottleneck is in per-band "
-            "normalisation rather than learnable filter shape, which is a "
-            "strong prior that LEAF will do more on top. If neutral, the "
-            "bottleneck is filterbank shape and LEAF's value (if any) has "
-            "to come from there — a more specific bet."
+            "Two-stream PCEN frontend on top of the final recipe "
+            "(7-class WBCE + per-epoch neg resampling). Replace |STFT| "
+            "with two PCEN streams (T_fast=5s, T_slow=25s) matched to "
+            "the BMABZ-vs-D/BP duration spread observed in the training "
+            "data (P95 = 12.89 s for BMABZ vs ~4 s for D and BP). "
+            "Cos/sin phase channels unchanged, so the CNN input goes "
+            "from 3 to 4 channels; everything else (8-site data, paper "
+            "BiLSTM, segment-count WBCE, per-epoch neg resampling) is "
+            "held fixed. PCEN scalars (alpha=0.98, delta=2.0, r=0.5) "
+            "frozen at Wang et al. 2017 defaults; the IIR uses "
+            "analytical warm-start initialisation. Same-day de-risk "
+            "before LEAF: if PCEN moves macro F1 outside the seed-noise "
+            "band, the frontend bottleneck is in per-band normalisation "
+            "rather than learnable filter shape -- strong prior that "
+            "LEAF will do more on top. If neutral, the bottleneck is "
+            "filterbank shape and LEAF's value (if any) has to come "
+            "from there. Same parent as 10a (multi-res STFT) and 9a "
+            "(BPN reproduction) -- frontend change on top of the "
+            "canonical final recipe."
         ),
         interventions=["pcen_2stream_frontend"],
     ),

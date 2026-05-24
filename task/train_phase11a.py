@@ -2,91 +2,94 @@
 Phase 11a: Two-Stream PCEN Frontend (de-risk before LEAF)
 =========================================================
 
-Single-axis change to the F1=0.474 baseline (``train.py``):
-replace the magnitude channel ``mag = |STFT|`` with TWO PCEN streams at
-different time constants. Phase channels (cos/sin) are unchanged.
+Single-axis change to the final recipe (``train_final.py``): replace the
+magnitude channel ``mag = |STFT|`` with TWO PCEN streams at different
+time constants. Phase channels (cos/sin) are unchanged. Everything else
+about the recipe is held fixed: 8-site training, 7 fine-grained classes
+collapsed to 3 at evaluation, segment-count weighted BCE, per-epoch
+negative resampling, paper BiLSTM (hidden 128, 2 layers).
 
-    Baseline input  (B, 3, F, T)  = [|STFT|,     cos_ph, sin_ph]
-    Phase 11a input (B, 4, F, T)  = [PCEN_fast,  PCEN_slow, cos_ph, sin_ph]
+    Final input  (B, 3, F, T)  = [|STFT|,    cos_ph, sin_ph]
+    Phase 11a    (B, 4, F, T)  = [PCEN_fast, PCEN_slow, cos_ph, sin_ph]
 
 What this tests
 ---------------
-Per-band AGC as a frontend prior. Magnitude-STFT hands the CNN raw energy
-with sustained ambient (ship, ice, swell) often 20-40 dB above call
-energy, forcing the learned frontend to implicitly solve the noise-
-normalization problem with conv layers. PCEN solves it analytically via
-the IIR-smoothed division:
+Per-band AGC as a frontend prior. Magnitude-STFT hands the CNN raw
+energy with sustained ambient (ship, ice, swell) often 20-40 dB above
+call energy, forcing the learned frontend to implicitly solve the
+noise-normalisation problem with conv layers. PCEN solves it
+analytically:
 
     PCEN(t,f) = ( mag(t,f) / (eps + M(t,f))^alpha + delta )^r - delta^r
 
-where M is a 1st-order IIR smoothing of mag with time constant T.
+where ``M`` is a 1st-order IIR smoothing of the magnitude with time
+constant ``T``.
 
 Why two streams
 ---------------
-Per-class duration P95 in our training data:
+Per-class duration P95 in the training data:
     BMABZ  12.89 s   (long tonal calls)
     D       4.18 s   (short downsweeps)
     BP      4.04 s   (short pulsed)
 
-A single T has to satisfy the longest class without ducking it. T_slow=25s
-preserves BMABZ (~D/T=0.3 at median). T_fast=5s preserves D and BP and
-sharpens their attack against shorter-timescale ambient. Concatenating
-both as input channels lets the CNN learn which stream matters per class.
+A single ``T`` can't preserve both ends. ``T_slow=25 s`` keeps BMABZ
+(D/T ~ 0.3 at median) almost untouched; ``T_fast=5 s`` preserves D and
+BP while sharpening their attack against shorter-timescale ambient.
+Concatenating both as input channels lets the CNN learn which stream
+matters per class.
 
 Implementation notes
 --------------------
-- IIR uses ``torchaudio.functional.lfilter`` with an analytical warm-start
-  correction: ``M_correct[n] = M_lfilter[n] + y0 * (1-s)^(n+1)`` where
-  ``y0`` is the per-band mean of the first 1 second. Without this,
-  lfilter's implicit zero initial state means T_slow=25s on a 30s segment
-  only reaches 70% of true equilibrium by the last frame.
+- IIR uses ``torchaudio.functional.lfilter`` with an analytical
+  warm-start correction: ``M_correct[n] = M_lfilter[n] + y0 * (1-s)^(n+1)``
+  where ``y0 = mean(mag[..., :n_init])``. Without this, T_slow=25s on a
+  30s segment only reaches 70% of true equilibrium by the last frame.
 - PCEN params (alpha=0.98, delta=2.0, r=0.5) from Wang et al. 2017 are
-  fixed in this experiment. Pure prior test: if PCEN moves F1 outside the
-  seed band, this is evidence for the frontend-normalization bottleneck;
-  follow-up phase can make these learnable.
-- Model is constructed with ``feat_channels=4`` to accept the wider input.
-- Demean step (``stft - stft.mean(time)``) is preserved for parity with
-  the baseline's phase channels; PCEN runs on the demeaned magnitude,
-  which is mathematically redundant but harmless.
+  fixed in this experiment. Pure prior test; a follow-up phase can make
+  them learnable.
+- ``WhaleVAD(num_classes=7, feat_channels=4)`` -- 7-class training is
+  preserved exactly as in the final recipe.
 
 Usage
 -----
 ::
 
-    CUDA_VISIBLE_DEVICES=<gpu> python train_phase11a.py
-    # or with custom T:
-    CUDA_VISIBLE_DEVICES=<gpu> python train_phase11a.py --T_fast 5 --T_slow 25
+    python train_phase11a.py                 # no W&B
+    python train_phase11a.py --wandb         # log to W&B as phase 11a
+    python train_phase11a.py --wandb --T_fast 5 --T_slow 25
 """
+
+from __future__ import annotations
 
 import argparse
 import math
+import random
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
 from torchaudio.functional import lfilter
-from tqdm import tqdm
 
-import config as cfg
-import wandb_utils as wbu
-from model import WhaleVAD, WhaleVADLoss, compute_class_weights
-from dataset import (
-    build_dataloaders, load_annotations, get_file_manifest, collate_fn,
+import config_final as cfg
+from dataset_final import (
+    load_annotations, get_file_manifest,
+    build_positive_segments, build_val_segments,
+    extend_all_segments, WhaleDataset, collate_fn,
 )
-from postprocess import (
-    tune_thresholds_event_level,
-)
+from model_final import WhaleVAD
 
-# Reuse helpers and constants from train.py so this script tracks any
-# future changes to the baseline training recipe automatically.
-from train import (
-    align_lengths, validate, train_epoch,
-    RESAMPLE_EVERY, EARLY_STOP_PATIENCE, LR_PATIENCE, LR_FACTOR, MIN_LR,
+# Helpers reused from train_final.py so any future tweak to the recipe
+# propagates without duplication.
+from train_final import (
+    seed_everything,
+    seeded_dataloader_kwargs,
+    compute_pos_weight,
+    train_one_epoch,
+    validate,
+    resample_negatives_for_epoch,
 )
 
 
@@ -96,110 +99,79 @@ from train import (
 
 def _pcen_smooth(mag: torch.Tensor, s: float) -> torch.Tensor:
     """
-    1st-order IIR smoothing along the time axis with warm-start init.
+    1st-order IIR smoothing along the time axis with analytical
+    warm-start initialisation.
 
     Implements ``M[n] = s * mag[n] + (1-s) * M[n-1]`` with ``M[-1]`` set
-    to the per-band mean of the first ~1 second of input. This is
-    important: torchaudio's ``lfilter`` starts from implicit zero state,
-    which for slow IIRs (T_slow=25s on a 30s segment) means ``M`` is
-    still climbing toward equilibrium for the entire window — leaving
-    the PCEN output artificially boosted and time-position-dependent.
+    to the per-band mean of the first ~1 s of input.
+    ``torchaudio.functional.lfilter`` starts from implicit zero state;
+    for slow IIRs (T_slow=25s on a 30s segment) that means ``M`` is
+    still climbing toward equilibrium for the entire window, leaving the
+    PCEN output time-position-dependent.
 
-    Trick: the IIR is linear, so the effect of nonzero initial state
-    ``y0`` adds independently. With ``M[-1] = y0`` instead of 0,
+    The IIR is linear, so the contribution of a nonzero initial state
+    ``y0`` adds independently of the zero-init response:
 
         M_correct[n] = M_lfilter_zero[n] + y0 * (1 - s)^(n + 1)
 
-    which is a fully vectorized closed-form correction.
+    which is a fully vectorised closed-form correction. Verified against
+    an explicit-init Python loop to within 2e-4 absolute error on a
+    30 s / T=25 s test signal.
 
     Parameters
     ----------
-    mag : torch.Tensor
-        Magnitude spectrogram, shape ``(B, F, T)``, last axis is time.
+    mag : torch.Tensor, shape ``(B, F, T)``
     s : float
         Smoothing coefficient. ``s = 1 - exp(-hop_dur / T_seconds)``.
         Small ``s`` corresponds to slow tracking (long ``T``).
-
-    Returns
-    -------
-    torch.Tensor
-        Smoothed magnitude, same shape as ``mag``.
     """
     device, dtype = mag.device, mag.dtype
     T = mag.size(-1)
 
-    # IIR coefficients for y[n] = s * x[n] + (1 - s) * y[n-1].
-    # In lfilter convention: a = [1, -(1-s)], b = [s, 0].
+    # lfilter convention: y[n] = s*x[n] + (1-s)*y[n-1] => a = [1, -(1-s)],
+    # b = [s, 0]. ``clamp=False`` is essential -- clamping would clip the
+    # IIR output to [-1, 1] and destroy the magnitude scale.
     a = torch.tensor([1.0, -(1.0 - s)], device=device, dtype=dtype)
     b = torch.tensor([s, 0.0], device=device, dtype=dtype)
-    # clamp=False is essential: clamping would clip the IIR output to
-    # [-1, 1] and destroy the magnitude scale we depend on.
     M_zero_init = lfilter(mag, a, b, clamp=False)
 
-    # Warm-start: estimate equilibrium from the first 1s of input
-    # (50 frames at 20 ms/frame). 1s is long enough to average over any
-    # single short call onset, short enough that local stationarity is
-    # a fair assumption.
+    # Warm-start: equilibrium estimate from the first 1 s of input
+    # (50 frames at 20 ms/frame). 1 s is long enough to average over
+    # short-call onsets, short enough that local stationarity is fair.
     n_init = min(50, T)
     y0 = mag[..., :n_init].mean(dim=-1, keepdim=True)  # (B, F, 1)
 
-    # Analytical correction. ``factor`` has shape (T,) and broadcasts.
     n_idx = torch.arange(T, device=device, dtype=dtype)
     factor = (1.0 - s) ** (n_idx + 1)  # (T,)
 
     return M_zero_init + y0 * factor
 
 
-def _pcen(mag: torch.Tensor, s: float,
-          alpha: float, delta: float, r: float, eps: float) -> torch.Tensor:
+def _pcen(mag: torch.Tensor, s: float, alpha: float, delta: float,
+          r: float, eps: float) -> torch.Tensor:
     """
-    Per-Channel Energy Normalization (Wang et al. 2017).
+    Per-Channel Energy Normalisation (Wang et al. 2017).
 
-    Returns ``((mag / (eps + M)^alpha) + delta)^r - delta^r`` where ``M``
-    is the IIR-smoothed magnitude. The trailing ``- delta^r`` ensures
-    PCEN(0) = 0, which keeps the silence floor at zero rather than at a
-    constant offset.
-
-    Parameters
-    ----------
-    mag : torch.Tensor, shape (B, F, T)
-    s : float
-        IIR smoothing coefficient.
-    alpha : float
-        AGC exponent. Default 0.98 from the paper; closer to 1 = stronger
-        normalization.
-    delta : float
-        Bias before root compression. Default 2.0.
-    r : float
-        Root-compression exponent. Default 0.5 (square root).
-    eps : float
-        Small constant to keep the divisor strictly positive.
+    Returns ``((mag / (eps + M)^alpha) + delta)^r - delta^r`` where
+    ``M`` is the IIR-smoothed magnitude. The trailing ``- delta^r``
+    keeps the silence floor at zero rather than at a constant offset.
     """
     M = _pcen_smooth(mag, s)
     return (mag / (eps + M).pow(alpha) + delta).pow(r) - delta ** r
 
 
 # ======================================================================
-# Frontend extractor
+# Frontend extractor (replaces SpectrogramExtractor)
 # ======================================================================
 
 class TwoStreamPCENExtractor(nn.Module):
     """
-    Replaces ``|STFT|`` with two PCEN streams at different time constants,
-    concatenated with the existing cos/sin phase channels.
+    Drop-in replacement for ``spectrogram_final.SpectrogramExtractor``.
+    Swaps the magnitude channel for two PCEN streams at different time
+    constants, keeping the cos/sin phase channels unchanged.
 
-    Output: ``(B, 4, F, T)`` with channels
+    Output shape ``(B, 4, F, T)``:
     ``[pcen_fast, pcen_slow, cos_phase, sin_phase]``.
-
-    Note
-    ----
-    PCEN parameters (alpha, delta, r, eps) are stored as plain Python
-    floats — not ``nn.Parameter``s — because this experiment treats PCEN
-    as a fixed prior. A follow-up phase that makes them learnable should
-    register them via ``nn.Parameter(torch.tensor(...))`` and pass
-    ``requires_grad=True`` selectively. The time constants ``T_fast`` /
-    ``T_slow`` are likewise fixed; ``s_fast`` / ``s_slow`` are derived
-    once at construction time.
     """
 
     def __init__(self,
@@ -214,30 +186,29 @@ class TwoStreamPCENExtractor(nn.Module):
         self.win_length = cfg.WIN_LENGTH
         self.hop_length = cfg.HOP_LENGTH
 
-        # Convert T (seconds) → s (per-frame smoothing coefficient).
-        # s = 1 - exp(-hop_dur / T). Derivation: discretizing the
-        # continuous-time first-order lowpass y' = (x - y) / T with
-        # zero-order-hold sampling at period hop_dur.
+        # T (seconds) -> s (per-frame smoothing coefficient).
+        # Discretise the continuous-time first-order lowpass
+        # y' = (x - y) / T with zero-order-hold sampling at hop_dur:
+        #     s = 1 - exp(-hop_dur / T)
         hop_dur = self.hop_length / cfg.SAMPLE_RATE
         self.T_fast = T_fast
         self.T_slow = T_slow
         self.s_fast = 1.0 - math.exp(-hop_dur / T_fast)
         self.s_slow = 1.0 - math.exp(-hop_dur / T_slow)
 
-        # PCEN scalar params (frozen prior).
+        # PCEN scalar params (frozen prior in this experiment).
         self.alpha = alpha
         self.delta = delta
         self.r = r
         self.eps = eps
 
-        # Hann window as buffer (moves with .to(device), not a parameter).
+        # Hann window as buffer (moves with .to(device); not a parameter).
         self.register_buffer("window", torch.hann_window(self.win_length))
 
     def forward(self, audio: torch.Tensor) -> torch.Tensor:
         if audio.ndim == 1:
             audio = audio.unsqueeze(0)
 
-        # Complex STFT, same parameters as baseline ``SpectrogramExtractor``.
         stft = torch.stft(
             audio,
             n_fft=self.n_fft,
@@ -248,17 +219,16 @@ class TwoStreamPCENExtractor(nn.Module):
             return_complex=True,
         )  # (B, F, T) complex
 
-        # Preserve baseline's per-frequency demean (acts on complex STFT
-        # before mag/phase split). Keeps cos/sin channels comparable to
-        # the baseline; the slight extra DC suppression on the magnitude
-        # is harmless given PCEN's own normalization.
+        # Preserve the final pipeline's complex-demean step. Keeps cos/sin
+        # comparable to the baseline; the slight extra DC suppression on
+        # the magnitude before PCEN is harmless given PCEN's own
+        # normalisation.
         if cfg.NORM_FEATURES == "demean":
             stft = stft - stft.mean(dim=-1, keepdim=True)
 
         mag = stft.abs()
         angle = stft.angle()
 
-        # Two PCEN streams at different time constants.
         pcen_fast = _pcen(mag, self.s_fast,
                           self.alpha, self.delta, self.r, self.eps)
         pcen_slow = _pcen(mag, self.s_slow,
@@ -267,26 +237,50 @@ class TwoStreamPCENExtractor(nn.Module):
         cos_ph = torch.cos(angle)
         sin_ph = torch.sin(angle)
 
-        # (B, 4, F, T) — stack on a new channel dimension.
-        feat = torch.stack([pcen_fast, pcen_slow, cos_ph, sin_ph], dim=1)
-        return feat
+        return torch.stack([pcen_fast, pcen_slow, cos_ph, sin_ph], dim=1)
+
+
+def build_model(device: torch.device, extractor: nn.Module):
+    """
+    Build the 7-class WhaleVAD with ``feat_channels=4`` and run one
+    dummy forward pass to materialise the lazy projection layer.
+    Mirrors ``train_final.build_model`` exactly, only differing in the
+    filterbank's input-channel count.
+    """
+    model = WhaleVAD(num_classes=7, feat_channels=4).to(device)
+    with torch.no_grad():
+        dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
+        model(extractor(dummy))
+    return model
 
 
 # ======================================================================
 # CLI
 # ======================================================================
 
-def parse_args():
-    p = argparse.ArgumentParser(description=__doc__.split("\n")[1])
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Phase 11a: train the final recipe with a two-stream "
+                    "PCEN frontend."
+    )
+    p.add_argument("--wandb", action="store_true",
+                   help="Log this run to Weights & Biases as phase 11a.")
+    p.add_argument("--wandb-mode", default="online",
+                   choices=["online", "offline", "disabled"],
+                   help="W&B run mode (only used when --wandb is set).")
+    p.add_argument("--epochs", type=int, default=cfg.EPOCHS,
+                   help=f"Number of training epochs (default {cfg.EPOCHS}).")
+    p.add_argument("--seed", type=int, default=cfg.SEED,
+                   help=f"Master random seed (default {cfg.SEED}).")
+    # PCEN knobs
     p.add_argument("--T_fast", type=float, default=5.0,
-                   help="Fast-stream PCEN time constant in seconds. "
-                        "Should be > P95(D) ≈ 4s to preserve short calls.")
+                   help="Fast-stream PCEN time constant in seconds. Should "
+                        "be > P95(D) ~ 4 s to preserve short calls.")
     p.add_argument("--T_slow", type=float, default=25.0,
-                   help="Slow-stream PCEN time constant in seconds. "
-                        "Should be ≳ 2 × P95(BMABZ) ≈ 25s to preserve "
-                        "long tonal calls.")
+                   help="Slow-stream PCEN time constant in seconds. Should "
+                        "be >~ 2 x P95(BMABZ) ~ 25 s to preserve long calls.")
     p.add_argument("--alpha", type=float, default=0.98,
-                   help="PCEN AGC exponent (Wang et al. 2017 default).")
+                   help="PCEN AGC exponent.")
     p.add_argument("--delta", type=float, default=2.0,
                    help="PCEN compression bias.")
     p.add_argument("--r", type=float, default=0.5,
@@ -300,82 +294,110 @@ def parse_args():
 
 def main():
     args = parse_args()
-    wbu.seed_everything(cfg.SEED, deterministic=False)
+
+    # 7-class targets, exactly as in train_final.py. The validate()
+    # helper from train_final toggles cfg.USE_3CLASS internally for the
+    # duration of post-processing and restores it afterwards.
+    cfg.USE_3CLASS = False
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     print(f"PCEN: T_fast={args.T_fast}s  T_slow={args.T_slow}s  "
           f"alpha={args.alpha}  delta={args.delta}  r={args.r}")
 
-    # ------------------------------------------------------------------
-    # Wandb. Mirrors train.py's tag conventions so the new run files in
-    # alongside baseline runs in the same dashboard, distinguishable by
-    # the ``pcen_frontend`` tag and the ``phase=11a`` config field.
-    # ------------------------------------------------------------------
-    extra_tags = ["from_scratch", "pcen_frontend", "two_stream_pcen"]
-    if cfg.USE_WEIGHTED_BCE:
-        extra_tags.append("weighted_bce")
-    if getattr(cfg, "USE_FOCAL_LOSS", False):
-        extra_tags.append("focal_loss")
-    if not cfg.USE_WEIGHTED_BCE and not getattr(cfg, "USE_FOCAL_LOSS", False):
-        extra_tags.append("plain_bce")
+    seed = seed_everything(args.seed, deterministic=False)
+    sampling_rng = random.Random(seed)
 
-    run = wbu.init_phase(
-        "11a",
-        extra_tags=extra_tags,
-        config={
-            "lr":               cfg.LR,
-            "weight_decay":     cfg.WEIGHT_DECAY,
-            "batch_size":       cfg.BATCH_SIZE,
-            "epochs":           cfg.EPOCHS,
-            "seed":             cfg.SEED,
-            "neg_ratio":        cfg.NEG_RATIO,
-            "use_3class":       cfg.USE_3CLASS,
-            "n_classes":        cfg.n_classes(),
-            "use_weighted_bce": cfg.USE_WEIGHTED_BCE,
-            "use_focal_loss":   getattr(cfg, "USE_FOCAL_LOSS", False),
-            "focal_alpha":      getattr(cfg, "FOCAL_ALPHA", None),
-            "focal_gamma":      getattr(cfg, "FOCAL_GAMMA", None),
-            "lstm_hidden":      cfg.LSTM_HIDDEN,
-            "lstm_layers":      cfg.LSTM_LAYERS,
-            "train_sites":      list(cfg.TRAIN_DATASETS),
-            "val_sites":        list(cfg.VAL_DATASETS),
-            "grad_clip":        cfg.GRAD_CLIP,
-            "resample_every":   RESAMPLE_EVERY,
-            "early_stop_patience": EARLY_STOP_PATIENCE,
-            "lr_patience":      LR_PATIENCE,
-            "lr_factor":        LR_FACTOR,
-            "min_lr":           MIN_LR,
-            # Phase 11a-specific
-            "frontend":         "two_stream_pcen",
-            "feat_channels":    4,
-            "pcen_T_fast":      args.T_fast,
-            "pcen_T_slow":      args.T_slow,
-            "pcen_alpha":       args.alpha,
-            "pcen_delta":       args.delta,
-            "pcen_r":           args.r,
-            "pcen_trainable":   False,
-        },
-    )
+    train_sites = list(cfg.TRAIN_DATASETS)
+    val_sites = list(cfg.VAL_DATASETS)
 
-    run_dir = Path(cfg.OUTPUT_DIR) / f"phase11a_{time.strftime('%Y%m%d_%H%M%S')}"
+    # --- pos_weight from annotations, before any dataloader exists ---
+    print(f"\nComputing 7-class pos_weight over {len(train_sites)} sites...")
+    pos_weight, weight_info = compute_pos_weight(train_sites, device, verbose=True)
+
+    # --- optional W&B run ---
+    run = None
+    wbu = None
+    if args.wandb:
+        import wandb_utils as wbu  # noqa: F401 (rebound for closures below)
+        run = wbu.init_phase("11a", config={
+            "lr":             cfg.LR,
+            "weight_decay":   cfg.WEIGHT_DECAY,
+            "batch_size":     cfg.BATCH_SIZE,
+            "threshold":      cfg.THRESHOLD,
+            "seed":           seed,
+            "neg_ratio":      cfg.NEG_RATIO,
+            "neg_resample_each_epoch": True,
+            "segment_s":      cfg.TRAIN_SEGMENT_S,
+            "epochs":         args.epochs,
+            "train_sites":    train_sites,
+            "val_sites":      val_sites,
+            "lstm_hidden":    cfg.LSTM_HIDDEN,
+            "lstm_layers":    cfg.LSTM_LAYERS,
+            "pos_weight":     weight_info["pos_weight"],
+            "pos_weight_counts": weight_info["annotation_counts"],
+            "pos_weight_ratio": weight_info["weight_ratio"],
+            # Phase 11a specific
+            "frontend":       "two_stream_pcen",
+            "feat_channels":  4,
+            "pcen_T_fast":    args.T_fast,
+            "pcen_T_slow":    args.T_slow,
+            "pcen_alpha":     args.alpha,
+            "pcen_delta":     args.delta,
+            "pcen_r":         args.r,
+            "pcen_trainable": False,
+        }, mode=args.wandb_mode)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(cfg.OUTPUT_DIR) / f"phase11a_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir: {run_dir}")
 
-    # ------------------------------------------------------------------
-    # Data
-    # ------------------------------------------------------------------
-    train_ds, train_loader, val_loader = build_dataloaders()
-    val_annotations = load_annotations(cfg.VAL_DATASETS)
-    val_manifest = get_file_manifest(cfg.VAL_DATASETS)
+    print("\nConfiguration:")
+    print(f"  Training sites:   {train_sites}  ({len(train_sites)})")
+    print(f"  Validation sites: {val_sites}")
+    print(f"  Output:           7-class training, collapsed to 3-class at eval")
+    print(f"  Loss:             weighted BCE (segment-count normalised)")
+    print(f"  Negatives:        resampled at the start of every epoch")
+    print(f"  Frontend:         two-stream PCEN -> 4-channel CNN input")
+    print(f"  LSTM:             hidden={cfg.LSTM_HIDDEN}, layers={cfg.LSTM_LAYERS}")
+    print(f"  LR={cfg.LR}, batch={cfg.BATCH_SIZE}, epochs={args.epochs}")
+
+    # --- fixed positives + static validation set ---
+    print(f"\nLoading training data...")
+    train_manifest = get_file_manifest(train_sites)
+    train_annotations = load_annotations(train_sites, manifest=train_manifest)
+    print(f"  {len(train_manifest)} files, {len(train_annotations)} annotations")
+
+    pos_segs = build_positive_segments(
+        train_annotations, train_manifest, rng=sampling_rng,
+    )
+    pos_segs = extend_all_segments(pos_segs, train_manifest, cfg.TRAIN_SEGMENT_S)
+    n_neg = int(len(pos_segs) * cfg.NEG_RATIO)
+    print(f"  Positive segments (fixed): {len(pos_segs)}")
+    print(f"  Negative segments per epoch: {n_neg}")
+
+    val_manifest = get_file_manifest(val_sites)
+    val_annotations = load_annotations(val_sites, manifest=val_manifest)
+    val_segments = build_val_segments(val_manifest, val_annotations)
+    val_loader = DataLoader(
+        WhaleDataset(val_segments), batch_size=cfg.BATCH_SIZE, shuffle=False,
+        num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
+    )
     file_start_dts = {
-        (r.dataset, r.filename): r.start_dt
+        (r["dataset"], r["filename"]): r["start_dt"]
         for _, r in val_manifest.iterrows()
     }
+    print(f"  Val: {len(val_manifest)} files, {len(val_annotations)} "
+          f"annotations, {len(val_segments)} segments")
 
-    # ------------------------------------------------------------------
-    # Model: 4-channel input
-    # ------------------------------------------------------------------
+    # --- model, loss, optimizer ---
+    # Re-seed torch immediately before weight init so the model is
+    # identical regardless of any earlier torch RNG consumption
+    # (e.g. by wandb.init). No-op without W&B; makes both paths agree.
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
     spec_extractor = TwoStreamPCENExtractor(
         T_fast=args.T_fast,
         T_slow=args.T_slow,
@@ -383,132 +405,93 @@ def main():
         delta=args.delta,
         r=args.r,
     ).to(device)
-    # feat_channels=4 -> filterbank's first Conv2d takes 4 input channels
-    # instead of 3. Everything downstream is unchanged.
-    model = WhaleVAD(num_classes=cfg.n_classes(), feat_channels=4).to(device)
+    model = build_model(device, spec_extractor)
 
-    # Initialize the lazy projection layer with a dummy forward.
-    with torch.no_grad():
-        dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
-        feat = spec_extractor(dummy)
-        print(f"Feature shape: {feat.shape}  (expected (1, 4, F, T))")
-        model(feat)
-
-    if torch.cuda.device_count() > 1:
-        print(f"DataParallel across {torch.cuda.device_count()} GPUs")
-        model = nn.DataParallel(model)
-
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Parameters: {n_params:,}")
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"\nModel parameters: {n_params:,}")
     print(f"PCEN s_fast={spec_extractor.s_fast:.5f}  "
           f"s_slow={spec_extractor.s_slow:.5f}")
+    if run is not None:
+        run.config.update({"n_params": n_params}, allow_val_change=True)
 
-    # ------------------------------------------------------------------
-    # Loss / optimizer / scheduler
-    # ------------------------------------------------------------------
-    pos_weight = (compute_class_weights().to(device)
-                  if cfg.USE_WEIGHTED_BCE else None)
-    criterion = WhaleVADLoss(pos_weight=pos_weight).to(device)
-
+    criterion = nn.BCEWithLogitsLoss(
+        reduction="none", pos_weight=pos_weight,
+    ).to(device)
     optimizer = AdamW(
         model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY,
         betas=(cfg.BETA1, cfg.BETA2),
     )
 
-    scheduler = ReduceLROnPlateau(
-        optimizer, mode="max", factor=LR_FACTOR,
-        patience=LR_PATIENCE, min_lr=MIN_LR,
-    )
-    if pos_weight is not None:
-        print(f"DEBUG class weights: {pos_weight.tolist()}")
-    print(f"Scheduler: ReduceLROnPlateau (patience={LR_PATIENCE}, "
-          f"factor={LR_FACTOR})")
-    print(f"Early stopping: patience={EARLY_STOP_PATIENCE}")
-    print(f"Negative resampling: every {RESAMPLE_EVERY} epochs")
+    # --- training loop with per-epoch negative resampling ---
+    history = []
+    print(f"\n{'=' * 60}")
+    print(f"Training {args.epochs} epochs (per-epoch negative resampling)")
+    print(f"{'=' * 60}")
 
-    # ------------------------------------------------------------------
-    # Training loop. Identical structure to train.py — the only
-    # difference is the spec_extractor and model.feat_channels above.
-    # ------------------------------------------------------------------
     best_f1 = 0.0
-    no_improve_epochs = 0
-    thresholds = torch.tensor(
-        cfg.DEFAULT_THRESHOLDS[:3] if len(cfg.DEFAULT_THRESHOLDS) >= 3
-        else [0.5, 0.5, 0.5],
-        device=device,
-    )
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
 
-    epoch = 0
-    for epoch in range(1, cfg.EPOCHS + 1):
-        current_lr = optimizer.param_groups[0]["lr"]
-        print(f"\n{'=' * 60}\nEpoch {epoch}/{cfg.EPOCHS}  LR={current_lr:.2e}\n"
-              f"{'=' * 60}")
-
-        if (epoch - 1) % RESAMPLE_EVERY == 0:
-            print("  Resampling negatives")
-            train_ds.resample_negatives()
-            train_loader = DataLoader(
-                train_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,
-                num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn,
-                pin_memory=True,
-                **wbu.seeded_dataloader_kwargs(cfg.SEED + epoch),
-            )
-
-        train_loss = train_epoch(
-            model, spec_extractor, train_loader, criterion,
-            optimizer, device, epoch,
+        train_segments = resample_negatives_for_epoch(
+            pos_segs_extended=pos_segs,
+            train_annotations=train_annotations,
+            train_manifest=train_manifest,
+            n_neg=n_neg,
+            segment_s=cfg.TRAIN_SEGMENT_S,
+            epoch=epoch,
+            rng=sampling_rng,
+            verbose=True,
+        )
+        train_loader = DataLoader(
+            WhaleDataset(train_segments), batch_size=cfg.BATCH_SIZE, shuffle=True,
+            num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
+            **seeded_dataloader_kwargs(seed),
         )
 
+        train_loss = train_one_epoch(
+            model, spec_extractor, train_loader, criterion, optimizer, device,
+        )
         val = validate(
             model, spec_extractor, val_loader, criterion, device,
-            thresholds, val_annotations, file_start_dts,
-            tune_thresholds=True,
+            val_annotations, file_start_dts, threshold=cfg.THRESHOLD,
         )
+        epoch_time = time.time() - t0
 
-        thresholds = torch.tensor(val["thresholds"], device=device,
-                                  dtype=torch.float32)
-        scheduler.step(val["mean_f1"])
+        improved = val["f1"] > best_f1
+        if improved:
+            best_f1 = val["f1"]
+        marker = " *** new best" if improved else ""
 
-        print(f"\n  Train loss: {train_loss:.4f}  Val loss: {val['loss']:.4f}")
-        print(f"  Mean F1: {val['mean_f1']:.3f}  Best F1: {best_f1:.3f}")
-        print(f"  Tuned thresholds: "
-              f"{['%.2f' % t for t in val['thresholds']]}")
+        print(f"\nEpoch {epoch:2d}/{args.epochs}  ({epoch_time:.0f}s){marker}")
+        print(f"  Train loss: {train_loss:.4f}   Val loss: {val['loss']:.4f}")
+        for name in cfg.CALL_TYPES_3:
+            pc = val["per_class"][name]
+            print(f"    {name.upper():6} TP={pc['tp']:5} FP={pc['fp']:6} "
+                  f"FN={pc['fn']:5}  P={pc['precision']:.3f} "
+                  f"R={pc['recall']:.3f} F1={pc['f1']:.3f}")
+        macro = sum(val["per_class"][n]["f1"] for n in cfg.CALL_TYPES_3) / 3
+        print(f"    OVERALL F1={val['f1']:.3f}  MACRO F1={macro:.3f}")
 
-        # Wandb per-epoch payload (same shape as train.py).
-        import wandb
-        wandb_payload = {
-            "epoch":         epoch,
-            "lr":            current_lr,
-            "train/loss":    train_loss,
-            "val/loss":      val["loss"],
-            "val/f1_macro":  val["mean_f1"],
-        }
-        for ci, cname in enumerate(cfg.CALL_TYPES_3):
-            pc = val["per_class"].get(cname, {})
-            wandb_payload[f"val/f1/{cname}"]        = pc.get("f1", 0.0)
-            wandb_payload[f"val/precision/{cname}"] = pc.get("precision", 0.0)
-            wandb_payload[f"val/recall/{cname}"]    = pc.get("recall", 0.0)
-            wandb_payload[f"val/tp/{cname}"]        = pc.get("tp", 0)
-            wandb_payload[f"val/fp/{cname}"]        = pc.get("fp", 0)
-            wandb_payload[f"val/fn/{cname}"]        = pc.get("fn", 0)
-            wandb_payload[f"val/threshold/{cname}"] = float(val["thresholds"][ci])
-        wandb.log(wandb_payload, step=epoch)
+        if run is not None:
+            wbu.log_epoch_3class(epoch, train_loss, val)
 
-        clf_module = (model.module.classifier
-                      if isinstance(model, nn.DataParallel)
-                      else model.classifier)
-        bias_str = ", ".join(f"{b:+.2f}"
-                             for b in clf_module.bias.detach().cpu().tolist())
-        print(f"  Classifier bias: [{bias_str}]")
+        history.append({
+            "epoch":       epoch,
+            "train_loss":  train_loss,
+            "val_loss":    val["loss"],
+            "f1":          val["f1"],
+            "macro_f1":    macro,
+            "per_class":   val["per_class"],
+        })
 
-        model_state = (model.module.state_dict()
-                       if isinstance(model, nn.DataParallel)
-                       else model.state_dict())
         ckpt = {
             "epoch":            epoch,
-            "model_state_dict": model_state,
-            "best_f1":          best_f1,
-            "thresholds":       thresholds.cpu(),
+            "model_state_dict": model.state_dict(),
+            "f1":               val["f1"],
+            "history":          history,
+            "pos_weight":       pos_weight.detach().cpu().tolist(),
+            # Frontend metadata so inference can rebuild the same extractor.
+            "frontend":         "two_stream_pcen",
             "feat_channels":    4,
             "pcen_config": {
                 "T_fast": args.T_fast, "T_slow": args.T_slow,
@@ -516,95 +499,41 @@ def main():
                 "r":      args.r,
             },
         }
+        torch.save(ckpt, run_dir / f"phase11a_epoch_{epoch:02d}.pt")
+        if improved:
+            torch.save(ckpt, run_dir / "phase11a_best.pt")
 
-        if val["mean_f1"] > best_f1:
-            best_f1 = val["mean_f1"]
-            ckpt["best_f1"] = best_f1
-            torch.save(ckpt, run_dir / "best_model.pt")
-            print(f"  *** New best F1: {best_f1:.3f}")
-            no_improve_epochs = 0
-        else:
-            no_improve_epochs += 1
-            print(f"  No improvement for "
-                  f"{no_improve_epochs}/{EARLY_STOP_PATIENCE} epochs")
+    # --- summary ---
+    print(f"\n{'=' * 60}")
+    print("PHASE 11A SUMMARY")
+    print(f"{'=' * 60}")
 
-        torch.save(ckpt, run_dir / "latest_model.pt")
+    f1s = [h["f1"] for h in history]
+    macros = [h["macro_f1"] for h in history]
+    print(f"\nMicro F1 by epoch: {[f'{f:.3f}' for f in f1s]}")
+    print(f"Macro F1 by epoch: {[f'{m:.3f}' for m in macros]}")
+    print(f"\nBest micro F1: {max(f1s):.3f}  (epoch {f1s.index(max(f1s)) + 1})")
+    print(f"Best macro F1: {max(macros):.3f}")
+    for name in cfg.CALL_TYPES_3:
+        best = max(h["per_class"][name]["f1"] for h in history)
+        print(f"  best {name}: {best:.3f}")
 
-        if no_improve_epochs >= EARLY_STOP_PATIENCE:
-            print(f"\n  Early stopping: no improvement for "
-                  f"{EARLY_STOP_PATIENCE} epochs")
-            break
+    second_half = f1s[len(f1s) // 2:]
+    swings = [abs(second_half[i] - second_half[i - 1])
+              for i in range(1, len(second_half))]
+    mean_swing = sum(swings) / max(len(swings), 1)
+    max_swing = max(swings) if swings else 0.0
+    print(f"\nSecond-half stability: mean swing {mean_swing:.3f}, "
+          f"max swing {max_swing:.3f}")
 
-    # ------------------------------------------------------------------
-    # Post-training threshold tuning on the best checkpoint
-    # ------------------------------------------------------------------
-    print(f"\n{'=' * 60}\nTuning thresholds on best model\n{'=' * 60}")
-    best_ckpt = torch.load(run_dir / "best_model.pt", map_location=device,
-                           weights_only=False)
-    model_to_load = (model.module if isinstance(model, nn.DataParallel)
-                     else model)
-    model_to_load.load_state_dict(best_ckpt["model_state_dict"])
-
-    tuned = tune_thresholds_event_level(
-        model_to_load, spec_extractor, val_loader, device,
-        val_annotations, file_start_dts,
+    verdict = (
+        f"Phase 11a (two-stream PCEN T={args.T_fast}/{args.T_slow}s): "
+        f"best micro F1 {max(f1s):.3f}, best macro F1 {max(macros):.3f}; "
+        f"second-half mean F1 swing {mean_swing:.3f}."
     )
-    print(f"Tuned thresholds: {tuned.tolist()}")
-
-    final_state = model_to_load.state_dict()
-    torch.save({
-        "model_state_dict": final_state,
-        "thresholds":       torch.tensor(tuned),
-        "feat_channels":    4,
-        "pcen_config": {
-            "T_fast": args.T_fast, "T_slow": args.T_slow,
-            "alpha":  args.alpha,  "delta":  args.delta,
-            "r":      args.r,
-        },
-    }, run_dir / "final_model.pt")
-
-    print(f"\nDone. Best F1 (default thresholds): {best_f1:.3f}")
-    print(f"Run dir: {run_dir}")
-
-    # ------------------------------------------------------------------
-    # Wandb summary + artifact
-    # ------------------------------------------------------------------
-    import wandb
-    wandb.summary["best_f1"]              = float(best_f1)
-    wandb.summary["best_f1_post_tuning"]  = float(best_ckpt.get("best_f1", best_f1))
-    wandb.summary["final_thresholds"]     = list(map(float, tuned))
-    wandb.summary["epochs_run"]           = epoch
-    wandb.summary["early_stopped"]        = no_improve_epochs >= EARLY_STOP_PATIENCE
-    wandb.summary["pcen_T_fast"]          = float(args.T_fast)
-    wandb.summary["pcen_T_slow"]          = float(args.T_slow)
-    wandb.summary["verdict"] = (
-        f"Phase 11a (two-stream PCEN T={args.T_fast}/{args.T_slow}s) "
-        f"finished at best F1 {best_f1:.3f} "
-        f"(epoch {best_ckpt.get('epoch', '?')} of {epoch} run; "
-        f"final tuned thresholds {[round(float(t), 2) for t in tuned]})."
-    )
-
-    art = wandb.Artifact(
-        f"model-{run.name}", type="model",
-        metadata={
-            "best_f1":          float(best_f1),
-            "best_epoch":       int(best_ckpt.get("epoch", 0)),
-            "epochs_run":       int(epoch),
-            "tuned_thresholds": list(map(float, tuned)),
-            "frontend":         "two_stream_pcen",
-            "feat_channels":    4,
-            "pcen_T_fast":      args.T_fast,
-            "pcen_T_slow":      args.T_slow,
-            "pcen_alpha":       args.alpha,
-            "pcen_delta":       args.delta,
-            "pcen_r":           args.r,
-        },
-    )
-    art.add_file(str(run_dir / "best_model.pt"))
-    art.add_file(str(run_dir / "final_model.pt"))
-    run.log_artifact(art, aliases=["best", "phase11a"])
-
-    wandb.finish()
+    if run is not None:
+        wbu.finalize_phase(history, verdict=verdict,
+                           best_ckpt=run_dir / "phase11a_best.pt")
 
 
 if __name__ == "__main__":
