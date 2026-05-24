@@ -567,6 +567,31 @@ PHASE_REGISTRY: dict[str, dict] = {
         ),
         interventions=["bpn_gate_minimal"],
     ),
+    "10a": dict(
+        parent="final",
+        hypothesis=(
+            "Multi-resolution STFT fusion on top of the final pipeline. "
+            "Three parallel STFTs share n_fft=256 and hop=5 but use "
+            "different win_length values (default 16/64/256 samples = "
+            "64/256/1024 ms at SR=250). Their phase-aware (magnitude, "
+            "cos-phase, sin-phase) outputs are channel-concatenated and "
+            "fed to the existing WhaleVAD CNN-BiLSTM with feat_channels=9. "
+            "All branches use center=True for cross-branch frame alignment "
+            "(the only deviation from the final baseline besides the new "
+            "branches). Tests whether the single-window STFT is a Pareto "
+            "compromise on the time-frequency tradeoff: D-calls (1-3 s, "
+            "20-120 Hz downsweeps) should gain from the short branch's "
+            "finer time resolution, while Bm-Z (10 s tonals at ~27 Hz) "
+            "should be roughly unchanged from the long branch (= current "
+            "baseline). Direct test of the frontend-bottleneck hypothesis "
+            "and a stripped-down version of the BioDCASE 2025 winner's "
+            "recipe (Marolt & Bones: LEAF + 3-scale Swin, val macro F1 = "
+            "0.64). Branch list is configurable via --win_lengths so "
+            "ablations sit under the same phase tag, distinguished by "
+            "config.multires/win_lengths in wandb."
+        ),
+        interventions=["multi_res_stft"],
+    ),
 
 }
 
