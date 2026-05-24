@@ -295,18 +295,22 @@ def resample_negatives_for_epoch(
     n_neg: int,
     segment_s: float,
     epoch: int,
+    rng: random.Random,
     verbose: bool = False,
 ):
     """
     Draw a fresh negative segment set for one epoch and return the combined
     (fixed positives + new negatives) training segment list.
 
-    No per-epoch seed is derived: the global RNG seeded once at startup
-    advances naturally between calls, so each epoch draws a different subset
-    while the whole run stays reproducible from the master seed.
+    Sampling is driven by the dedicated ``rng`` instance rather than the
+    global ``random`` stream. Reusing the same instance across epochs makes it
+    advance naturally between calls -- so each epoch draws a different subset
+    -- while keeping the whole run reproducible from the master seed and
+    independent of anything else (e.g. ``wandb.init``) that touches the global
+    stream.
     """
     neg_segs = build_negative_segments(
-        train_annotations, train_manifest, n_segments=n_neg,
+        train_annotations, train_manifest, n_segments=n_neg, rng=rng,
     )
     neg_segs = extend_all_segments(neg_segs, train_manifest, segment_s)
 
@@ -352,6 +356,13 @@ def main():
     print(f"Device: {device}")
 
     seed = seed_everything(args.seed, deterministic=False)
+
+    # Dedicated RNG for all segment sampling (positive collars + per-epoch
+    # negatives). Isolating this from the global ``random`` stream makes the
+    # draws identical whether or not W&B is enabled, since nothing else can
+    # perturb the stream between calls. random.Random(seed) yields the same
+    # sequence the global module would after random.seed(seed).
+    sampling_rng = random.Random(seed)
 
     train_sites = list(cfg.TRAIN_DATASETS)
     val_sites = list(cfg.VAL_DATASETS)
@@ -403,7 +414,9 @@ def main():
     train_annotations = load_annotations(train_sites, manifest=train_manifest)
     print(f"  {len(train_manifest)} files, {len(train_annotations)} annotations")
 
-    pos_segs = build_positive_segments(train_annotations, train_manifest)
+    pos_segs = build_positive_segments(
+        train_annotations, train_manifest, rng=sampling_rng,
+    )
     pos_segs = extend_all_segments(pos_segs, train_manifest, cfg.TRAIN_SEGMENT_S)
     n_neg = int(len(pos_segs) * cfg.NEG_RATIO)
     print(f"  Positive segments (fixed): {len(pos_segs)}")
@@ -424,6 +437,11 @@ def main():
           f"annotations, {len(val_segments)} segments")
 
     # --- model, loss, optimizer ---
+    # Re-seed torch immediately before weight init so the model is identical
+    # regardless of any earlier torch RNG consumption (e.g. by wandb.init).
+    # This is a no-op for the no-W&B path and makes the two paths agree.
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     model, spec_extractor = build_model(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel parameters: {n_params:,}")
@@ -455,6 +473,7 @@ def main():
             n_neg=n_neg,
             segment_s=cfg.TRAIN_SEGMENT_S,
             epoch=epoch,
+            rng=sampling_rng,
             verbose=True,
         )
         train_loader = DataLoader(
