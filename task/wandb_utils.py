@@ -536,6 +536,27 @@ PHASE_REGISTRY: dict[str, dict] = {
         ),
         interventions=["clean_pipeline"],
     ),
+    "bpn0": dict(
+        parent="final",
+        hypothesis=(
+            "BPN ladder rung 0: adopt the WhaleVAD-BPN backbone/training "
+            "changes that precede gating -- dilated-residual depthwise block "
+            "(dilations 2/4/8, spatial dropout) and the BPN recipe (focal "
+            "loss, LR 1e-3, weight decay 0.01, batch 48, <=32 epochs). "
+            "Establishes the baseline the BPN gate attaches to."
+        ),
+        interventions=["dilated_backbone", "focal_loss", "bpn_recipe"],
+    ),
+    "bpn1": dict(
+        parent="bpn0",
+        hypothesis=(
+            "BPN ladder rung 1: minimal boundary-proposal gate (single tap, "
+            "R=1, BiLSTM ROI processor, gate initialised to pass-through) "
+            "multiplying the classifier probabilities. Tests that gating "
+            "wires up and trains end-to-end without collapsing the classifier."
+        ),
+        interventions=["bpn_gate_minimal"],
+    ),
 
 }
 
