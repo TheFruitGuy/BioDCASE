@@ -511,6 +511,21 @@ PHASE_REGISTRY: dict[str, dict] = {
         ),
         interventions=["weighted_bce_segments"],
     ),
+    "0s": dict(
+            parent="0r",
+            hypothesis=(
+                "Per-epoch negative resampling on top of 0r. 0r's "
+                "weighted BCE was 4.5× less stable than 0m's plain BCE "
+                "(mean swing 0.190 vs 0.042) with 4 catastrophic D-class "
+                "FP explosions (epochs 19, 21, 25, 29). Christiaan's "
+                "Section 2.5 recipe pairs weighted BCE with per-epoch "
+                "negative resampling — drawing a fresh no-call subset "
+                "each epoch. Tests whether the resampling is the load-"
+                "bearing ingredient for stability under weighted BCE."
+            ),
+            interventions=["neg_resample_per_epoch"],
+        ),
+
 }
 
 
