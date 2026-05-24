@@ -359,6 +359,7 @@ def build_positive_segments(
     manifest: pd.DataFrame,
     collar_min_s: float = cfg.COLLAR_MIN_S,
     collar_max_s: float = cfg.COLLAR_MAX_S,
+    rng: random.Random | None = None,
 ) -> list[Segment]:
     """
     Build one training segment per valid positive annotation.
@@ -367,7 +368,17 @@ def build_positive_segments(
     collar_max_s)`` collar on each side. All annotations intersecting the
     resulting window are attached so multi-call segments are labelled
     correctly. Annotations with invalid or out-of-range durations are skipped.
+
+    Parameters
+    ----------
+    rng : random.Random, optional
+        Source of randomness for the collars. Pass a dedicated instance to
+        decouple sampling from the global ``random`` stream (and thus from
+        anything else that may consume it). Defaults to the global module.
     """
+    if rng is None:
+        rng = random
+
     segments: list[Segment] = []
     if manifest.empty or annotations.empty:
         return segments
@@ -394,8 +405,8 @@ def build_positive_segments(
         if call_end_s - call_start_s < cfg.MIN_CALL_DURATION_S:
             continue
 
-        pre = random.uniform(collar_min_s, collar_max_s)
-        post = random.uniform(collar_min_s, collar_max_s)
+        pre = rng.uniform(collar_min_s, collar_max_s)
+        post = rng.uniform(collar_min_s, collar_max_s)
         seg_start_s = max(0.0, call_start_s - pre)
         seg_end_s = min(file_row["duration_s"], call_end_s + post)
 
@@ -425,6 +436,7 @@ def build_negative_segments(
     n_segments: int,
     min_dur_s: float = 5.0,
     max_dur_s: float = 30.0,
+    rng: random.Random | None = None,
 ) -> list[Segment]:
     """
     Sample up to ``n_segments`` random call-free windows from the manifest.
@@ -432,7 +444,18 @@ def build_negative_segments(
     Implements stochastic negative undersampling: candidate windows that
     overlap any annotated call are rejected. Returns fewer than requested only
     if the rejection sampler hits its retry cap (20x ``n_segments``).
+
+    Parameters
+    ----------
+    rng : random.Random, optional
+        Source of randomness for window selection. Pass a dedicated instance
+        to decouple sampling from the global ``random`` stream. Defaults to
+        the global module. Reusing the same instance across epochs makes each
+        epoch draw a fresh, reproducible negative subset.
     """
+    if rng is None:
+        rng = random
+
     segments: list[Segment] = []
     if manifest.empty:
         return segments
@@ -448,15 +471,15 @@ def build_negative_segments(
 
     while len(segments) < n_segments and tries < max_tries:
         tries += 1
-        file_row = random.choice(files)
+        file_row = rng.choice(files)
         key = (file_row["dataset"], file_row["filename"])
         dur = file_row["duration_s"]
-        seg_len = random.uniform(min_dur_s, max_dur_s)
+        seg_len = rng.uniform(min_dur_s, max_dur_s)
 
         if dur <= seg_len + 1.0:
             continue
 
-        seg_start_s = random.uniform(0, dur - seg_len)
+        seg_start_s = rng.uniform(0, dur - seg_len)
         seg_end_s = seg_start_s + seg_len
 
         intervals = call_intervals.get(key, [])

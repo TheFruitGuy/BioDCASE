@@ -201,6 +201,46 @@ THRESHOLD = 0.3
 
 
 # ======================================================================
+# WhaleVAD-BPN: focal loss + training recipe (arXiv 2510.21280v2)
+# ======================================================================
+# The BPN follow-on model trains with focal loss (not weighted BCE) and a
+# different optimiser configuration. Christiaan confirmed by email that focal
+# loss "drastically stabilises" BPN training.
+
+#: Focal loss class-imbalance and focusing terms (Lin et al. 2018 defaults,
+#: as used by the paper).
+FOCAL_ALPHA = 0.25
+FOCAL_GAMMA = 2.0
+
+#: BPN training recipe (paper Section V-B5): AdamW, fixed LR, ~30 s segments.
+BPN_LR = 1e-3
+BPN_WEIGHT_DECAY = 0.01
+BPN_BATCH_SIZE = 48
+BPN_EPOCHS = 32
+
+# ----------------------------------------------------------------------
+# BPN architecture. Several of these are values the paper does not state
+# and that we determine experimentally through the BPN phase ladder; the
+# defaults here are the starting points for that search.
+# ----------------------------------------------------------------------
+
+#: Dilations of the three residual depthwise layers in the modified
+#: aggregation block. These layers also expose the intermediate taps.
+BPN_DILATIONS = (2, 4, 8)
+
+#: ROI vector dimensionality (C_bpn), the proposal network output channels.
+BPN_CHANNELS = 64
+
+#: Hidden size per direction of the BPN ROI BiLSTM (paper does not state it).
+BPN_LSTM_HIDDEN = 128
+
+#: Bias used to initialise the BPN gate output so that sigmoid(gate) ~ 0.98 at
+#: the start of training, i.e. the mask passes the classifier through almost
+#: unchanged and only learns to suppress over time.
+BPN_GATE_INIT_BIAS = 4.0
+
+
+# ======================================================================
 # Post-processing
 # ======================================================================
 

@@ -1,0 +1,366 @@
+"""
+BPN Ladder - Rung 0: Dilated-Residual Backbone + Focal Recipe
+=============================================================
+
+First rung of the WhaleVAD-BPN reproduction ladder, built on the clean
+``*_final`` pipeline. This rung establishes the baseline that the BPN gating
+branch will later attach to, by adopting the two backbone/training changes the
+BPN paper (arXiv:2510.21280v2) introduces *before* any gating:
+
+1. The depthwise aggregation block becomes a residual block with increasing
+   dilation (2, 4, 8) and spatial dropout (``model_bpn_final.WhaleVADBPN`` with
+   ``use_bpn=False``).
+2. The training recipe switches from the reproduced WhaleVAD recipe to the BPN
+   recipe: **focal loss** (alpha=0.25, gamma=2) instead of weighted BCE, LR
+   1e-3, weight decay 0.01, batch 48, up to 32 epochs. Christiaan confirmed by
+   email that focal "drastically stabilises" BPN training.
+
+Everything else matches ``train_final``: 8 training sites, official 3-site
+validation split, 7-class targets collapsed to 3 at eval, 30 s training
+segments, per-epoch negative resampling, isolated sampling RNG.
+
+What this rung answers
+----------------------
+Whether the dilated backbone + focal recipe trains stably and reaches a macro
+F1 in the same ballpark as the weighted-BCE ``final`` baseline. If it does, it
+is a sound foundation for the gating branch (rung 1+). If focal collapses a
+class to zero, that is diagnostic before any BPN complexity is added.
+
+Usage
+-----
+::
+
+    python train_bpn0.py                 # train, no W&B
+    python train_bpn0.py --wandb
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import random
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.optim import AdamW
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+import config_final as cfg
+from dataset_final import (
+    load_annotations, get_file_manifest,
+    build_positive_segments, build_negative_segments, build_val_segments,
+    extend_all_segments, WhaleDataset, collate_fn,
+)
+from spectrogram_final import SpectrogramExtractor
+from model_bpn_final import WhaleVADBPN, focal_loss_with_logits
+from postprocess_final import (
+    postprocess_predictions, compute_metrics, Detection,
+    collapse_probs_to_3class,
+)
+
+
+# ======================================================================
+# Reproducibility helpers
+# ======================================================================
+
+def seed_everything(seed: int = 42) -> int:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    return seed
+
+
+def seeded_dataloader_kwargs(seed: int) -> dict:
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    def _worker_init(worker_id: int) -> None:
+        worker_seed = (seed + worker_id) % 2 ** 32
+        np.random.seed(worker_seed)
+        random.seed(worker_seed)
+
+    return {"generator": g, "worker_init_fn": _worker_init}
+
+
+# ======================================================================
+# Model
+# ======================================================================
+
+def build_model(device: torch.device):
+    """Dilated-backbone classifier (no BPN branch) + spectrogram extractor."""
+    model = WhaleVADBPN(num_classes=7, use_bpn=False).to(device)
+    spec = SpectrogramExtractor().to(device)
+    with torch.no_grad():
+        dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
+        model(spec(dummy))
+    return model, spec
+
+
+# ======================================================================
+# Train / validate
+# ======================================================================
+
+def train_one_epoch(model, spec_extractor, loader, optimizer, device):
+    """One training pass with masked focal loss on logits."""
+    model.train()
+    losses, n = 0.0, 0
+    for audio, targets, mask, _ in tqdm(loader, desc="Train", leave=False):
+        audio = audio.to(device)
+        targets = targets.to(device)
+        mask = mask.to(device)
+
+        logits = model(spec_extractor(audio))
+        T = min(logits.size(1), targets.size(1))
+        logits, targets, mask = logits[:, :T], targets[:, :T], mask[:, :T]
+
+        valid = mask.unsqueeze(-1).float()
+        per_frame = focal_loss_with_logits(logits, targets) * valid
+        loss = per_frame.sum() / (valid.sum() * targets.size(-1)).clamp(min=1.0)
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.GRAD_CLIP)
+        optimizer.step()
+
+        losses += loss.item()
+        n += 1
+    return losses / max(n, 1)
+
+
+@torch.no_grad()
+def validate(model, spec_extractor, loader, device,
+             val_annotations, file_start_dts, threshold: float):
+    """7-class inference -> collapse to 3 -> event-level F1."""
+    model.eval()
+    all_probs_7 = {}
+    hop = spec_extractor.hop_length
+
+    for audio, _, _, metas in tqdm(loader, desc="Val", leave=False):
+        audio = audio.to(device)
+        probs = torch.sigmoid(model(spec_extractor(audio))).cpu().numpy()
+        for j, meta in enumerate(metas):
+            key = (meta["dataset"], meta["filename"], meta["start_sample"])
+            n_samp = meta["end_sample"] - meta["start_sample"]
+            n_frames = min(n_samp // hop, probs[j].shape[0])
+            all_probs_7[key] = probs[j, :n_frames, :]
+
+    all_probs_3 = collapse_probs_to_3class(all_probs_7)
+
+    cfg.USE_3CLASS = True
+    try:
+        pred_events = postprocess_predictions(
+            all_probs_3, np.array([threshold] * 3))
+    finally:
+        cfg.USE_3CLASS = False
+
+    gt_events = []
+    for _, row in val_annotations.iterrows():
+        fsd = file_start_dts.get((row["dataset"], row["filename"]))
+        if fsd is None:
+            continue
+        gt_events.append(Detection(
+            dataset=row["dataset"], filename=row["filename"],
+            label=row["label_3class"],
+            start_s=(row["start_datetime"] - fsd).total_seconds(),
+            end_s=(row["end_datetime"] - fsd).total_seconds(),
+        ))
+
+    metrics = compute_metrics(pred_events, gt_events, iou_threshold=0.3)
+    per_class = {
+        name: {
+            "f1": metrics.get(name, {}).get("f1", 0.0),
+            "precision": metrics.get(name, {}).get("precision", 0.0),
+            "recall": metrics.get(name, {}).get("recall", 0.0),
+            "tp": metrics.get(name, {}).get("tp", 0),
+            "fp": metrics.get(name, {}).get("fp", 0),
+            "fn": metrics.get(name, {}).get("fn", 0),
+        }
+        for name in cfg.CALL_TYPES_3
+    }
+    return {"f1": metrics.get("overall", {}).get("f1", 0.0), "per_class": per_class}
+
+
+# ======================================================================
+# Per-epoch negative resampling
+# ======================================================================
+
+def resample_negatives_for_epoch(pos_segs, train_annotations, train_manifest,
+                                 n_neg, segment_s, epoch, rng, verbose=False):
+    neg_segs = build_negative_segments(
+        train_annotations, train_manifest, n_segments=n_neg, rng=rng)
+    neg_segs = extend_all_segments(neg_segs, train_manifest, segment_s)
+    if verbose and neg_segs:
+        first = neg_segs[0]
+        print(f"    epoch {epoch}: resampled {len(neg_segs)} negatives "
+              f"[first: {first.filename} @ {first.start_sample} samp]")
+    return pos_segs + neg_segs
+
+
+# ======================================================================
+# CLI
+# ======================================================================
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="BPN ladder rung 0: dilated backbone + focal recipe.")
+    p.add_argument("--wandb", action="store_true",
+                   help="Log to Weights & Biases (off by default).")
+    p.add_argument("--wandb-mode", default="online",
+                   choices=["online", "offline", "disabled"])
+    p.add_argument("--epochs", type=int, default=cfg.BPN_EPOCHS)
+    p.add_argument("--seed", type=int, default=cfg.SEED)
+    return p.parse_args()
+
+
+# ======================================================================
+# Main
+# ======================================================================
+
+def main():
+    args = parse_args()
+    cfg.USE_3CLASS = False  # 7-class targets
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    seed = seed_everything(args.seed)
+    sampling_rng = random.Random(seed)
+
+    train_sites = list(cfg.TRAIN_DATASETS)
+    val_sites = list(cfg.VAL_DATASETS)
+
+    run = None
+    if args.wandb:
+        import wandb_utils as wbu
+        run = wbu.init_phase("bpn0", config={
+            "lr": cfg.BPN_LR, "weight_decay": cfg.BPN_WEIGHT_DECAY,
+            "batch_size": cfg.BPN_BATCH_SIZE, "threshold": cfg.THRESHOLD,
+            "seed": seed, "neg_ratio": cfg.NEG_RATIO,
+            "segment_s": cfg.TRAIN_SEGMENT_S, "epochs": args.epochs,
+            "loss": "focal", "focal_alpha": cfg.FOCAL_ALPHA,
+            "focal_gamma": cfg.FOCAL_GAMMA, "dilations": cfg.BPN_DILATIONS,
+            "train_sites": train_sites, "val_sites": val_sites,
+        }, mode=args.wandb_mode)
+
+    timestamp = time.strftime("%Y%m%d_%H%M%S")
+    run_dir = Path(cfg.OUTPUT_DIR) / f"bpn0_{timestamp}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Run dir: {run_dir}")
+
+    print("\nConfiguration (BPN rung 0):")
+    print(f"  Backbone:  dilated-residual depthwise (dilations {cfg.BPN_DILATIONS})")
+    print(f"  Loss:      focal (alpha={cfg.FOCAL_ALPHA}, gamma={cfg.FOCAL_GAMMA})")
+    print(f"  LR={cfg.BPN_LR}, wd={cfg.BPN_WEIGHT_DECAY}, "
+          f"batch={cfg.BPN_BATCH_SIZE}, epochs={args.epochs}")
+
+    # --- data ---
+    print("\nLoading training data...")
+    train_manifest = get_file_manifest(train_sites)
+    train_annotations = load_annotations(train_sites, manifest=train_manifest)
+    pos_segs = build_positive_segments(
+        train_annotations, train_manifest, rng=sampling_rng)
+    pos_segs = extend_all_segments(pos_segs, train_manifest, cfg.TRAIN_SEGMENT_S)
+    n_neg = int(len(pos_segs) * cfg.NEG_RATIO)
+    print(f"  {len(train_manifest)} files, {len(train_annotations)} annotations")
+    print(f"  Positive segments (fixed): {len(pos_segs)}; negatives/epoch: {n_neg}")
+
+    val_manifest = get_file_manifest(val_sites)
+    val_annotations = load_annotations(val_sites, manifest=val_manifest)
+    val_segments = build_val_segments(val_manifest, val_annotations)
+    val_loader = DataLoader(
+        WhaleDataset(val_segments), batch_size=cfg.BPN_BATCH_SIZE, shuffle=False,
+        num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True)
+    file_start_dts = {
+        (r["dataset"], r["filename"]): r["start_dt"]
+        for _, r in val_manifest.iterrows()
+    }
+    print(f"  Val: {len(val_manifest)} files, {len(val_segments)} segments")
+
+    # --- model + optimizer ---
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    model, spec_extractor = build_model(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"\nModel parameters: {n_params:,}")
+    if run is not None:
+        run.config.update({"n_params": n_params}, allow_val_change=True)
+
+    optimizer = AdamW(
+        model.parameters(), lr=cfg.BPN_LR, weight_decay=cfg.BPN_WEIGHT_DECAY,
+        betas=(cfg.BETA1, cfg.BETA2))
+
+    # --- training loop ---
+    history = []
+    print(f"\n{'=' * 60}\nTraining {args.epochs} epochs\n{'=' * 60}")
+    best_f1 = 0.0
+    for epoch in range(1, args.epochs + 1):
+        t0 = time.time()
+        train_segments = resample_negatives_for_epoch(
+            pos_segs, train_annotations, train_manifest, n_neg,
+            cfg.TRAIN_SEGMENT_S, epoch, sampling_rng, verbose=True)
+        train_loader = DataLoader(
+            WhaleDataset(train_segments), batch_size=cfg.BPN_BATCH_SIZE,
+            shuffle=True, num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn,
+            pin_memory=True, **seeded_dataloader_kwargs(seed))
+
+        train_loss = train_one_epoch(
+            model, spec_extractor, train_loader, optimizer, device)
+        val = validate(model, spec_extractor, val_loader, device,
+                       val_annotations, file_start_dts, threshold=cfg.THRESHOLD)
+        epoch_time = time.time() - t0
+
+        improved = val["f1"] > best_f1
+        if improved:
+            best_f1 = val["f1"]
+        marker = " *** new best" if improved else ""
+        macro = sum(val["per_class"][n]["f1"] for n in cfg.CALL_TYPES_3) / 3
+
+        print(f"\nEpoch {epoch:2d}/{args.epochs}  ({epoch_time:.0f}s){marker}")
+        print(f"  Train loss: {train_loss:.4f}")
+        for name in cfg.CALL_TYPES_3:
+            pc = val["per_class"][name]
+            print(f"    {name.upper():6} TP={pc['tp']:5} FP={pc['fp']:6} "
+                  f"FN={pc['fn']:5}  P={pc['precision']:.3f} "
+                  f"R={pc['recall']:.3f} F1={pc['f1']:.3f}")
+        print(f"    OVERALL F1={val['f1']:.3f}  MACRO F1={macro:.3f}")
+
+        if run is not None:
+            import wandb_utils as wbu
+            wbu.log_epoch_3class(epoch, train_loss,
+                                 {"loss": 0.0, "f1": val["f1"],
+                                  "per_class": val["per_class"]})
+
+        history.append({"epoch": epoch, "train_loss": train_loss,
+                        "f1": val["f1"], "macro_f1": macro,
+                        "per_class": val["per_class"]})
+        ckpt = {"epoch": epoch, "model_state_dict": model.state_dict(),
+                "f1": val["f1"], "history": history}
+        torch.save(ckpt, run_dir / f"bpn0_epoch_{epoch:02d}.pt")
+        if improved:
+            torch.save(ckpt, run_dir / "bpn0_best.pt")
+
+    # --- summary ---
+    f1s = [h["f1"] for h in history]
+    macros = [h["macro_f1"] for h in history]
+    print(f"\n{'=' * 60}\nBPN RUNG 0 SUMMARY\n{'=' * 60}")
+    print(f"Best micro F1: {max(f1s):.3f} (epoch {f1s.index(max(f1s)) + 1})")
+    print(f"Best macro F1: {max(macros):.3f}")
+    for name in cfg.CALL_TYPES_3:
+        print(f"  best {name}: {max(h['per_class'][name]['f1'] for h in history):.3f}")
+
+    if run is not None:
+        import wandb_utils as wbu
+        wbu.finalize_phase(
+            history,
+            verdict=(f"Dilated backbone + focal: best micro {max(f1s):.3f}, "
+                     f"best macro {max(macros):.3f}."),
+            best_ckpt=run_dir / "bpn0_best.pt")
+
+
+if __name__ == "__main__":
+    main()
