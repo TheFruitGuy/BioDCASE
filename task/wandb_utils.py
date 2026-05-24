@@ -613,27 +613,32 @@ PHASE_REGISTRY: dict[str, dict] = {
         interventions=["pcen_2stream_frontend"],
     ),
     "12a": dict(
-        parent="baseline",
+        parent="final",
         hypothesis=(
             "Frequency Dynamic Convolution (FDY conv; Nam et al. 2022, "
-            "arXiv:2203.15296) in the residual aggregation block. Replaces "
-            "the first and last of the three depthwise 3x3 convs "
-            "(positions 1 and 7 of the aggregation Sequential) with "
-            "FDConv2d using K=4 basis kernels and attention reduction=4 — "
-            "paper-standard hyperparameters. Middle depthwise (position 4) "
-            "stays standard nn.Conv2d to keep parameter overhead modest "
-            "(~16k params, +1.6%) and avoid consecutive FDConvs over-"
-            "specialising per-band kernels in correlated ways. Tests "
-            "whether breaking the frequency-equivariance assumption in the "
-            "CNN aggregation stage improves the learned representation. "
-            "Diagnostic ablations (phases 1-2) identified the CNN frontend "
-            "as the bottleneck; whale calls are defined by their frequency "
-            "band (Bm-Z at ~27 Hz, D above 20 Hz), so the wrong inductive "
-            "bias should be most costly here. Reported +7.56% on DESED in "
-            "the original paper; whale data has more frequency-disjoint "
+            "arXiv:2203.15296) in the residual aggregation block, applied "
+            "on top of the consolidated 'final' recipe (8-site training, "
+            "paper BiLSTM, 7-class targets collapsed to 3 at eval, "
+            "segment-count weighted BCE, per-epoch negative resampling). "
+            "Replaces the first and last of the three depthwise 3x3 "
+            "convs (positions 1 and 7 of the aggregation Sequential) "
+            "with FDConv2d using K=4 basis kernels and attention "
+            "reduction=4 — paper-standard hyperparameters. Middle "
+            "depthwise (position 4) stays standard nn.Conv2d to keep "
+            "parameter overhead modest (~16k params, +1.6%) and avoid "
+            "consecutive FDConvs over-specialising per-band kernels in "
+            "correlated ways. Tests whether breaking the frequency-"
+            "equivariance assumption in the CNN aggregation stage "
+            "improves the learned representation. Diagnostic ablations "
+            "(phases 1-2) identified the CNN frontend as the bottleneck; "
+            "whale calls are defined by their frequency band (Bm-Z at "
+            "~27 Hz, D above 20 Hz), so the wrong inductive bias should "
+            "be most costly here. Reported +7.56% on DESED in the "
+            "original paper; whale data has more frequency-disjoint "
             "classes than DESED, so the prior should bite at least as "
-            "hard. Same parent as phases 11a/10a/2a/2b — clean single-axis "
-            "architecture change on the baseline."
+            "hard. Same parent as 10a (multi-res STFT) and 9a (BPN "
+            "reproduction) — architecture changes on top of the "
+            "canonical final recipe."
         ),
         interventions=["fdconv_aggregation"],
     ),
