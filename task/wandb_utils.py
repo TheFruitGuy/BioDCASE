@@ -139,6 +139,11 @@ WANDB_ENTITY  = os.environ.get("WANDB_ENTITY",  "bio-dcase")
 WANDB_PROJECT = os.environ.get("WANDB_PROJECT", "biodcase26-task2-whale-sed")
 WANDB_GROUP   = "phase0_ladder"
 
+#: Dedicated W&B group for the WhaleVAD-BPN reproduction ladder (phase 9).
+#: Its rungs (9a, 9b, ...) pass this as ``group`` to ``init_phase`` so they
+#: are tracked together, separately from the phase-0 ladder.
+WANDB_GROUP_BPN = "phase9_bpn_reproduction"
+
 
 # ---------------------------------------------------------------------------
 # The ladder. Add a new entry every time you start a new phase script.
@@ -536,24 +541,29 @@ PHASE_REGISTRY: dict[str, dict] = {
         ),
         interventions=["clean_pipeline"],
     ),
-    "bpn0": dict(
+    # ------------------------------------------------------------------
+    # Phase 9: WhaleVAD-BPN reproduction ladder (arXiv:2510.21280v2).
+    # Rungs 9a, 9b, ... share the WANDB_GROUP_BPN group.
+    # ------------------------------------------------------------------
+    "9a": dict(
         parent="final",
         hypothesis=(
-            "BPN ladder rung 0: adopt the WhaleVAD-BPN backbone/training "
-            "changes that precede gating -- dilated-residual depthwise block "
-            "(dilations 2/4/8, spatial dropout) and the BPN recipe (focal "
-            "loss, LR 1e-3, weight decay 0.01, batch 48, <=32 epochs). "
-            "Establishes the baseline the BPN gate attaches to."
+            "Phase 9 (BPN reproduction) rung A: adopt the WhaleVAD-BPN "
+            "backbone/training changes that precede gating -- dilated-residual "
+            "depthwise block (dilations 2/4/8, spatial dropout) and the BPN "
+            "recipe (focal loss, LR 1e-3, weight decay 0.01, batch 48, <=32 "
+            "epochs). Establishes the baseline the BPN gate attaches to."
         ),
         interventions=["dilated_backbone", "focal_loss", "bpn_recipe"],
     ),
-    "bpn1": dict(
-        parent="bpn0",
+    "9b": dict(
+        parent="9a",
         hypothesis=(
-            "BPN ladder rung 1: minimal boundary-proposal gate (single tap, "
-            "R=1, BiLSTM ROI processor, gate initialised to pass-through) "
-            "multiplying the classifier probabilities. Tests that gating "
-            "wires up and trains end-to-end without collapsing the classifier."
+            "Phase 9 (BPN reproduction) rung B: minimal boundary-proposal "
+            "gate (single tap, R=1, BiLSTM ROI processor, gate initialised to "
+            "pass-through) multiplying the classifier probabilities. Tests "
+            "that gating wires up and trains end-to-end without collapsing "
+            "the classifier."
         ),
         interventions=["bpn_gate_minimal"],
     ),
@@ -606,6 +616,7 @@ def init_phase(phase: str, config: dict,
                extra_tags: Optional[list[str]] = None,
                parent_override: Optional[str] = None,
                job_type: Optional[str] = None,
+               group: Optional[str] = None,
                mode: str = "online"):
     """
     Start a wandb run for one phase of the ablation ladder.
@@ -633,6 +644,10 @@ def init_phase(phase: str, config: dict,
     job_type : str, optional
         Wandb job type (``"train"``, ``"eval"``, ``"sweep"``, ...).
         Defaults to ``"phase<phase>"``.
+    group : str, optional
+        Override the W&B group. Defaults to ``WANDB_GROUP`` (the phase-0
+        ladder). The BPN ladder passes ``WANDB_GROUP_BPN`` so its rungs are
+        grouped together as the phase-9 reproduction.
     mode : str
         Wandb run mode. ``"disabled"`` for smoke tests.
     """
@@ -675,7 +690,7 @@ def init_phase(phase: str, config: dict,
     return wandb.init(
         entity=WANDB_ENTITY,
         project=WANDB_PROJECT,
-        group=WANDB_GROUP,
+        group=group or WANDB_GROUP,
         job_type=job_type or f"phase{phase}",
         name=name,
         tags=tags,

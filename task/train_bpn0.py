@@ -1,8 +1,9 @@
 """
-BPN Ladder - Rung 0: Dilated-Residual Backbone + Focal Recipe
-=============================================================
+BPN Ladder (Phase 9) - Rung 0 / 9a: Dilated-Residual Backbone + Focal Recipe
+============================================================================
 
-First rung of the WhaleVAD-BPN reproduction ladder, built on the clean
+First rung of the WhaleVAD-BPN reproduction ladder (tracked in W&B as phase
+``9a`` within the ``phase9_bpn_reproduction`` group), built on the clean
 ``*_final`` pipeline. This rung establishes the baseline that the BPN gating
 branch will later attach to, by adopting the two backbone/training changes the
 BPN paper (arXiv:2510.21280v2) introduces *before* any gating:
@@ -237,7 +238,7 @@ def main():
     run = None
     if args.wandb:
         import wandb_utils as wbu
-        run = wbu.init_phase("bpn0", config={
+        run = wbu.init_phase("9a", config={
             "lr": cfg.BPN_LR, "weight_decay": cfg.BPN_WEIGHT_DECAY,
             "batch_size": cfg.BPN_BATCH_SIZE, "threshold": cfg.THRESHOLD,
             "seed": seed, "neg_ratio": cfg.NEG_RATIO,
@@ -245,7 +246,9 @@ def main():
             "loss": "focal", "focal_alpha": cfg.FOCAL_ALPHA,
             "focal_gamma": cfg.FOCAL_GAMMA, "dilations": cfg.BPN_DILATIONS,
             "train_sites": train_sites, "val_sites": val_sites,
-        }, mode=args.wandb_mode)
+        }, group=wbu.WANDB_GROUP_BPN,
+            extra_tags=["phase9", "reproduction_of_bpn"],
+            mode=args.wandb_mode)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path(cfg.OUTPUT_DIR) / f"bpn0_{timestamp}"
