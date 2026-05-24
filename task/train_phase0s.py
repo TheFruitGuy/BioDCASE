@@ -169,10 +169,19 @@ def resample_negatives_for_epoch(
         # Quick fingerprint to verify in the log that the negative set
         # is actually drifting between epochs. If two epochs print the
         # same fingerprint, seeding is broken.
-        first = neg_segs[0] if neg_segs else None
-        fp = (f"file={first.get('filename', '?')}, "
-              f"start={first.get('start_time', '?'):.1f}s"
-              if first else "<empty>")
+        if neg_segs:
+            first = neg_segs[0]
+            # Segments are objects (likely a dataclass), not dicts —
+            # getattr with defaults is the safe way to inspect fields
+            # without knowing the exact schema.
+            filename = getattr(first, "filename", "?")
+            start = getattr(first, "start_time", None)
+            if isinstance(start, (int, float)):
+                fp = f"file={filename}, start={start:.1f}s"
+            else:
+                fp = f"file={filename}, start={start}"
+        else:
+            fp = "<empty>"
         print(f"    resampled {len(neg_segs)} negatives "
               f"[seed={epoch_seed}; first: {fp}]")
 
