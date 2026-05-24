@@ -525,6 +525,17 @@ PHASE_REGISTRY: dict[str, dict] = {
             ),
             interventions=["neg_resample_per_epoch"],
         ),
+    "final": dict(
+        parent="0s",
+        hypothesis=(
+            "Consolidated final recipe (train_final.py): 8-site training, "
+            "paper BiLSTM (hidden=128, layers=2), 7-class targets collapsed "
+            "to 3 at eval, segment-count weighted BCE, and per-epoch negative "
+            "resampling. A clean reimplementation of the 0s recipe with no "
+            "dependency on the exploratory train_phase0*.py scripts."
+        ),
+        interventions=["clean_pipeline"],
+    ),
 
 }
 
