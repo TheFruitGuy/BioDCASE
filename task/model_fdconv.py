@@ -15,9 +15,19 @@ the same as the same pattern at 100 Hz, which is provably wrong here.
 
 Reference
 ---------
-Nam, Kim, Park & Park, 2022. "Frequency Dynamic Convolution: Frequency-
-adaptive Pattern Recognition for Sound Event Detection". INTERSPEECH.
-Reported +7-9% on DESED.
+Nam, Kim, Park & Park (2022). "Frequency Dynamic Convolution:
+Frequency-Adaptive Pattern Recognition for Sound Event Detection."
+INTERSPEECH 2022. arXiv:2203.15296.
+
+This layer implements the original FDY conv ("FDY" for Frequency
+DYnamic), which reports +7.56% on DESED over a standard-conv CRNN
+baseline. The name "FDConv" is overloaded across follow-up work in
+this family — Dilated FDY (DFD, +9.27%), Multi-Dilated FDY (MDFD,
++10.98%), Full-Frequency Dynamic Conv (FFDConv, arXiv:2401.04976),
+and a 2025 survey/extension paper (arXiv:2506.12785) all use related
+terminology. This file is the 2022 original; the dilated and full-
+frequency variants are candidates for a follow-up phase 12b if 12a
+moves the needle.
 
 Usage
 -----

@@ -17,11 +17,19 @@ Diagnostic ablations (Phases 1-2) confirmed the CNN frontend is the
 bottleneck; this phase attacks the wrong frequency-equivariance
 inductive bias directly.
 
-Reference: Nam et al. 2022 (FDY-SED). Reported +7-9% on DESED. Whale
-data has more frequency-disjoint classes than DESED, so the prior
-should bite at least as hard; on the other hand we have less training
-data and the frequency axis is already heavily downsampled by the
-time the aggregation block runs, which could limit gains.
+Reference: Nam et al. 2022, "Frequency Dynamic Convolution: Frequency-
+Adaptive Pattern Recognition for Sound Event Detection", INTERSPEECH
+(arXiv:2203.15296). Original "FDY conv" formulation: +7.56% on DESED
+over a standard-conv CRNN baseline. The dilated and multi-dilated
+follow-ups in the same family report +9.27% (DFD) and +10.98% (MDFD)
+respectively but are out of scope for phase 12a — those are 12b/12c
+candidates if 12a beats baseline.
+
+Whale data has more frequency-disjoint classes than DESED, so the
+prior should bite at least as hard; on the other hand we have less
+training data and the frequency axis is already heavily downsampled
+by the time the aggregation block runs (F~=12 at that stage), which
+could limit gains.
 
 Standard hyperparameters
 ------------------------
