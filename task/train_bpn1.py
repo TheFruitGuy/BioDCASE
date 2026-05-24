@@ -1,8 +1,9 @@
 """
-BPN Ladder - Rung 1: Minimal Working Gate
-=========================================
+BPN Ladder (Phase 9) - Rung 1 / 9b: Minimal Working Gate
+========================================================
 
-Second rung of the WhaleVAD-BPN ladder. It adds the smallest possible boundary
+Second rung of the WhaleVAD-BPN ladder (tracked in W&B as phase ``9b`` within
+the ``phase9_bpn_reproduction`` group). It adds the smallest possible boundary
 proposal branch on top of rung 0's dilated backbone + focal recipe, to verify
 that the gating mechanism wires up and trains end-to-end without collapsing the
 classifier.
@@ -256,7 +257,7 @@ def main():
     run = None
     if args.wandb:
         import wandb_utils as wbu
-        run = wbu.init_phase("bpn1", config={
+        run = wbu.init_phase("9b", config={
             "lr": cfg.BPN_LR, "weight_decay": cfg.BPN_WEIGHT_DECAY,
             "batch_size": cfg.BPN_BATCH_SIZE, "threshold": cfg.THRESHOLD,
             "seed": seed, "neg_ratio": cfg.NEG_RATIO,
@@ -267,7 +268,9 @@ def main():
             "bpn_gate_init_bias": cfg.BPN_GATE_INIT_BIAS,
             "init_from": args.init_from,
             "train_sites": train_sites, "val_sites": val_sites,
-        }, mode=args.wandb_mode)
+        }, group=wbu.WANDB_GROUP_BPN,
+            extra_tags=["phase9", "reproduction_of_bpn"],
+            mode=args.wandb_mode)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     run_dir = Path(cfg.OUTPUT_DIR) / f"bpn1_{timestamp}"
