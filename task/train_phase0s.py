@@ -125,41 +125,45 @@ def resample_negatives_for_epoch(
     train_manifest,
     n_neg: int,
     segment_s: float,
-    epoch_seed: int,
+    epoch: int,
     verbose: bool = False,
 ):
     """
     Draw a fresh negative segment set for one epoch and build the
     training segment list.
 
-    Why we re-seed Python's ``random`` and NumPy: ``build_negative_
-    segments`` uses NumPy's global RNG for the no-call subsample.
-    Some segment-construction helpers also touch Python's ``random``.
-    Seeding both makes the resampling deterministic given the master
-    seed but different across epochs.
+    Seeding strategy
+    ----------------
+    We do NOT re-seed before each call. ``wbu.seed_everything(42)``
+    is called once at the start of main(); from that point on the
+    global RNG state advances naturally as ``build_negative_segments``
+    is called each epoch. Each call returns a different subset because
+    the RNG state at the call site is different — no per-epoch derived
+    seed needed.
+
+    This keeps the "seed=42" convention that every other phase uses.
+    The whole run is bit-reproducible from a single master seed, and
+    wandb config shows ``seed=42`` exactly like 0m/0r.
 
     Parameters
     ----------
     pos_segs_extended : list
         Already-extended positive segments. Reused across epochs.
     n_neg : int
-        Number of negative segments to draw. Fixed across epochs at
-        ``cfg.NEG_RATIO × len(pos_segs)`` so batch composition stays
-        consistent.
-    epoch_seed : int
-        Per-epoch seed. Derived as ``SEED + epoch * 1000``.
+        Number of negative segments to draw per epoch.
+    epoch : int
+        Epoch index (1-based). Used only for the fingerprint print
+        — not for seeding.
     verbose : bool
-        Print a short fingerprint (count + first segment ID) so it's
-        visible in the training log that resampling happened.
+        Print a short fingerprint (count + first segment) so it's
+        visible in the training log that resampling happened and that
+        the draw is actually changing across epochs.
 
     Returns
     -------
     train_segments : list
         Combined pos + new neg segment list ready for WhaleDataset.
     """
-    np.random.seed(epoch_seed)
-    random.seed(epoch_seed)
-
     neg_segs = build_negative_segments(
         train_annotations, train_manifest, n_segments=n_neg,
     )
@@ -168,12 +172,9 @@ def resample_negatives_for_epoch(
     if verbose:
         # Quick fingerprint to verify in the log that the negative set
         # is actually drifting between epochs. If two epochs print the
-        # same fingerprint, seeding is broken.
+        # same fingerprint, the global RNG isn't advancing as expected.
         if neg_segs:
             first = neg_segs[0]
-            # Segments are objects (likely a dataclass), not dicts —
-            # getattr with defaults is the safe way to inspect fields
-            # without knowing the exact schema.
             filename = getattr(first, "filename", "?")
             start = getattr(first, "start_time", None)
             if isinstance(start, (int, float)):
@@ -182,8 +183,10 @@ def resample_negatives_for_epoch(
                 fp = f"file={filename}, start={start}"
         else:
             fp = "<empty>"
-        print(f"    resampled {len(neg_segs)} negatives "
-              f"[seed={epoch_seed}; first: {fp}]")
+        print(f"    epoch {epoch}: resampled {len(neg_segs)} negatives "
+              f"[first: {fp}]")
+
+    return pos_segs_extended + neg_segs
 
     return pos_segs_extended + neg_segs
 
@@ -232,7 +235,6 @@ def main():
         "seed":              SEED,
         "neg_ratio":         cfg.NEG_RATIO,
         "neg_resample_each_epoch": True,
-        "neg_seed_step":     1000,
         "segment_s":         PHASE0E_SEGMENT_S,
         "epochs":            PHASE0F_EPOCHS,
         "train_sites":       PHASE0M_TRAIN_SITES,
@@ -331,18 +333,18 @@ def main():
         t0 = time.time()
 
         # ------------------------------------------------------------
-        # Resample negatives. Per-epoch seed = SEED + epoch * 1000.
-        # The fingerprint print verifies in the log that the negative
-        # set is actually different every epoch.
+        # Resample negatives. No per-epoch seed derivation — the global
+        # RNG seeded once at startup advances naturally between calls,
+        # so each epoch draws a different subset while the whole run
+        # stays bit-reproducible from seed=42.
         # ------------------------------------------------------------
-        epoch_seed = SEED + epoch * 1000
         train_segments = resample_negatives_for_epoch(
             pos_segs_extended=pos_segs,
             train_annotations=train_annotations,
             train_manifest=train_manifest,
             n_neg=n_neg,
             segment_s=PHASE0E_SEGMENT_S,
-            epoch_seed=epoch_seed,
+            epoch=epoch,
             verbose=True,
         )
         train_ds = WhaleDataset(train_segments)
@@ -350,7 +352,7 @@ def main():
             train_ds, batch_size=PHASE0_BATCH_SIZE, shuffle=True,
             num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn,
             pin_memory=True,
-            **wbu.seeded_dataloader_kwargs(epoch_seed),
+            **wbu.seeded_dataloader_kwargs(SEED),
         )
 
         # ------------------------------------------------------------
@@ -384,7 +386,6 @@ def main():
 
         history.append({
             "epoch":       epoch,
-            "epoch_seed":  epoch_seed,
             "train_loss":  train_loss,
             "val_loss":    val["loss"],
             "f1":          val["f1"],
@@ -396,14 +397,12 @@ def main():
             "epoch": epoch, "model_state_dict": model.state_dict(),
             "f1": val["f1"], "history": history,
             "pos_weight": pos_weight.detach().cpu().tolist(),
-            "epoch_seed": epoch_seed,
         }, run_dir / f"phase0s_epoch_{epoch:02d}.pt")
         if improved:
             torch.save({
                 "epoch": epoch, "model_state_dict": model.state_dict(),
                 "f1": val["f1"], "history": history,
                 "pos_weight": pos_weight.detach().cpu().tolist(),
-                "epoch_seed": epoch_seed,
             }, run_dir / "phase0s_best.pt")
 
     # ------------------------------------------------------------------
