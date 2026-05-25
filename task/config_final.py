@@ -231,6 +231,11 @@ BPN_DILATIONS = (2, 4, 8)
 #: ROI vector dimensionality (C_bpn), the proposal network output channels.
 BPN_CHANNELS = 64
 
+#: Number of ROIs per frame produced by the proposal network (R). The paper
+#: leaves R unstated; with its two conv-transpose layers expanding a singleton
+#: ROI axis the implied value is 8, which we use as the default and sweep.
+BPN_R = 8
+
 #: Hidden size per direction of the BPN ROI BiLSTM (paper does not state it).
 BPN_LSTM_HIDDEN = 128
 

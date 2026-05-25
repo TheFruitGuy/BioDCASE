@@ -30,10 +30,17 @@ The ``returns_probs`` attribute records which convention is active.
 
 Scope
 -----
-This module currently implements the ``R = 1`` (single ROI per head) path used
-by the first ladder rungs. The multi-ROI proposal network (conv-transpose,
-``R > 1``) and the global-vs-per-frame weighted-mean variants are later rungs
-and raise ``NotImplementedError`` until added.
+Supports the single-ROI path (``R = 1``: combine taps -> one ROI vector) and
+the multi-ROI proposal network (``R > 1``: a conv-transpose expands a singleton
+ROI axis to R ROI vectors, each processed by the shared ROI processor and
+combined by a learned weighted mean over the R ROIs - the global form, a single
+length-R weight vector applied to every frame). The per-frame weighted-mean
+variant is a later ladder rung.
+
+For ``R > 1`` the number of ROIs is a direct, sweepable hyperparameter
+(``bpn_R``). The paper's Table III fixes R implicitly through its conv-transpose
+kernel sizes; since R is exactly the value we are searching for, we instead size
+a conv-transpose to yield R directly (channels still follow 128 -> C_bpn).
 """
 
 import torch
@@ -229,11 +236,8 @@ class WhaleVADBPN(nn.Module):
 
     def _build_bpn(self, bpn_channels, bpn_lstm_hidden, use_bilstm,
                    gate_init_bias):
-        if self.bpn_R != 1:
-            raise NotImplementedError(
-                "Only bpn_R=1 is implemented so far; the multi-ROI proposal "
-                "network (conv-transpose, R>1) is a later ladder rung."
-            )
+        if self.bpn_R < 1:
+            raise ValueError("bpn_R must be >= 1.")
 
         ch = cfg.FEAT_EXTRACTOR_CH
         # One projection head per tap (shared architecture, separate weights).
@@ -247,10 +251,32 @@ class WhaleVADBPN(nn.Module):
             for _ in self.bpn_taps
         ])
 
-        # Combine the per-tap (freq-collapsed) features into one ROI vector.
-        self.bpn_proj = nn.Linear(ch * len(self.bpn_taps), bpn_channels)
+        # Combine the per-tap (freq-collapsed) features into a single
+        # per-frame feature of width ``ch`` (proposal-network input width).
+        self.bpn_combine = nn.Linear(ch * len(self.bpn_taps), ch)
 
-        # ROI processor -> per-class gate logits.
+        if self.bpn_R == 1:
+            # Single ROI: project the combined feature straight to C_bpn.
+            self.bpn_proj = nn.Linear(ch, bpn_channels)
+        else:
+            # Proposal network: expand a singleton ROI axis to R ROIs via a
+            # conv-transpose (channels ch -> ch), then a 1x1 conv to C_bpn.
+            # Both layers carry GELU, batch norm, and spatial dropout.
+            self.bpn_proposal = nn.Sequential(
+                nn.ConvTranspose2d(ch, ch, kernel_size=(self.bpn_R, 1)),
+                nn.BatchNorm2d(ch),
+                nn.GELU(),
+                nn.Dropout2d(cfg.AGG_DROPOUT),
+                nn.Conv2d(ch, bpn_channels, kernel_size=(1, 1)),
+                nn.BatchNorm2d(bpn_channels),
+                nn.GELU(),
+                nn.Dropout2d(cfg.AGG_DROPOUT),
+            )
+            # Learned weighted mean over the R ROIs (global: one length-R
+            # vector applied to every frame; fixed at inference).
+            self.roi_weights = nn.Parameter(torch.zeros(self.bpn_R))
+
+        # ROI processor -> per-class gate logits (shared across ROIs).
         self.bpn_use_bilstm = use_bilstm
         if use_bilstm:
             self.bpn_lstm = nn.LSTM(
@@ -285,20 +311,37 @@ class WhaleVADBPN(nn.Module):
         x, _ = self.lstm(x)
         return self.classifier(x)
 
+    def _roi_gate(self, roi: torch.Tensor) -> torch.Tensor:
+        """ROI vectors (N, T, C_bpn) -> per-class gate logits (N, T, C)."""
+        if self.bpn_use_bilstm:
+            roi, _ = self.bpn_lstm(roi)
+        return self.bpn_out(roi)
+
     def _bpn_mask(self, taps: list[torch.Tensor]) -> torch.Tensor:
         """Selected taps -> per-frame, per-class mask in (0, 1), shape (B,T,C)."""
         feats = []
-        for ti in self.bpn_taps:
-            h = self.bpn_heads[len(feats)](taps[ti])   # (B, ch, Fr', T)
-            h = h.mean(dim=2)                           # collapse freq -> (B, ch, T)
-            feats.append(h.transpose(1, 2))            # (B, T, ch)
-        roi = torch.cat(feats, dim=-1)                  # (B, T, ch*ntaps)
-        roi = self.bpn_proj(roi)                        # (B, T, C_bpn)  (R=1)
+        for head_i, ti in enumerate(self.bpn_taps):
+            h = self.bpn_heads[head_i](taps[ti])   # (B, ch, Fr', T)
+            h = h.mean(dim=2)                       # collapse freq -> (B, ch, T)
+            feats.append(h.transpose(1, 2))        # (B, T, ch)
+        combined = self.bpn_combine(torch.cat(feats, dim=-1))  # (B, T, ch)
 
-        if self.bpn_use_bilstm:
-            roi, _ = self.bpn_lstm(roi)
-        gate_logits = self.bpn_out(roi)                 # (B, T, num_classes)
-        return torch.sigmoid(gate_logits)
+        if self.bpn_R == 1:
+            roi = self.bpn_proj(combined)              # (B, T, C_bpn)
+            return torch.sigmoid(self._roi_gate(roi))
+
+        # R > 1: expand to R ROIs via the proposal network.
+        B, T, ch = combined.shape
+        x = combined.transpose(1, 2).unsqueeze(2)      # (B, ch, 1, T)
+        x = self.bpn_proposal(x)                        # (B, C_bpn, R, T)
+        x = x.permute(0, 2, 3, 1).contiguous()          # (B, R, T, C_bpn)
+        R, Cb = x.size(1), x.size(3)
+        gate = self._roi_gate(x.reshape(B * R, T, Cb))  # (B*R, T, num_classes)
+        gate = torch.sigmoid(gate).view(B, R, T, self.num_classes)
+
+        # Learned weighted mean over ROIs (global weights, fixed at inference).
+        w = torch.softmax(self.roi_weights, dim=0).view(1, R, 1, 1)
+        return (gate * w).sum(dim=1)                     # (B, T, num_classes)
 
     def forward(self, spec: torch.Tensor) -> torch.Tensor:
         x = self.filterbank(spec)
