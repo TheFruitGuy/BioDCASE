@@ -589,6 +589,128 @@ PHASE_REGISTRY: dict[str, dict] = {
         ),
         interventions=["bpn_multi_roi", "roi_weighted_mean"],
     ),
+    "10a": dict(
+        parent="final",
+        hypothesis=(
+            "Multi-resolution STFT fusion on top of the final pipeline. "
+            "Three parallel STFTs share n_fft=256 and hop=5 but use "
+            "different win_length values (default 16/64/256 samples = "
+            "64/256/1024 ms at SR=250). Their phase-aware (magnitude, "
+            "cos-phase, sin-phase) outputs are channel-concatenated and "
+            "fed to the existing WhaleVAD CNN-BiLSTM with feat_channels=9. "
+            "All branches use center=True for cross-branch frame alignment "
+            "(the only deviation from the final baseline besides the new "
+            "branches). Tests whether the single-window STFT is a Pareto "
+            "compromise on the time-frequency tradeoff: D-calls (1-3 s, "
+            "20-120 Hz downsweeps) should gain from the short branch's "
+            "finer time resolution, while Bm-Z (10 s tonals at ~27 Hz) "
+            "should be roughly unchanged from the long branch (= current "
+            "baseline). Direct test of the frontend-bottleneck hypothesis "
+            "and a stripped-down version of the BioDCASE 2025 winner's "
+            "recipe (Marolt & Bones: LEAF + 3-scale Swin, val macro F1 = "
+            "0.64). Branch list is configurable via --win_lengths so "
+            "ablations sit under the same phase tag, distinguished by "
+            "config.multires/win_lengths in wandb."
+        ),
+        interventions=["multi_res_stft"],
+    ),
+    "11a": dict(
+        parent="final",
+        hypothesis=(
+            "Two-stream PCEN frontend on top of the final recipe "
+            "(7-class WBCE + per-epoch neg resampling). Replace |STFT| "
+            "with two PCEN streams (T_fast=5s, T_slow=25s) matched to "
+            "the BMABZ-vs-D/BP duration spread observed in the training "
+            "data (P95 = 12.89 s for BMABZ vs ~4 s for D and BP). "
+            "Cos/sin phase channels unchanged, so the CNN input goes "
+            "from 3 to 4 channels; everything else (8-site data, paper "
+            "BiLSTM, segment-count WBCE, per-epoch neg resampling) is "
+            "held fixed. PCEN scalars (alpha=0.98, delta=2.0, r=0.5) "
+            "frozen at Wang et al. 2017 defaults; the IIR uses "
+            "analytical warm-start initialisation. Same-day de-risk "
+            "before LEAF: if PCEN moves macro F1 outside the seed-noise "
+            "band, the frontend bottleneck is in per-band normalisation "
+            "rather than learnable filter shape -- strong prior that "
+            "LEAF will do more on top. If neutral, the bottleneck is "
+            "filterbank shape and LEAF's value (if any) has to come "
+            "from there. Same parent as 10a (multi-res STFT) and 9a "
+            "(BPN reproduction) -- frontend change on top of the "
+            "canonical final recipe."
+        ),
+        interventions=["pcen_2stream_frontend"],
+    ),
+    "12a": dict(
+        parent="final",
+        hypothesis=(
+            "Frequency Dynamic Convolution (FDY conv; Nam et al. 2022, "
+            "arXiv:2203.15296) in the residual aggregation block, applied "
+            "on top of the consolidated 'final' recipe (8-site training, "
+            "paper BiLSTM, 7-class targets collapsed to 3 at eval, "
+            "segment-count weighted BCE, per-epoch negative resampling). "
+            "Replaces the first and last of the three depthwise 3x3 "
+            "convs (positions 1 and 7 of the aggregation Sequential) "
+            "with FDConv2d using K=4 basis kernels and attention "
+            "reduction=4 — paper-standard hyperparameters. Middle "
+            "depthwise (position 4) stays standard nn.Conv2d to keep "
+            "parameter overhead modest (~16k params, +1.6%) and avoid "
+            "consecutive FDConvs over-specialising per-band kernels in "
+            "correlated ways. Tests whether breaking the frequency-"
+            "equivariance assumption in the CNN aggregation stage "
+            "improves the learned representation. Diagnostic ablations "
+            "(phases 1-2) identified the CNN frontend as the bottleneck; "
+            "whale calls are defined by their frequency band (Bm-Z at "
+            "~27 Hz, D above 20 Hz), so the wrong inductive bias should "
+            "be most costly here. Reported +7.56% on DESED in the "
+            "original paper; whale data has more frequency-disjoint "
+            "classes than DESED, so the prior should bite at least as "
+            "hard. Same parent as 10a (multi-res STFT) and 9a (BPN "
+            "reproduction) — architecture changes on top of the "
+            "canonical final recipe."
+        ),
+        interventions=["fdconv_aggregation"],
+    ),
+    "11b-sym": dict(
+            parent="final",
+            hypothesis=(
+                "Stacked PCEN frontend, symmetric demean variant. 5-channel "
+                "input [mag, PCEN_fast, PCEN_slow, cos_ph, sin_ph] -- the "
+                "magnitude channel from the baseline is kept intact and two "
+                "PCEN streams (T_fast=5s, T_slow=25s) are appended as "
+                "additional input. Demean is applied once to the complex "
+                "STFT (matching the baseline's pre-normalisation); both the "
+                "magnitude channel and the PCEN streams compute on the "
+                "resulting demeaned magnitude. Tests whether PCEN as an "
+                "additive side-channel helps, where 11a's pure-replacement "
+                "did not (macro F1 0.313 vs ~0.45 baseline). Strictly more "
+                "conservative than 11a: information-theoretically the "
+                "network can learn to zero out the PCEN kernels and recover "
+                "baseline behavior, so a from-scratch run should be lower-"
+                "bounded by baseline in expectation. PCEN scalars frozen at "
+                "Wang et al. 2017 defaults. Paired with 11b-asym to isolate "
+                "demean-PCEN interaction from the stacking question."
+            ),
+            interventions=["pcen_stacked_symmetric"],
+        ),
+    "11b-asym": dict(
+        parent="final",
+        hypothesis=(
+            "Stacked PCEN frontend, asymmetric demean variant. 5-channel "
+            "input [mag, PCEN_fast, PCEN_slow, cos_ph, sin_ph] identical "
+            "in structure to 11b-sym, differing only in how the PCEN "
+            "streams are fed: demean is applied to the complex STFT for "
+            "the mag and phase channels (so the baseline-style triplet "
+            "[mag, cos_ph, sin_ph] is bit-for-bit identical to what the "
+            "final baseline computes), while PCEN streams compute on "
+            "RAW (non-demeaned) magnitude so PCEN's IIR sees the "
+            "persistent background it is supposed to track. Each "
+            "pre-normalisation runs on the input it was designed for. "
+            "Tests whether the 11a regression was caused by demean-PCEN "
+            "redundancy: if 11b-asym > 11b-sym, the demean step was "
+            "neutralising PCEN's main contribution. Paired with 11b-sym "
+            "to isolate the demean-PCEN interaction."
+        ),
+        interventions=["pcen_stacked_asymmetric"],
+    ),
 
 }
 
