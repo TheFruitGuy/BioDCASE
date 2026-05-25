@@ -556,38 +556,20 @@ PHASE_REGISTRY: dict[str, dict] = {
         ),
         interventions=["dilated_backbone", "focal_loss", "bpn_recipe"],
     ),
-    "9b": dict(
+    "9d": dict(
         parent="9a",
         hypothesis=(
-            "Phase 9 (BPN reproduction) rung B: minimal boundary-proposal "
-            "gate (single tap, R=1, BiLSTM ROI processor, gate initialised to "
-            "pass-through) multiplying the classifier probabilities. Tests "
-            "that gating wires up and trains end-to-end without collapsing "
-            "the classifier."
+            "Phase 9 (BPN reproduction) rung D: faithful BPN-multi "
+            "(arXiv:2510.21280v2, Fig. 2 + Table III). Three taps -> projection "
+            "heads -> proposal network expands each head into R=8 ROIs via two "
+            "conv-transposes (R derived from the architecture, not configured) "
+            "-> shared BiLSTM scores each of the H*R=24 ROIs to one gate logit "
+            "-> learned global weighted mean -> single-channel mask gating every "
+            "class equally. Tests whether the faithful BPN delivers the paper's "
+            "minority-class (d, bp) precision gains once evaluated with proper "
+            "post-processing rather than a flat threshold."
         ),
-        interventions=["bpn_gate_minimal"],
-    ),
-    "9c": dict(
-        parent="9b",
-        hypothesis=(
-            "Phase 9 (BPN reproduction) rung C: extend the gate from one tap "
-            "to all three depthwise taps (h0, h1, h2), each with its own "
-            "projection head, combined into a single ROI (R=1). Tests how "
-            "many intermediate taps the boundary proposal needs."
-        ),
-        interventions=["bpn_multi_tap"],
-    ),
-    "9d": dict(
-        parent="9c",
-        hypothesis=(
-            "Phase 9 (BPN reproduction) rung D: full multi-ROI proposal "
-            "network -- the proposal net expands the combined per-frame "
-            "feature into R ROI vectors (conv-transpose), each scored by the "
-            "shared BiLSTM gate and combined by a learned weighted mean over "
-            "the R ROIs. R is swept (the paper leaves it unstated). Tests "
-            "whether the full BPN delivers the minority-class (d, bp) gains."
-        ),
-        interventions=["bpn_multi_roi", "roi_weighted_mean"],
+        interventions=["bpn_multi_roi", "roi_weighted_mean", "single_channel_mask"],
     ),
     "10a": dict(
         parent="final",

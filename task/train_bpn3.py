@@ -1,33 +1,31 @@
 """
-BPN Ladder (Phase 9) - Rung 3 / 9d: Full BPN (Multi-ROI Proposal Network)
-=========================================================================
+WhaleVAD-BPN: faithful BPN-multi reproduction (Phase 9d)
+=======================================================
 
-Fourth rung of the WhaleVAD-BPN ladder (tracked in W&B as phase ``9d`` within
-the ``phase9_bpn_reproduction`` group). This is the full boundary proposal
-network: all three taps feed projection heads, the combined per-frame feature
-is expanded by the proposal network into ``R`` ROI vectors (conv-transpose),
-each ROI is processed by the shared BiLSTM into per-class gate logits, and the
-R gates are combined by a learned weighted mean into the final mask.
+Trains the full boundary proposal network as described in arXiv:2510.21280v2
+(Fig. 2 + Table III), tracked in W&B as phase ``9d`` within the
+``phase9_bpn_reproduction`` group. All three depthwise taps feed their own
+projection heads; the proposal network expands each head into R ROI vectors via
+two conv-transposes (R = 8 per head, derived from the architecture, not
+configured); each of the H*R = 24 ROIs is scored over time by a shared BiLSTM
+into one gate logit; the H*R sigmoid gates are combined by a learned global
+weighted mean into a single-channel mask that gates every class equally.
 
-``R`` is the value the paper leaves unstated; sweep it with ``--R`` (default
-``cfg.BPN_R = 8``, the value implied by the paper's conv-transpose kernels).
+Training recipe (paper Section V-B5): AdamW, focal loss on gated probabilities,
+LR 1e-3 fixed, weight decay 0.01, batch 48, <=32 epochs, ~30 s segments, with
+per-epoch negative resampling and a gate initialised to pass-through.
 
-Everything else matches the earlier rungs: focal loss on gated probabilities,
-gate initialised to pass-through, the BPN training recipe (LR 1e-3, weight
-decay 0.01, batch 48, <=32 epochs), and per-epoch negative resampling.
-
-What this rung answers
-----------------------
-Whether the full multi-ROI proposal network delivers the paper's minority-class
-gains (d, bp), and what value of R is needed to get them.
+Memory: H*R = 24 ROI sequences per sample run through the BiLSTM, so a large
+batch can OOM. Use ``--batch-size`` with ``--accum-steps`` to hold the effective
+batch at 48 while shrinking the per-step batch.
 
 Usage
 -----
 ::
 
-    python train_bpn3.py --R 8
-    python train_bpn3.py --R 4 --init-from runs/bpn0_<timestamp>/bpn0_best.pt
-    python train_bpn3.py --R 8 --wandb
+    python train_bpn3.py
+    python train_bpn3.py --batch-size 24 --accum-steps 2 --wandb
+    python train_bpn3.py --init-from runs/bpn0_<timestamp>/bpn0_best.pt
 """
 
 from __future__ import annotations
@@ -87,11 +85,11 @@ def seeded_dataloader_kwargs(seed: int) -> dict:
 # Model
 # ======================================================================
 
-def build_model(device: torch.device, bpn_R: int, init_from: str | None = None):
-    """Full BPN model (R ROIs, 3 taps) + spectrogram extractor."""
+def build_model(device: torch.device, init_from: str | None = None):
+    """Faithful BPN-multi model (3 taps, architecture-derived R) + spectrogram."""
     model = WhaleVADBPN(
         num_classes=7, use_bpn=True,
-        bpn_taps=(0, 1, 2), bpn_R=bpn_R, bpn_use_bilstm=True,
+        bpn_taps=(0, 1, 2), bpn_use_bilstm=True,
     ).to(device)
     spec = SpectrogramExtractor().to(device)
     with torch.no_grad():
@@ -230,8 +228,6 @@ def parse_args() -> argparse.Namespace:
                    help="Log to Weights & Biases (off by default).")
     p.add_argument("--wandb-mode", default="online",
                    choices=["online", "offline", "disabled"])
-    p.add_argument("--R", type=int, default=cfg.BPN_R,
-                   help=f"Number of ROIs per frame (default {cfg.BPN_R}).")
     p.add_argument("--batch-size", type=int, default=cfg.BPN_BATCH_SIZE,
                    help=f"Per-step batch size (default {cfg.BPN_BATCH_SIZE}). "
                         "Lower it if a large --R runs out of GPU memory.")
@@ -275,23 +271,23 @@ def main():
             "segment_s": cfg.TRAIN_SEGMENT_S, "epochs": args.epochs,
             "loss": "focal", "focal_alpha": cfg.FOCAL_ALPHA,
             "focal_gamma": cfg.FOCAL_GAMMA,
-            "bpn_taps": (0, 1, 2), "bpn_R": args.R, "bpn_use_bilstm": True,
-            "bpn_weighted_mean": "global",
+            "bpn_taps": (0, 1, 2), "bpn_use_bilstm": True,
+            "bpn_weighted_mean": "global", "bpn_mask": "single_channel",
             "bpn_gate_init_bias": cfg.BPN_GATE_INIT_BIAS,
             "init_from": args.init_from,
             "train_sites": train_sites, "val_sites": val_sites,
         }, group=wbu.WANDB_GROUP_BPN,
-            extra_tags=["phase9", "reproduction_of_bpn", f"R{args.R}"],
+            extra_tags=["phase9", "reproduction_of_bpn", "faithful"],
             mode=args.wandb_mode)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(cfg.OUTPUT_DIR) / f"bpn3_R{args.R}_{timestamp}"
+    run_dir = Path(cfg.OUTPUT_DIR) / f"bpn3_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir: {run_dir}")
 
-    print("\nConfiguration (BPN rung 3 - full multi-ROI proposal network):")
-    print(f"  Taps: (0, 1, 2)   R: {args.R}   ROI processor: BiLSTM")
-    print(f"  Weighted mean over ROIs: global (length-{args.R} learned vector)")
+    print("\nConfiguration (BPN faithful reproduction - BPN-multi):")
+    print(f"  Taps: (0, 1, 2)   ROI processor: BiLSTM   (R derived from arch)")
+    print(f"  Weighted mean over ROIs: global   Mask: single-channel")
     print(f"  Gate init bias: {cfg.BPN_GATE_INIT_BIAS} (mask starts ~pass-through)")
     print(f"  Loss: focal (alpha={cfg.FOCAL_ALPHA}, gamma={cfg.FOCAL_GAMMA})")
     print(f"  LR={cfg.BPN_LR}, wd={cfg.BPN_WEIGHT_DECAY}, "
@@ -325,11 +321,16 @@ def main():
     # --- model + optimizer ---
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    model, spec_extractor = build_model(device, bpn_R=args.R, init_from=args.init_from)
+    model, spec_extractor = build_model(device, init_from=args.init_from)
     n_params = sum(p.numel() for p in model.parameters())
+    n_roi = model.bpn_n_roi
+    R = n_roi // len(model.bpn_taps)
     print(f"\nModel parameters: {n_params:,}")
+    print(f"  Derived R={R} per head, {n_roi} ROIs total "
+          f"({len(model.bpn_taps)} taps)")
     if run is not None:
-        run.config.update({"n_params": n_params}, allow_val_change=True)
+        run.config.update({"n_params": n_params, "bpn_R": R,
+                           "bpn_n_roi": n_roi}, allow_val_change=True)
 
     optimizer = AdamW(
         model.parameters(), lr=cfg.BPN_LR, weight_decay=cfg.BPN_WEIGHT_DECAY,
@@ -381,7 +382,7 @@ def main():
                         "f1": val["f1"], "macro_f1": macro,
                         "per_class": val["per_class"]})
         ckpt = {"epoch": epoch, "model_state_dict": model.state_dict(),
-                "f1": val["f1"], "history": history, "bpn_R": args.R}
+                "f1": val["f1"], "history": history, "bpn_R": R}
         torch.save(ckpt, run_dir / f"bpn3_epoch_{epoch:02d}.pt")
         if improved:
             torch.save(ckpt, run_dir / "bpn3_best.pt")
@@ -389,7 +390,7 @@ def main():
     # --- summary ---
     f1s = [h["f1"] for h in history]
     macros = [h["macro_f1"] for h in history]
-    print(f"\n{'=' * 60}\nBPN RUNG 3 SUMMARY (R={args.R})\n{'=' * 60}")
+    print(f"\n{'=' * 60}\nBPN FAITHFUL SUMMARY (R={R}, {n_roi} ROIs)\n{'=' * 60}")
     print(f"Best micro F1: {max(f1s):.3f} (epoch {f1s.index(max(f1s)) + 1})")
     print(f"Best macro F1: {max(macros):.3f}")
     for name in cfg.CALL_TYPES_3:
@@ -399,7 +400,7 @@ def main():
         import wandb_utils as wbu
         wbu.finalize_phase(
             history,
-            verdict=(f"Full BPN (R={args.R}): best micro {max(f1s):.3f}, "
+            verdict=(f"Faithful BPN-multi (R={R}): best micro {max(f1s):.3f}, "
                      f"best macro {max(macros):.3f}."),
             best_ckpt=run_dir / "bpn3_best.pt")
 
