@@ -464,18 +464,34 @@ def validate_hnm(model, model_type, spec_extractor, val_loader, device,
                                       val_loader, device)
     all_probs = collapse_probs_to_3class(all_probs)
 
-    if tune_thresholds:
-        # Coordinate-descent grid sweep over per-class thresholds. With
-        # val_workers > 1, the ~13 trials per class run in parallel via
-        # fork-based worker processes — same picks, ~10× faster wall.
-        thresholds = tune_thresholds_per_class(
-            all_probs, gt_events,
-            parallel_workers=val_workers,
-        )
-    else:
-        thresholds = np.array(cfg.DEFAULT_THRESHOLDS, dtype=np.float64)
+    # After collapse, probs are shape (T, 3) and live in the 3-class label
+    # space. But postprocess.threshold_to_detections reads cfg.class_names()
+    # to label its emitted detections, and that returns CALL_TYPES_7 under
+    # our auto-overridden USE_3CLASS=False. With C=3 channels and
+    # names=CALL_TYPES_7, channel 1 (=D collapsed) gets labelled "bmb" and
+    # channel 2 (=BP collapsed) gets labelled "bmz"; merge_and_filter then
+    # rewrites both to "bmabz" via COLLAPSE_MAP, erasing the D and BP
+    # detections entirely. Flip USE_3CLASS to True for the duration of
+    # threshold-tune + eval so postprocess sees CALL_TYPES_3 — restored
+    # afterwards so the training loop's loss path keeps the 7-class view.
+    saved_use_3class = cfg.USE_3CLASS
+    cfg.USE_3CLASS = True
+    try:
+        if tune_thresholds:
+            # Coordinate-descent grid sweep over per-class thresholds. With
+            # val_workers > 1, the ~13 trials per class run in parallel via
+            # fork-based worker processes — same picks, ~10× faster wall.
+            thresholds = tune_thresholds_per_class(
+                all_probs, gt_events,
+                parallel_workers=val_workers,
+            )
+        else:
+            thresholds = np.array(cfg.DEFAULT_THRESHOLDS, dtype=np.float64)
 
-    metrics = evaluate_with_thresholds(all_probs, gt_events, thresholds)
+        metrics = evaluate_with_thresholds(all_probs, gt_events, thresholds)
+    finally:
+        cfg.USE_3CLASS = saved_use_3class
+
     overall_f1 = metrics.get("overall", {}).get("f1", 0.0)
     macro = macro_f1(metrics)
 
