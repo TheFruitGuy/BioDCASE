@@ -647,6 +647,48 @@ PHASE_REGISTRY: dict[str, dict] = {
         ),
         interventions=["fdconv_aggregation"],
     ),
+    "11b-sym": dict(
+            parent="final",
+            hypothesis=(
+                "Stacked PCEN frontend, symmetric demean variant. 5-channel "
+                "input [mag, PCEN_fast, PCEN_slow, cos_ph, sin_ph] -- the "
+                "magnitude channel from the baseline is kept intact and two "
+                "PCEN streams (T_fast=5s, T_slow=25s) are appended as "
+                "additional input. Demean is applied once to the complex "
+                "STFT (matching the baseline's pre-normalisation); both the "
+                "magnitude channel and the PCEN streams compute on the "
+                "resulting demeaned magnitude. Tests whether PCEN as an "
+                "additive side-channel helps, where 11a's pure-replacement "
+                "did not (macro F1 0.313 vs ~0.45 baseline). Strictly more "
+                "conservative than 11a: information-theoretically the "
+                "network can learn to zero out the PCEN kernels and recover "
+                "baseline behavior, so a from-scratch run should be lower-"
+                "bounded by baseline in expectation. PCEN scalars frozen at "
+                "Wang et al. 2017 defaults. Paired with 11b-asym to isolate "
+                "demean-PCEN interaction from the stacking question."
+            ),
+            interventions=["pcen_stacked_symmetric"],
+        ),
+    "11b-asym": dict(
+        parent="final",
+        hypothesis=(
+            "Stacked PCEN frontend, asymmetric demean variant. 5-channel "
+            "input [mag, PCEN_fast, PCEN_slow, cos_ph, sin_ph] identical "
+            "in structure to 11b-sym, differing only in how the PCEN "
+            "streams are fed: demean is applied to the complex STFT for "
+            "the mag and phase channels (so the baseline-style triplet "
+            "[mag, cos_ph, sin_ph] is bit-for-bit identical to what the "
+            "final baseline computes), while PCEN streams compute on "
+            "RAW (non-demeaned) magnitude so PCEN's IIR sees the "
+            "persistent background it is supposed to track. Each "
+            "pre-normalisation runs on the input it was designed for. "
+            "Tests whether the 11a regression was caused by demean-PCEN "
+            "redundancy: if 11b-asym > 11b-sym, the demean step was "
+            "neutralising PCEN's main contribution. Paired with 11b-sym "
+            "to isolate the demean-PCEN interaction."
+        ),
+        interventions=["pcen_stacked_asymmetric"],
+    ),
 
 }
 
