@@ -687,7 +687,15 @@ def main():
         fsd = file_start_dts.get(key)
         if fsd is None:
             continue
-        label = row["label_3class"] if cfg.USE_3CLASS else row["annotation"]
+        # GT label is ALWAYS the 3-class collapsed version because the
+        # eval pipeline (validate_hnm -> collapse_probs_to_3class ->
+        # tune_thresholds_per_class -> evaluate_with_thresholds) operates
+        # in 3-class space regardless of training mode. Using
+        # row["annotation"] here (the 7-class fine-grained label) under
+        # USE_3CLASS=False would produce a GT list labeled bma/bmb/bmz/
+        # bmd/bpd/bp20/bp20plus that never matches predictions labeled
+        # bmabz/d/bp -> all F1 scores collapse to 0.
+        label = row["label_3class"]
         gt_events.append(Detection(
             dataset=row["dataset"], filename=row["filename"], label=label,
             start_s=(row["start_datetime"] - fsd).total_seconds(),
