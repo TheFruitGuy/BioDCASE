@@ -567,6 +567,28 @@ PHASE_REGISTRY: dict[str, dict] = {
         ),
         interventions=["bpn_gate_minimal"],
     ),
+    "9c": dict(
+        parent="9b",
+        hypothesis=(
+            "Phase 9 (BPN reproduction) rung C: extend the gate from one tap "
+            "to all three depthwise taps (h0, h1, h2), each with its own "
+            "projection head, combined into a single ROI (R=1). Tests how "
+            "many intermediate taps the boundary proposal needs."
+        ),
+        interventions=["bpn_multi_tap"],
+    ),
+    "9d": dict(
+        parent="9c",
+        hypothesis=(
+            "Phase 9 (BPN reproduction) rung D: full multi-ROI proposal "
+            "network -- the proposal net expands the combined per-frame "
+            "feature into R ROI vectors (conv-transpose), each scored by the "
+            "shared BiLSTM gate and combined by a learned weighted mean over "
+            "the R ROIs. R is swept (the paper leaves it unstated). Tests "
+            "whether the full BPN delivers the minority-class (d, bp) gains."
+        ),
+        interventions=["bpn_multi_roi", "roi_weighted_mean"],
+    ),
 
 }
 
