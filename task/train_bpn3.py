@@ -111,11 +111,21 @@ def build_model(device: torch.device, bpn_R: int, init_from: str | None = None):
 # Train / validate
 # ======================================================================
 
-def train_one_epoch(model, spec_extractor, loader, optimizer, device):
-    """One training pass with masked focal loss on gated probabilities."""
+def train_one_epoch(model, spec_extractor, loader, optimizer, device,
+                    accum_steps=1):
+    """One training pass with masked focal loss on gated probabilities.
+
+    ``accum_steps`` accumulates gradients over that many batches before each
+    optimizer step, so a reduced ``--batch-size`` can still reach the paper's
+    effective batch of 48 (batch_size * accum_steps) - keeping the R-sweep a
+    fair comparison even when a large R forces a smaller per-step batch.
+    """
     model.train()
     losses, n = 0.0, 0
-    for audio, targets, mask, _ in tqdm(loader, desc="Train", leave=False):
+    n_batches = len(loader)
+    optimizer.zero_grad()
+    for i, (audio, targets, mask, _) in enumerate(
+            tqdm(loader, desc="Train", leave=False)):
         audio = audio.to(device)
         targets = targets.to(device)
         mask = mask.to(device)
@@ -128,10 +138,12 @@ def train_one_epoch(model, spec_extractor, loader, optimizer, device):
         per_frame = focal_loss_with_probs(probs, targets) * valid
         loss = per_frame.sum() / (valid.sum() * targets.size(-1)).clamp(min=1.0)
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.GRAD_CLIP)
-        optimizer.step()
+        (loss / accum_steps).backward()
+        if (i + 1) % accum_steps == 0 or (i + 1) == n_batches:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=cfg.GRAD_CLIP)
+            optimizer.step()
+            optimizer.zero_grad()
 
         losses += loss.item()
         n += 1
@@ -220,6 +232,13 @@ def parse_args() -> argparse.Namespace:
                    choices=["online", "offline", "disabled"])
     p.add_argument("--R", type=int, default=cfg.BPN_R,
                    help=f"Number of ROIs per frame (default {cfg.BPN_R}).")
+    p.add_argument("--batch-size", type=int, default=cfg.BPN_BATCH_SIZE,
+                   help=f"Per-step batch size (default {cfg.BPN_BATCH_SIZE}). "
+                        "Lower it if a large --R runs out of GPU memory.")
+    p.add_argument("--accum-steps", type=int, default=1,
+                   help="Gradient accumulation steps; effective batch = "
+                        "batch_size * accum_steps. Use to hold the effective "
+                        "batch at 48 while shrinking --batch-size for large R.")
     p.add_argument("--init-from", default=None,
                    help="Optional rung-0 checkpoint to warm-start the backbone.")
     p.add_argument("--epochs", type=int, default=cfg.BPN_EPOCHS)
@@ -249,7 +268,9 @@ def main():
         import wandb_utils as wbu
         run = wbu.init_phase("9d", config={
             "lr": cfg.BPN_LR, "weight_decay": cfg.BPN_WEIGHT_DECAY,
-            "batch_size": cfg.BPN_BATCH_SIZE, "threshold": cfg.THRESHOLD,
+            "batch_size": args.batch_size, "accum_steps": args.accum_steps,
+            "effective_batch": args.batch_size * args.accum_steps,
+            "threshold": cfg.THRESHOLD,
             "seed": seed, "neg_ratio": cfg.NEG_RATIO,
             "segment_s": cfg.TRAIN_SEGMENT_S, "epochs": args.epochs,
             "loss": "focal", "focal_alpha": cfg.FOCAL_ALPHA,
@@ -274,7 +295,9 @@ def main():
     print(f"  Gate init bias: {cfg.BPN_GATE_INIT_BIAS} (mask starts ~pass-through)")
     print(f"  Loss: focal (alpha={cfg.FOCAL_ALPHA}, gamma={cfg.FOCAL_GAMMA})")
     print(f"  LR={cfg.BPN_LR}, wd={cfg.BPN_WEIGHT_DECAY}, "
-          f"batch={cfg.BPN_BATCH_SIZE}, epochs={args.epochs}")
+          f"batch={args.batch_size} x accum {args.accum_steps} "
+          f"(effective {args.batch_size * args.accum_steps}), "
+          f"epochs={args.epochs}")
 
     # --- data ---
     print("\nLoading training data...")
@@ -291,7 +314,7 @@ def main():
     val_annotations = load_annotations(val_sites, manifest=val_manifest)
     val_segments = build_val_segments(val_manifest, val_annotations)
     val_loader = DataLoader(
-        WhaleDataset(val_segments), batch_size=cfg.BPN_BATCH_SIZE, shuffle=False,
+        WhaleDataset(val_segments), batch_size=args.batch_size, shuffle=False,
         num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True)
     file_start_dts = {
         (r["dataset"], r["filename"]): r["start_dt"]
@@ -322,12 +345,13 @@ def main():
             pos_segs, train_annotations, train_manifest, n_neg,
             cfg.TRAIN_SEGMENT_S, epoch, sampling_rng, verbose=True)
         train_loader = DataLoader(
-            WhaleDataset(train_segments), batch_size=cfg.BPN_BATCH_SIZE,
+            WhaleDataset(train_segments), batch_size=args.batch_size,
             shuffle=True, num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn,
             pin_memory=True, **seeded_dataloader_kwargs(seed))
 
         train_loss = train_one_epoch(
-            model, spec_extractor, train_loader, optimizer, device)
+            model, spec_extractor, train_loader, optimizer, device,
+            accum_steps=args.accum_steps)
         val = validate(model, spec_extractor, val_loader, device,
                        val_annotations, file_start_dts, threshold=cfg.THRESHOLD)
         epoch_time = time.time() - t0
