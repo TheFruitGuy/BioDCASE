@@ -35,6 +35,15 @@ Validation/eval is unchanged: probabilities are collapsed 7→3 before
 F1 is computed, so the macro/overall numbers remain comparable to
 3-class HNM runs.
 
+Config handling
+---------------
+
+The script auto-overrides ``cfg.USE_3CLASS = False`` at the start of
+``main()`` if it was True. The override is in-process only — config.py
+on disk is never modified and concurrent 3-class jobs in OTHER
+processes are unaffected. You do not need to edit config.py to switch
+between 3-class and 7-class HNM runs.
+
 Usage
 -----
 ::
@@ -492,17 +501,25 @@ def validate_hnm(model, model_type, spec_extractor, val_loader, device,
 
 def main():
     args = parse_args()
+    # Auto-override the class-axis flag instead of requiring the user
+    # to edit config.py. cfg attributes are read dynamically by
+    # downstream callers (cfg.n_classes, cfg.class_names, dataset/loss
+    # paths), so a single in-process flip is enough — config.py on
+    # disk is never modified, and concurrent 3-class jobs in OTHER
+    # processes are unaffected. Must happen before any model / dataset
+    # / dataloader construction because those read n_classes() at
+    # build time.
+    if getattr(cfg, "USE_4CLASS_D_SPLIT", False):
+        raise RuntimeError(
+            "USE_4CLASS_D_SPLIT must be False for 7-class HNM; "
+            "got True. Check config.py.")
     if cfg.USE_3CLASS:
-        raise RuntimeError(
-            "train_phase_hnm_7class.py requires cfg.USE_3CLASS=False "
-            "(7-class output head). Either set USE_3CLASS=False in "
-            "config.py for this run, or use the 3-class version "
-            "train_phase_hnm.py instead.")
-    if cfg.n_classes() != 7:
-        raise RuntimeError(
-            f"Expected cfg.n_classes() == 7, got {cfg.n_classes()}. "
-            f"Check config.py — USE_4CLASS_D_SPLIT or similar flags "
-            f"may be interfering.")
+        print(f"[hnm 7c] cfg.USE_3CLASS True -> False (in-process "
+              f"only; config.py unchanged). Required because the "
+              f"source checkpoint has 7 output channels.")
+        cfg.USE_3CLASS = False
+    assert cfg.n_classes() == 7, (
+        f"expected n_classes() == 7 after override, got {cfg.n_classes()}")
     wbu.seed_everything(args.seed, deterministic=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -559,7 +576,7 @@ def main():
                       else "single_target")
 
     run = wbu.init_phase(
-        "6",
+        "6-7c",
         config={
             "lr": args.lr,
             "epochs": args.epochs,

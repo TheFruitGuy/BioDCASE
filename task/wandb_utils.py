@@ -384,6 +384,28 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "tags."),
         interventions=["hard_negative_mining"],
     ),
+    "6-7c": dict(
+        parent=None,  # source can vary across 7-class checkpoints; lineage via tags
+        hypothesis=(
+            "7-class variant of phase 6 (HNM + optional PGI). Run on "
+            "checkpoints whose classifier outputs the 7 fine-grained "
+            "call types (cfg.USE_3CLASS=False). The 3-class HNM script "
+            "uses cfg.CALL_TYPES_3.index(target_class) to build the PGI "
+            "mask, which silently degrades to 'isolate the first 3 of "
+            "7 channels' on a 7-class model. This phase uses "
+            "train_phase_hnm_7class.py, which expands the PGI mask "
+            "correctly: a 3-class target (e.g. 'd') is mapped to the "
+            "GROUP of 7-class channels that collapse to it under "
+            "COLLAPSE_MAP ({bmd, bpd}); a 7-class target (e.g. 'bmd') "
+            "isolates that one channel for the strictest cross-class "
+            "test of the PGI hypothesis. Mining can stay 3-class (reuse "
+            "existing JSONs) or switch to subclass-level via "
+            "mine_hard_negatives_7class.py. Eval is unchanged: probs "
+            "are collapsed 7->3 before macro F1 is computed, so numbers "
+            "remain comparable to phase-6 runs."
+        ),
+        interventions=["hard_negative_mining", "seven_class_pgi"],
+    ),
     "final_eval": dict(
         parent=None,
         hypothesis=("Final reporting on the validation set: per-site "
