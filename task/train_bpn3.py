@@ -52,7 +52,8 @@ from spectrogram_final import SpectrogramExtractor
 from model_bpn_final import WhaleVADBPN, focal_loss_with_probs
 from postprocess_final import (
     postprocess_predictions, compute_metrics, Detection,
-    collapse_probs_to_3class,
+    collapse_probs_to_3class, stitch_segments, smooth_probabilities,
+    threshold_to_detections, merge_and_filter,
 )
 
 
@@ -199,6 +200,95 @@ def validate(model, spec_extractor, loader, device,
         for name in cfg.CALL_TYPES_3
     }
     return {"f1": metrics.get("overall", {}).get("f1", 0.0), "per_class": per_class}
+
+
+@torch.no_grad()
+def tune_thresholds(model, spec_extractor, loader, device,
+                    val_annotations, file_start_dts,
+                    grid=np.arange(0.05, 0.96, 0.02)):
+    """Per-class threshold sweep on the development set.
+
+    Per-class event-level F1 only depends on that class's threshold (event
+    matching is per-class), so each class is optimised independently. Stitching
+    and median smoothing are cached and reused across the sweep; only the
+    thresholding + merge/filter step runs inside the loop.
+
+    Returns
+    -------
+    dict
+        ``{"thresholds": [tau_bmabz, tau_d, tau_bp],
+           "per_class": {name: {"f1","precision","recall","threshold"}},
+           "macro_f1": float, "micro_f1": float}``
+    """
+    model.eval()
+    all_probs_7 = {}
+    hop = spec_extractor.hop_length
+    for audio, _, _, metas in tqdm(loader, desc="Tune-inference", leave=False):
+        audio = audio.to(device)
+        probs = model(spec_extractor(audio)).cpu().numpy()
+        for j, meta in enumerate(metas):
+            key = (meta["dataset"], meta["filename"], meta["start_sample"])
+            n_samp = meta["end_sample"] - meta["start_sample"]
+            n_frames = min(n_samp // hop, probs[j].shape[0])
+            all_probs_7[key] = probs[j, :n_frames, :]
+    all_probs_3 = collapse_probs_to_3class(all_probs_7)
+
+    cfg.USE_3CLASS = True
+    try:
+        file_probs = stitch_segments(all_probs_3)
+        file_smoothed = {k: smooth_probabilities(v) for k, v in file_probs.items()}
+
+        gt_events = []
+        for _, row in val_annotations.iterrows():
+            fsd = file_start_dts.get((row["dataset"], row["filename"]))
+            if fsd is None:
+                continue
+            gt_events.append(Detection(
+                dataset=row["dataset"], filename=row["filename"],
+                label=row["label_3class"],
+                start_s=(row["start_datetime"] - fsd).total_seconds(),
+                end_s=(row["end_datetime"] - fsd).total_seconds(),
+            ))
+
+        tuned = np.full(3, 0.5, dtype=np.float64)
+        per_class_out = {}
+        for c_idx, c_name in enumerate(cfg.CALL_TYPES_3):
+            best = {"f1": -1.0, "precision": 0.0, "recall": 0.0, "tau": 0.5}
+            for tau in grid:
+                thr = np.full(3, 0.99, dtype=np.float64)  # silence other classes
+                thr[c_idx] = float(tau)
+                dets = []
+                for (ds, fn), p in file_smoothed.items():
+                    dets.extend(threshold_to_detections(p, thr, ds, fn))
+                events = merge_and_filter(dets)
+                m = compute_metrics(events, gt_events, iou_threshold=0.3)
+                f1 = m.get(c_name, {}).get("f1", 0.0)
+                if f1 > best["f1"]:
+                    best = {
+                        "f1": f1,
+                        "precision": m[c_name]["precision"],
+                        "recall": m[c_name]["recall"],
+                        "tau": float(tau),
+                    }
+            tuned[c_idx] = best["tau"]
+            per_class_out[c_name] = best
+
+        # Joint score at the tuned per-class thresholds.
+        joint_dets = []
+        for (ds, fn), p in file_smoothed.items():
+            joint_dets.extend(threshold_to_detections(p, tuned, ds, fn))
+        joint_events = merge_and_filter(joint_dets)
+        joint = compute_metrics(joint_events, gt_events, iou_threshold=0.3)
+    finally:
+        cfg.USE_3CLASS = False
+
+    per_class_f1 = [per_class_out[n]["f1"] for n in cfg.CALL_TYPES_3]
+    return {
+        "thresholds": tuned.tolist(),
+        "per_class": per_class_out,
+        "macro_f1": float(np.mean(per_class_f1)),
+        "micro_f1": float(joint.get("overall", {}).get("f1", 0.0)),
+    }
 
 
 # ======================================================================
@@ -391,17 +481,47 @@ def main():
     f1s = [h["f1"] for h in history]
     macros = [h["macro_f1"] for h in history]
     print(f"\n{'=' * 60}\nBPN FAITHFUL SUMMARY (R={R}, {n_roi} ROIs)\n{'=' * 60}")
-    print(f"Best micro F1: {max(f1s):.3f} (epoch {f1s.index(max(f1s)) + 1})")
-    print(f"Best macro F1: {max(macros):.3f}")
+    print(f"Best micro F1 @ flat 0.3: {max(f1s):.3f} "
+          f"(epoch {f1s.index(max(f1s)) + 1})")
+    print(f"Best macro F1 @ flat 0.3: {max(macros):.3f}")
     for name in cfg.CALL_TYPES_3:
         print(f"  best {name}: {max(h['per_class'][name]['f1'] for h in history):.3f}")
 
+    # --- final per-class threshold tuning on the best checkpoint ---
+    # The paper's BPN gains live in the precision-recall curve, so flat-0.3
+    # numbers understate the model. Tune one threshold per class on the dev set
+    # and report what the model actually delivers at the tuned operating point.
+    print(f"\n{'-' * 60}\nThreshold tuning on best checkpoint\n{'-' * 60}")
+    best_ckpt = run_dir / "bpn3_best.pt"
+    model.load_state_dict(torch.load(best_ckpt, map_location=device)["model_state_dict"])
+    tuned = tune_thresholds(model, spec_extractor, val_loader, device,
+                            val_annotations, file_start_dts)
+    print(f"Tuned thresholds: " + ", ".join(
+        f"{n}={t:.2f}" for n, t in zip(cfg.CALL_TYPES_3, tuned["thresholds"])))
+    for name in cfg.CALL_TYPES_3:
+        pc = tuned["per_class"][name]
+        print(f"  {name}: F1={pc['f1']:.3f}  P={pc['precision']:.3f}  "
+              f"R={pc['recall']:.3f}  (tau={pc['tau']:.2f})")
+    print(f"Macro F1 @ tuned: {tuned['macro_f1']:.3f}   "
+          f"Micro F1 @ tuned: {tuned['micro_f1']:.3f}")
+    import json
+    (run_dir / "tuned_thresholds.json").write_text(json.dumps(tuned, indent=2))
+
     if run is not None:
         import wandb_utils as wbu
+        run.summary["tuned/macro_f1"] = tuned["macro_f1"]
+        run.summary["tuned/micro_f1"] = tuned["micro_f1"]
+        for name in cfg.CALL_TYPES_3:
+            pc = tuned["per_class"][name]
+            run.summary[f"tuned/{name}/f1"] = pc["f1"]
+            run.summary[f"tuned/{name}/precision"] = pc["precision"]
+            run.summary[f"tuned/{name}/recall"] = pc["recall"]
+            run.summary[f"tuned/{name}/threshold"] = pc["tau"]
         wbu.finalize_phase(
             history,
-            verdict=(f"Faithful BPN-multi (R={R}): best micro {max(f1s):.3f}, "
-                     f"best macro {max(macros):.3f}."),
+            verdict=(f"Faithful BPN-multi (R={R}): flat-0.3 macro "
+                     f"{max(macros):.3f}; tuned-per-class macro "
+                     f"{tuned['macro_f1']:.3f}."),
             best_ckpt=run_dir / "bpn3_best.pt")
 
 
