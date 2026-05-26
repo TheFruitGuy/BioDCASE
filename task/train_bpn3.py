@@ -430,6 +430,7 @@ def main():
     history = []
     print(f"\n{'=' * 60}\nTraining {args.epochs} epochs\n{'=' * 60}")
     best_f1 = 0.0
+    best_macro = 0.0
     for epoch in range(1, args.epochs + 1):
         t0 = time.time()
         train_segments = resample_negatives_for_epoch(
@@ -476,6 +477,9 @@ def main():
         torch.save(ckpt, run_dir / f"bpn3_epoch_{epoch:02d}.pt")
         if improved:
             torch.save(ckpt, run_dir / "bpn3_best.pt")
+        if macro > best_macro:
+            best_macro = macro
+            torch.save(ckpt, run_dir / "bpn3_best_macro.pt")
 
     # --- summary ---
     f1s = [h["f1"] for h in history]
@@ -491,8 +495,10 @@ def main():
     # The paper's BPN gains live in the precision-recall curve, so flat-0.3
     # numbers understate the model. Tune one threshold per class on the dev set
     # and report what the model actually delivers at the tuned operating point.
-    print(f"\n{'-' * 60}\nThreshold tuning on best checkpoint\n{'-' * 60}")
-    best_ckpt = run_dir / "bpn3_best.pt"
+    print(f"\n{'-' * 60}\nThreshold tuning on best-macro checkpoint\n{'-' * 60}")
+    macro_ckpt = run_dir / "bpn3_best_macro.pt"
+    best_ckpt = macro_ckpt if macro_ckpt.exists() else (run_dir / "bpn3_best.pt")
+    print(f"Loading {best_ckpt.name}")
     model.load_state_dict(torch.load(best_ckpt, map_location=device)["model_state_dict"])
     tuned = tune_thresholds(model, spec_extractor, val_loader, device,
                             val_annotations, file_start_dts)
