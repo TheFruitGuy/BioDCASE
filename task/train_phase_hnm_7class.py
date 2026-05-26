@@ -889,11 +889,16 @@ def main():
     wandb.summary["mining_targets"]    = list(targets_used)
     wandb.summary["mining_targets_3c"] = sorted(targets_used_3c)
 
-    # Verdict text — multi-target aware.
+    # Verdict text — multi-target aware. Per-target deltas reference
+    # wandb summary keys, which are stamped above only for CALL_TYPES_3
+    # entries (the eval is post-collapse). Iterate over the rolled-up
+    # 3-class target set so subclass-target runs (e.g. mining bmd + bpd)
+    # don't try to read delta_f1_bmd / delta_f1_bpd — both of which
+    # roll up to delta_f1_d, which is what the user actually wants.
     selected_delta = best_f1 - val0[f"{args.select_by}_f1"]
     per_target_str = ", ".join(
         f"{t}={wandb.summary[f'delta_f1_{t}']:+.3f}"
-        for t in targets_used
+        for t in sorted(targets_used_3c)
     )
     pgi_str = "on" if args.isolate_classes else "off"
 
