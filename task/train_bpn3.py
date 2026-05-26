@@ -86,10 +86,16 @@ def seeded_dataloader_kwargs(seed: int) -> dict:
 # Model
 # ======================================================================
 
-def build_model(device: torch.device, init_from: str | None = None):
-    """Faithful BPN-multi model (3 taps, architecture-derived R) + spectrogram."""
+def build_model(device: torch.device, init_from: str | None = None,
+                use_bpn: bool = True):
+    """Faithful BPN-multi model (3 taps, architecture-derived R) + spectrogram.
+
+    With ``use_bpn=False`` the BPN branch is dropped entirely, leaving the
+    dilated backbone + classifier. Returns logits in that case; the caller is
+    responsible for sigmoid before computing focal loss / probs.
+    """
     model = WhaleVADBPN(
-        num_classes=7, use_bpn=True,
+        num_classes=7, use_bpn=use_bpn,
         bpn_taps=(0, 1, 2), bpn_use_bilstm=True,
     ).to(device)
     spec = SpectrogramExtractor().to(device)
@@ -129,7 +135,8 @@ def train_one_epoch(model, spec_extractor, loader, optimizer, device,
         targets = targets.to(device)
         mask = mask.to(device)
 
-        probs = model(spec_extractor(audio))   # already in (0, 1)
+        out = model(spec_extractor(audio))
+        probs = out if model.returns_probs else torch.sigmoid(out)
         T = min(probs.size(1), targets.size(1))
         probs, targets, mask = probs[:, :T], targets[:, :T], mask[:, :T]
 
@@ -159,7 +166,8 @@ def validate(model, spec_extractor, loader, device,
 
     for audio, _, _, metas in tqdm(loader, desc="Val", leave=False):
         audio = audio.to(device)
-        probs = model(spec_extractor(audio)).cpu().numpy()   # gated probs
+        out = model(spec_extractor(audio))
+        probs = (out if model.returns_probs else torch.sigmoid(out)).cpu().numpy()
         for j, meta in enumerate(metas):
             key = (meta["dataset"], meta["filename"], meta["start_sample"])
             n_samp = meta["end_sample"] - meta["start_sample"]
@@ -327,6 +335,10 @@ def parse_args() -> argparse.Namespace:
                         "batch at 48 while shrinking --batch-size for large R.")
     p.add_argument("--init-from", default=None,
                    help="Optional rung-0 checkpoint to warm-start the backbone.")
+    p.add_argument("--no-bpn", action="store_true",
+                   help="Ablation: keep the dilated backbone but drop the BPN "
+                        "gate. Trains the same classifier on raw logits with "
+                        "the same focal-loss-on-probs (post-sigmoid).")
     p.add_argument("--epochs", type=int, default=cfg.BPN_EPOCHS)
     p.add_argument("--seed", type=int, default=cfg.SEED)
     return p.parse_args()
@@ -371,7 +383,8 @@ def main():
             mode=args.wandb_mode)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(cfg.OUTPUT_DIR) / f"bpn3_{timestamp}"
+    run_prefix = "bpn3_nogate" if args.no_bpn else "bpn3"
+    run_dir = Path(cfg.OUTPUT_DIR) / f"{run_prefix}_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir: {run_dir}")
 
@@ -411,13 +424,19 @@ def main():
     # --- model + optimizer ---
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    model, spec_extractor = build_model(device, init_from=args.init_from)
+    model, spec_extractor = build_model(
+        device, init_from=args.init_from, use_bpn=not args.no_bpn)
     n_params = sum(p.numel() for p in model.parameters())
-    n_roi = model.bpn_n_roi
-    R = n_roi // len(model.bpn_taps)
-    print(f"\nModel parameters: {n_params:,}")
-    print(f"  Derived R={R} per head, {n_roi} ROIs total "
-          f"({len(model.bpn_taps)} taps)")
+    if model.use_bpn:
+        n_roi = model.bpn_n_roi
+        R = n_roi // len(model.bpn_taps)
+        print(f"\nModel parameters: {n_params:,}")
+        print(f"  Derived R={R} per head, {n_roi} ROIs total "
+              f"({len(model.bpn_taps)} taps)")
+    else:
+        n_roi, R = 0, 0
+        print(f"\nModel parameters: {n_params:,}")
+        print("  Ablation: BPN gate disabled (dilated backbone + classifier only)")
     if run is not None:
         run.config.update({"n_params": n_params, "bpn_R": R,
                            "bpn_n_roi": n_roi}, allow_val_change=True)
@@ -474,12 +493,12 @@ def main():
                         "per_class": val["per_class"]})
         ckpt = {"epoch": epoch, "model_state_dict": model.state_dict(),
                 "f1": val["f1"], "history": history, "bpn_R": R}
-        torch.save(ckpt, run_dir / f"bpn3_epoch_{epoch:02d}.pt")
+        torch.save(ckpt, run_dir / f"{run_prefix}_epoch_{epoch:02d}.pt")
         if improved:
-            torch.save(ckpt, run_dir / "bpn3_best.pt")
+            torch.save(ckpt, run_dir / f"{run_prefix}_best.pt")
         if macro > best_macro:
             best_macro = macro
-            torch.save(ckpt, run_dir / "bpn3_best_macro.pt")
+            torch.save(ckpt, run_dir / f"{run_prefix}_best_macro.pt")
 
     # --- summary ---
     f1s = [h["f1"] for h in history]
@@ -496,8 +515,8 @@ def main():
     # numbers understate the model. Tune one threshold per class on the dev set
     # and report what the model actually delivers at the tuned operating point.
     print(f"\n{'-' * 60}\nThreshold tuning on best-macro checkpoint\n{'-' * 60}")
-    macro_ckpt = run_dir / "bpn3_best_macro.pt"
-    best_ckpt = macro_ckpt if macro_ckpt.exists() else (run_dir / "bpn3_best.pt")
+    macro_ckpt = run_dir / f"{run_prefix}_best_macro.pt"
+    best_ckpt = macro_ckpt if macro_ckpt.exists() else (run_dir / f"{run_prefix}_best.pt")
     print(f"Loading {best_ckpt.name}")
     model.load_state_dict(torch.load(best_ckpt, map_location=device)["model_state_dict"])
     tuned = tune_thresholds(model, spec_extractor, val_loader, device,
@@ -528,7 +547,7 @@ def main():
             verdict=(f"Faithful BPN-multi (R={R}): flat-0.3 macro "
                      f"{max(macros):.3f}; tuned-per-class macro "
                      f"{tuned['macro_f1']:.3f}."),
-            best_ckpt=run_dir / "bpn3_best.pt")
+            best_ckpt=run_dir / f"{run_prefix}_best.pt")
 
 
 if __name__ == "__main__":
