@@ -1,33 +1,31 @@
 """
-BPN Ladder (Phase 9) - Rung 3 / 9d: Full BPN (Multi-ROI Proposal Network)
-=========================================================================
+WhaleVAD-BPN: faithful BPN-multi reproduction (Phase 9d)
+=======================================================
 
-Fourth rung of the WhaleVAD-BPN ladder (tracked in W&B as phase ``9d`` within
-the ``phase9_bpn_reproduction`` group). This is the full boundary proposal
-network: all three taps feed projection heads, the combined per-frame feature
-is expanded by the proposal network into ``R`` ROI vectors (conv-transpose),
-each ROI is processed by the shared BiLSTM into per-class gate logits, and the
-R gates are combined by a learned weighted mean into the final mask.
+Trains the full boundary proposal network as described in arXiv:2510.21280v2
+(Fig. 2 + Table III), tracked in W&B as phase ``9d`` within the
+``phase9_bpn_reproduction`` group. All three depthwise taps feed their own
+projection heads; the proposal network expands each head into R ROI vectors via
+two conv-transposes (R = 8 per head, derived from the architecture, not
+configured); each of the H*R = 24 ROIs is scored over time by a shared BiLSTM
+into one gate logit; the H*R sigmoid gates are combined by a learned global
+weighted mean into a single-channel mask that gates every class equally.
 
-``R`` is the value the paper leaves unstated; sweep it with ``--R`` (default
-``cfg.BPN_R = 8``, the value implied by the paper's conv-transpose kernels).
+Training recipe (paper Section V-B5): AdamW, focal loss on gated probabilities,
+LR 1e-3 fixed, weight decay 0.01, batch 48, <=32 epochs, ~30 s segments, with
+per-epoch negative resampling and a gate initialised to pass-through.
 
-Everything else matches the earlier rungs: focal loss on gated probabilities,
-gate initialised to pass-through, the BPN training recipe (LR 1e-3, weight
-decay 0.01, batch 48, <=32 epochs), and per-epoch negative resampling.
-
-What this rung answers
-----------------------
-Whether the full multi-ROI proposal network delivers the paper's minority-class
-gains (d, bp), and what value of R is needed to get them.
+Memory: H*R = 24 ROI sequences per sample run through the BiLSTM, so a large
+batch can OOM. Use ``--batch-size`` with ``--accum-steps`` to hold the effective
+batch at 48 while shrinking the per-step batch.
 
 Usage
 -----
 ::
 
-    python train_bpn3.py --R 8
-    python train_bpn3.py --R 4 --init-from runs/bpn0_<timestamp>/bpn0_best.pt
-    python train_bpn3.py --R 8 --wandb
+    python train_bpn3.py
+    python train_bpn3.py --batch-size 24 --accum-steps 2 --wandb
+    python train_bpn3.py --init-from runs/bpn0_<timestamp>/bpn0_best.pt
 """
 
 from __future__ import annotations
@@ -54,7 +52,8 @@ from spectrogram_final import SpectrogramExtractor
 from model_bpn_final import WhaleVADBPN, focal_loss_with_probs
 from postprocess_final import (
     postprocess_predictions, compute_metrics, Detection,
-    collapse_probs_to_3class,
+    collapse_probs_to_3class, stitch_segments, smooth_probabilities,
+    threshold_to_detections, merge_and_filter,
 )
 
 
@@ -87,11 +86,11 @@ def seeded_dataloader_kwargs(seed: int) -> dict:
 # Model
 # ======================================================================
 
-def build_model(device: torch.device, bpn_R: int, init_from: str | None = None):
-    """Full BPN model (R ROIs, 3 taps) + spectrogram extractor."""
+def build_model(device: torch.device, init_from: str | None = None):
+    """Faithful BPN-multi model (3 taps, architecture-derived R) + spectrogram."""
     model = WhaleVADBPN(
         num_classes=7, use_bpn=True,
-        bpn_taps=(0, 1, 2), bpn_R=bpn_R, bpn_use_bilstm=True,
+        bpn_taps=(0, 1, 2), bpn_use_bilstm=True,
     ).to(device)
     spec = SpectrogramExtractor().to(device)
     with torch.no_grad():
@@ -111,11 +110,21 @@ def build_model(device: torch.device, bpn_R: int, init_from: str | None = None):
 # Train / validate
 # ======================================================================
 
-def train_one_epoch(model, spec_extractor, loader, optimizer, device):
-    """One training pass with masked focal loss on gated probabilities."""
+def train_one_epoch(model, spec_extractor, loader, optimizer, device,
+                    accum_steps=1):
+    """One training pass with masked focal loss on gated probabilities.
+
+    ``accum_steps`` accumulates gradients over that many batches before each
+    optimizer step, so a reduced ``--batch-size`` can still reach the paper's
+    effective batch of 48 (batch_size * accum_steps) - keeping the R-sweep a
+    fair comparison even when a large R forces a smaller per-step batch.
+    """
     model.train()
     losses, n = 0.0, 0
-    for audio, targets, mask, _ in tqdm(loader, desc="Train", leave=False):
+    n_batches = len(loader)
+    optimizer.zero_grad()
+    for i, (audio, targets, mask, _) in enumerate(
+            tqdm(loader, desc="Train", leave=False)):
         audio = audio.to(device)
         targets = targets.to(device)
         mask = mask.to(device)
@@ -128,10 +137,12 @@ def train_one_epoch(model, spec_extractor, loader, optimizer, device):
         per_frame = focal_loss_with_probs(probs, targets) * valid
         loss = per_frame.sum() / (valid.sum() * targets.size(-1)).clamp(min=1.0)
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=cfg.GRAD_CLIP)
-        optimizer.step()
+        (loss / accum_steps).backward()
+        if (i + 1) % accum_steps == 0 or (i + 1) == n_batches:
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(), max_norm=cfg.GRAD_CLIP)
+            optimizer.step()
+            optimizer.zero_grad()
 
         losses += loss.item()
         n += 1
@@ -191,6 +202,95 @@ def validate(model, spec_extractor, loader, device,
     return {"f1": metrics.get("overall", {}).get("f1", 0.0), "per_class": per_class}
 
 
+@torch.no_grad()
+def tune_thresholds(model, spec_extractor, loader, device,
+                    val_annotations, file_start_dts,
+                    grid=np.arange(0.05, 0.96, 0.02)):
+    """Per-class threshold sweep on the development set.
+
+    Per-class event-level F1 only depends on that class's threshold (event
+    matching is per-class), so each class is optimised independently. Stitching
+    and median smoothing are cached and reused across the sweep; only the
+    thresholding + merge/filter step runs inside the loop.
+
+    Returns
+    -------
+    dict
+        ``{"thresholds": [tau_bmabz, tau_d, tau_bp],
+           "per_class": {name: {"f1","precision","recall","threshold"}},
+           "macro_f1": float, "micro_f1": float}``
+    """
+    model.eval()
+    all_probs_7 = {}
+    hop = spec_extractor.hop_length
+    for audio, _, _, metas in tqdm(loader, desc="Tune-inference", leave=False):
+        audio = audio.to(device)
+        probs = model(spec_extractor(audio)).cpu().numpy()
+        for j, meta in enumerate(metas):
+            key = (meta["dataset"], meta["filename"], meta["start_sample"])
+            n_samp = meta["end_sample"] - meta["start_sample"]
+            n_frames = min(n_samp // hop, probs[j].shape[0])
+            all_probs_7[key] = probs[j, :n_frames, :]
+    all_probs_3 = collapse_probs_to_3class(all_probs_7)
+
+    cfg.USE_3CLASS = True
+    try:
+        file_probs = stitch_segments(all_probs_3)
+        file_smoothed = {k: smooth_probabilities(v) for k, v in file_probs.items()}
+
+        gt_events = []
+        for _, row in val_annotations.iterrows():
+            fsd = file_start_dts.get((row["dataset"], row["filename"]))
+            if fsd is None:
+                continue
+            gt_events.append(Detection(
+                dataset=row["dataset"], filename=row["filename"],
+                label=row["label_3class"],
+                start_s=(row["start_datetime"] - fsd).total_seconds(),
+                end_s=(row["end_datetime"] - fsd).total_seconds(),
+            ))
+
+        tuned = np.full(3, 0.5, dtype=np.float64)
+        per_class_out = {}
+        for c_idx, c_name in enumerate(cfg.CALL_TYPES_3):
+            best = {"f1": -1.0, "precision": 0.0, "recall": 0.0, "tau": 0.5}
+            for tau in grid:
+                thr = np.full(3, 0.99, dtype=np.float64)  # silence other classes
+                thr[c_idx] = float(tau)
+                dets = []
+                for (ds, fn), p in file_smoothed.items():
+                    dets.extend(threshold_to_detections(p, thr, ds, fn))
+                events = merge_and_filter(dets)
+                m = compute_metrics(events, gt_events, iou_threshold=0.3)
+                f1 = m.get(c_name, {}).get("f1", 0.0)
+                if f1 > best["f1"]:
+                    best = {
+                        "f1": f1,
+                        "precision": m[c_name]["precision"],
+                        "recall": m[c_name]["recall"],
+                        "tau": float(tau),
+                    }
+            tuned[c_idx] = best["tau"]
+            per_class_out[c_name] = best
+
+        # Joint score at the tuned per-class thresholds.
+        joint_dets = []
+        for (ds, fn), p in file_smoothed.items():
+            joint_dets.extend(threshold_to_detections(p, tuned, ds, fn))
+        joint_events = merge_and_filter(joint_dets)
+        joint = compute_metrics(joint_events, gt_events, iou_threshold=0.3)
+    finally:
+        cfg.USE_3CLASS = False
+
+    per_class_f1 = [per_class_out[n]["f1"] for n in cfg.CALL_TYPES_3]
+    return {
+        "thresholds": tuned.tolist(),
+        "per_class": per_class_out,
+        "macro_f1": float(np.mean(per_class_f1)),
+        "micro_f1": float(joint.get("overall", {}).get("f1", 0.0)),
+    }
+
+
 # ======================================================================
 # Per-epoch negative resampling
 # ======================================================================
@@ -218,8 +318,13 @@ def parse_args() -> argparse.Namespace:
                    help="Log to Weights & Biases (off by default).")
     p.add_argument("--wandb-mode", default="online",
                    choices=["online", "offline", "disabled"])
-    p.add_argument("--R", type=int, default=cfg.BPN_R,
-                   help=f"Number of ROIs per frame (default {cfg.BPN_R}).")
+    p.add_argument("--batch-size", type=int, default=cfg.BPN_BATCH_SIZE,
+                   help=f"Per-step batch size (default {cfg.BPN_BATCH_SIZE}). "
+                        "Lower it if a large --R runs out of GPU memory.")
+    p.add_argument("--accum-steps", type=int, default=1,
+                   help="Gradient accumulation steps; effective batch = "
+                        "batch_size * accum_steps. Use to hold the effective "
+                        "batch at 48 while shrinking --batch-size for large R.")
     p.add_argument("--init-from", default=None,
                    help="Optional rung-0 checkpoint to warm-start the backbone.")
     p.add_argument("--epochs", type=int, default=cfg.BPN_EPOCHS)
@@ -249,32 +354,36 @@ def main():
         import wandb_utils as wbu
         run = wbu.init_phase("9d", config={
             "lr": cfg.BPN_LR, "weight_decay": cfg.BPN_WEIGHT_DECAY,
-            "batch_size": cfg.BPN_BATCH_SIZE, "threshold": cfg.THRESHOLD,
+            "batch_size": args.batch_size, "accum_steps": args.accum_steps,
+            "effective_batch": args.batch_size * args.accum_steps,
+            "threshold": cfg.THRESHOLD,
             "seed": seed, "neg_ratio": cfg.NEG_RATIO,
             "segment_s": cfg.TRAIN_SEGMENT_S, "epochs": args.epochs,
             "loss": "focal", "focal_alpha": cfg.FOCAL_ALPHA,
             "focal_gamma": cfg.FOCAL_GAMMA,
-            "bpn_taps": (0, 1, 2), "bpn_R": args.R, "bpn_use_bilstm": True,
-            "bpn_weighted_mean": "global",
+            "bpn_taps": (0, 1, 2), "bpn_use_bilstm": True,
+            "bpn_weighted_mean": "global", "bpn_mask": "single_channel",
             "bpn_gate_init_bias": cfg.BPN_GATE_INIT_BIAS,
             "init_from": args.init_from,
             "train_sites": train_sites, "val_sites": val_sites,
         }, group=wbu.WANDB_GROUP_BPN,
-            extra_tags=["phase9", "reproduction_of_bpn", f"R{args.R}"],
+            extra_tags=["phase9", "reproduction_of_bpn", "faithful"],
             mode=args.wandb_mode)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(cfg.OUTPUT_DIR) / f"bpn3_R{args.R}_{timestamp}"
+    run_dir = Path(cfg.OUTPUT_DIR) / f"bpn3_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir: {run_dir}")
 
-    print("\nConfiguration (BPN rung 3 - full multi-ROI proposal network):")
-    print(f"  Taps: (0, 1, 2)   R: {args.R}   ROI processor: BiLSTM")
-    print(f"  Weighted mean over ROIs: global (length-{args.R} learned vector)")
+    print("\nConfiguration (BPN faithful reproduction - BPN-multi):")
+    print(f"  Taps: (0, 1, 2)   ROI processor: BiLSTM   (R derived from arch)")
+    print(f"  Weighted mean over ROIs: global   Mask: single-channel")
     print(f"  Gate init bias: {cfg.BPN_GATE_INIT_BIAS} (mask starts ~pass-through)")
     print(f"  Loss: focal (alpha={cfg.FOCAL_ALPHA}, gamma={cfg.FOCAL_GAMMA})")
     print(f"  LR={cfg.BPN_LR}, wd={cfg.BPN_WEIGHT_DECAY}, "
-          f"batch={cfg.BPN_BATCH_SIZE}, epochs={args.epochs}")
+          f"batch={args.batch_size} x accum {args.accum_steps} "
+          f"(effective {args.batch_size * args.accum_steps}), "
+          f"epochs={args.epochs}")
 
     # --- data ---
     print("\nLoading training data...")
@@ -291,7 +400,7 @@ def main():
     val_annotations = load_annotations(val_sites, manifest=val_manifest)
     val_segments = build_val_segments(val_manifest, val_annotations)
     val_loader = DataLoader(
-        WhaleDataset(val_segments), batch_size=cfg.BPN_BATCH_SIZE, shuffle=False,
+        WhaleDataset(val_segments), batch_size=args.batch_size, shuffle=False,
         num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True)
     file_start_dts = {
         (r["dataset"], r["filename"]): r["start_dt"]
@@ -302,11 +411,16 @@ def main():
     # --- model + optimizer ---
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    model, spec_extractor = build_model(device, bpn_R=args.R, init_from=args.init_from)
+    model, spec_extractor = build_model(device, init_from=args.init_from)
     n_params = sum(p.numel() for p in model.parameters())
+    n_roi = model.bpn_n_roi
+    R = n_roi // len(model.bpn_taps)
     print(f"\nModel parameters: {n_params:,}")
+    print(f"  Derived R={R} per head, {n_roi} ROIs total "
+          f"({len(model.bpn_taps)} taps)")
     if run is not None:
-        run.config.update({"n_params": n_params}, allow_val_change=True)
+        run.config.update({"n_params": n_params, "bpn_R": R,
+                           "bpn_n_roi": n_roi}, allow_val_change=True)
 
     optimizer = AdamW(
         model.parameters(), lr=cfg.BPN_LR, weight_decay=cfg.BPN_WEIGHT_DECAY,
@@ -322,12 +436,13 @@ def main():
             pos_segs, train_annotations, train_manifest, n_neg,
             cfg.TRAIN_SEGMENT_S, epoch, sampling_rng, verbose=True)
         train_loader = DataLoader(
-            WhaleDataset(train_segments), batch_size=cfg.BPN_BATCH_SIZE,
+            WhaleDataset(train_segments), batch_size=args.batch_size,
             shuffle=True, num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn,
             pin_memory=True, **seeded_dataloader_kwargs(seed))
 
         train_loss = train_one_epoch(
-            model, spec_extractor, train_loader, optimizer, device)
+            model, spec_extractor, train_loader, optimizer, device,
+            accum_steps=args.accum_steps)
         val = validate(model, spec_extractor, val_loader, device,
                        val_annotations, file_start_dts, threshold=cfg.THRESHOLD)
         epoch_time = time.time() - t0
@@ -357,7 +472,7 @@ def main():
                         "f1": val["f1"], "macro_f1": macro,
                         "per_class": val["per_class"]})
         ckpt = {"epoch": epoch, "model_state_dict": model.state_dict(),
-                "f1": val["f1"], "history": history, "bpn_R": args.R}
+                "f1": val["f1"], "history": history, "bpn_R": R}
         torch.save(ckpt, run_dir / f"bpn3_epoch_{epoch:02d}.pt")
         if improved:
             torch.save(ckpt, run_dir / "bpn3_best.pt")
@@ -365,18 +480,48 @@ def main():
     # --- summary ---
     f1s = [h["f1"] for h in history]
     macros = [h["macro_f1"] for h in history]
-    print(f"\n{'=' * 60}\nBPN RUNG 3 SUMMARY (R={args.R})\n{'=' * 60}")
-    print(f"Best micro F1: {max(f1s):.3f} (epoch {f1s.index(max(f1s)) + 1})")
-    print(f"Best macro F1: {max(macros):.3f}")
+    print(f"\n{'=' * 60}\nBPN FAITHFUL SUMMARY (R={R}, {n_roi} ROIs)\n{'=' * 60}")
+    print(f"Best micro F1 @ flat 0.3: {max(f1s):.3f} "
+          f"(epoch {f1s.index(max(f1s)) + 1})")
+    print(f"Best macro F1 @ flat 0.3: {max(macros):.3f}")
     for name in cfg.CALL_TYPES_3:
         print(f"  best {name}: {max(h['per_class'][name]['f1'] for h in history):.3f}")
 
+    # --- final per-class threshold tuning on the best checkpoint ---
+    # The paper's BPN gains live in the precision-recall curve, so flat-0.3
+    # numbers understate the model. Tune one threshold per class on the dev set
+    # and report what the model actually delivers at the tuned operating point.
+    print(f"\n{'-' * 60}\nThreshold tuning on best checkpoint\n{'-' * 60}")
+    best_ckpt = run_dir / "bpn3_best.pt"
+    model.load_state_dict(torch.load(best_ckpt, map_location=device)["model_state_dict"])
+    tuned = tune_thresholds(model, spec_extractor, val_loader, device,
+                            val_annotations, file_start_dts)
+    print(f"Tuned thresholds: " + ", ".join(
+        f"{n}={t:.2f}" for n, t in zip(cfg.CALL_TYPES_3, tuned["thresholds"])))
+    for name in cfg.CALL_TYPES_3:
+        pc = tuned["per_class"][name]
+        print(f"  {name}: F1={pc['f1']:.3f}  P={pc['precision']:.3f}  "
+              f"R={pc['recall']:.3f}  (tau={pc['tau']:.2f})")
+    print(f"Macro F1 @ tuned: {tuned['macro_f1']:.3f}   "
+          f"Micro F1 @ tuned: {tuned['micro_f1']:.3f}")
+    import json
+    (run_dir / "tuned_thresholds.json").write_text(json.dumps(tuned, indent=2))
+
     if run is not None:
         import wandb_utils as wbu
+        run.summary["tuned/macro_f1"] = tuned["macro_f1"]
+        run.summary["tuned/micro_f1"] = tuned["micro_f1"]
+        for name in cfg.CALL_TYPES_3:
+            pc = tuned["per_class"][name]
+            run.summary[f"tuned/{name}/f1"] = pc["f1"]
+            run.summary[f"tuned/{name}/precision"] = pc["precision"]
+            run.summary[f"tuned/{name}/recall"] = pc["recall"]
+            run.summary[f"tuned/{name}/threshold"] = pc["tau"]
         wbu.finalize_phase(
             history,
-            verdict=(f"Full BPN (R={args.R}): best micro {max(f1s):.3f}, "
-                     f"best macro {max(macros):.3f}."),
+            verdict=(f"Faithful BPN-multi (R={R}): flat-0.3 macro "
+                     f"{max(macros):.3f}; tuned-per-class macro "
+                     f"{tuned['macro_f1']:.3f}."),
             best_ckpt=run_dir / "bpn3_best.pt")
 
 
