@@ -107,31 +107,35 @@ def compute_pos_weight(
     sites: list[str], device: torch.device, verbose: bool = True,
 ) -> tuple[torch.Tensor, dict]:
     """
-    Per-class ``pos_weight`` for the 7-class head, segment-count normalised.
+    Per-class ``pos_weight`` for the active classification head.
 
     Uses ``w_c = N / P_c`` where ``P_c`` is the number of positive segments
-    (= annotations) for fine-grained class c and ``N`` is the total positive
-    segment count across all classes. Computed from the raw annotation table,
-    before any dataloader exists, so padded frames cannot contaminate the
-    per-class counts.
+    (= annotations) for class c and ``N`` is the total positive segment count
+    across all classes. Dispatches on ``cfg.USE_3CLASS``: when True the count
+    is taken over ``label_3class`` and ``CALL_TYPES_3``; otherwise over
+    ``annotation`` and ``CALL_TYPES_7``. Computed from the raw annotation
+    table, before any dataloader exists, so padded frames cannot contaminate
+    the per-class counts.
 
     Returns
     -------
-    pos_weight : torch.Tensor, shape (7,)
-        Weights in ``cfg.CALL_TYPES_7`` order, moved to ``device``.
+    pos_weight : torch.Tensor, shape (n_classes,)
+        Weights in the active class order, moved to ``device``.
     info : dict
         Diagnostics (raw counts, weight values, max/min ratio).
     """
     annotations = load_annotations(sites)
 
-    p_c = [max(int((annotations["annotation"] == c).sum()), 1)
-           for c in cfg.CALL_TYPES_7]
+    class_labels = cfg.class_names()
+    label_col = "label_3class" if cfg.USE_3CLASS else "annotation"
+    p_c = [max(int((annotations[label_col] == c).sum()), 1)
+           for c in class_labels]
     n_total = sum(p_c)
     weights = [n_total / pc for pc in p_c]
 
     info = {
-        "annotation_counts": dict(zip(cfg.CALL_TYPES_7, p_c)),
-        "pos_weight": dict(zip(cfg.CALL_TYPES_7, weights)),
+        "annotation_counts": dict(zip(class_labels, p_c)),
+        "pos_weight": dict(zip(class_labels, weights)),
         "n_total_pos": n_total,
         "min_weight": min(weights),
         "max_weight": max(weights),
@@ -139,9 +143,10 @@ def compute_pos_weight(
     }
 
     if verbose:
-        print("\n  Per-class positive weights (w_c = N / P_c):")
+        print(f"\n  Per-class positive weights (w_c = N / P_c) "
+              f"[{len(class_labels)}-class head]:")
         print(f"  {'class':12} {'P_c (segments)':>15} {'w_c':>10}")
-        for c_name, pc, w in zip(cfg.CALL_TYPES_7, p_c, weights):
+        for c_name, pc, w in zip(class_labels, p_c, weights):
             print(f"  {c_name:12} {pc:>15,} {w:>10.3f}")
         print(f"  {'total':12} {n_total:>15,}")
         print(f"  Weight ratio (max/min): {info['weight_ratio']:.2f}x")
@@ -155,13 +160,14 @@ def compute_pos_weight(
 
 def build_model(device: torch.device):
     """
-    Build the 7-class Whale-VAD model and its spectrogram extractor.
+    Build the Whale-VAD model and its spectrogram extractor.
 
-    A single dummy forward pass materialises the lazily-created projection
-    layer so the model is immediately ready for training or checkpoint
-    loading.
+    The classifier head width follows ``cfg.n_classes()`` (3 or 7 depending
+    on ``cfg.USE_3CLASS``). A single dummy forward pass materialises the
+    lazily-created projection layer so the model is immediately ready for
+    training or checkpoint loading.
     """
-    model = WhaleVAD(num_classes=7).to(device)
+    model = WhaleVAD(num_classes=cfg.n_classes()).to(device)
     spec = SpectrogramExtractor().to(device)
     with torch.no_grad():
         dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
@@ -240,18 +246,22 @@ def validate(model, spec_extractor, loader, criterion, device,
             n_frames = min(n_samp // hop, probs7[j].shape[0])
             all_probs_7[key] = probs7[j, :n_frames, :]
 
-    # Collapse 7 -> 3 (active because cfg.USE_3CLASS is False here).
-    all_probs_3 = collapse_probs_to_3class(all_probs_7)
-
-    # Post-processing labels channels via cfg.class_names(); flip to 3-class
-    # for the duration of the call so the arrays are labelled [bmabz, d, bp],
-    # then restore so the next training epoch sees 7-class targets.
-    cfg.USE_3CLASS = True
-    try:
+    # If the model already emits 3-class probabilities we skip the collapse
+    # and leave cfg.USE_3CLASS as-is (True for the whole run). Otherwise we
+    # collapse 7 -> 3 and flip USE_3CLASS only for the duration of
+    # post-processing so the 3 output channels get the right labels.
+    if cfg.USE_3CLASS:
+        all_probs_3 = all_probs_7
         thresholds = np.array([threshold] * 3)
         pred_events = postprocess_predictions(all_probs_3, thresholds)
-    finally:
-        cfg.USE_3CLASS = False
+    else:
+        all_probs_3 = collapse_probs_to_3class(all_probs_7)
+        cfg.USE_3CLASS = True
+        try:
+            thresholds = np.array([threshold] * 3)
+            pred_events = postprocess_predictions(all_probs_3, thresholds)
+        finally:
+            cfg.USE_3CLASS = False
 
     gt_events = []
     for _, row in val_annotations.iterrows():
@@ -295,22 +305,18 @@ def resample_negatives_for_epoch(
     n_neg: int,
     segment_s: float,
     epoch: int,
-    rng: random.Random,
     verbose: bool = False,
 ):
     """
     Draw a fresh negative segment set for one epoch and return the combined
     (fixed positives + new negatives) training segment list.
 
-    Sampling is driven by the dedicated ``rng`` instance rather than the
-    global ``random`` stream. Reusing the same instance across epochs makes it
-    advance naturally between calls -- so each epoch draws a different subset
-    -- while keeping the whole run reproducible from the master seed and
-    independent of anything else (e.g. ``wandb.init``) that touches the global
-    stream.
+    No per-epoch seed is derived: the global RNG seeded once at startup
+    advances naturally between calls, so each epoch draws a different subset
+    while the whole run stays reproducible from the master seed.
     """
     neg_segs = build_negative_segments(
-        train_annotations, train_manifest, n_segments=n_neg, rng=rng,
+        train_annotations, train_manifest, n_segments=n_neg,
     )
     neg_segs = extend_all_segments(neg_segs, train_manifest, segment_s)
 
@@ -338,6 +344,10 @@ def parse_args() -> argparse.Namespace:
                    help=f"Number of training epochs (default {cfg.EPOCHS}).")
     p.add_argument("--seed", type=int, default=cfg.SEED,
                    help=f"Master random seed (default {cfg.SEED}).")
+    p.add_argument("--num-classes", type=int, default=7, choices=[3, 7],
+                   help="Train as 3-class (coarse) or 7-class (fine, default). "
+                        "3-class trains directly on collapsed labels; 7-class "
+                        "trains on fine call types and collapses at eval.")
     return p.parse_args()
 
 
@@ -348,27 +358,24 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    # 7-class targets: keep cfg.USE_3CLASS False so WhaleDataset emits
-    # 7-channel targets. The validation path toggles it internally.
-    cfg.USE_3CLASS = False
+    # Set the class-mode flag BEFORE any dataset/model is constructed so the
+    # whole pipeline (WhaleDataset target channels, model head width,
+    # pos_weight) sees the same n_classes.
+    cfg.USE_3CLASS = (args.num_classes == 3)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    print(f"Head: {cfg.n_classes()}-class "
+          f"({'coarse' if cfg.USE_3CLASS else 'fine'})")
 
     seed = seed_everything(args.seed, deterministic=False)
-
-    # Dedicated RNG for all segment sampling (positive collars + per-epoch
-    # negatives). Isolating this from the global ``random`` stream makes the
-    # draws identical whether or not W&B is enabled, since nothing else can
-    # perturb the stream between calls. random.Random(seed) yields the same
-    # sequence the global module would after random.seed(seed).
-    sampling_rng = random.Random(seed)
 
     train_sites = list(cfg.TRAIN_DATASETS)
     val_sites = list(cfg.VAL_DATASETS)
 
     # --- pos_weight from annotations, before any dataloader exists ---
-    print(f"\nComputing 7-class pos_weight over {len(train_sites)} sites...")
+    print(f"\nComputing {cfg.n_classes()}-class pos_weight over "
+          f"{len(train_sites)} sites...")
     pos_weight, weight_info = compute_pos_weight(train_sites, device, verbose=True)
 
     # --- optional W&B run ---
@@ -381,6 +388,8 @@ def main():
             "batch_size": cfg.BATCH_SIZE,
             "threshold": cfg.THRESHOLD,
             "seed": seed,
+            "num_classes": cfg.n_classes(),
+            "use_3class": cfg.USE_3CLASS,
             "neg_ratio": cfg.NEG_RATIO,
             "neg_resample_each_epoch": True,
             "segment_s": cfg.TRAIN_SEGMENT_S,
@@ -395,7 +404,8 @@ def main():
         }, mode=args.wandb_mode)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(cfg.OUTPUT_DIR) / f"final_{timestamp}"
+    tag = f"{cfg.n_classes()}c_s{seed}"
+    run_dir = Path(cfg.OUTPUT_DIR) / f"final_{tag}_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir: {run_dir}")
 
@@ -414,9 +424,7 @@ def main():
     train_annotations = load_annotations(train_sites, manifest=train_manifest)
     print(f"  {len(train_manifest)} files, {len(train_annotations)} annotations")
 
-    pos_segs = build_positive_segments(
-        train_annotations, train_manifest, rng=sampling_rng,
-    )
+    pos_segs = build_positive_segments(train_annotations, train_manifest)
     pos_segs = extend_all_segments(pos_segs, train_manifest, cfg.TRAIN_SEGMENT_S)
     n_neg = int(len(pos_segs) * cfg.NEG_RATIO)
     print(f"  Positive segments (fixed): {len(pos_segs)}")
@@ -437,11 +445,6 @@ def main():
           f"annotations, {len(val_segments)} segments")
 
     # --- model, loss, optimizer ---
-    # Re-seed torch immediately before weight init so the model is identical
-    # regardless of any earlier torch RNG consumption (e.g. by wandb.init).
-    # This is a no-op for the no-W&B path and makes the two paths agree.
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
     model, spec_extractor = build_model(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel parameters: {n_params:,}")
@@ -473,7 +476,6 @@ def main():
             n_neg=n_neg,
             segment_s=cfg.TRAIN_SEGMENT_S,
             epoch=epoch,
-            rng=sampling_rng,
             verbose=True,
         )
         train_loader = DataLoader(
