@@ -287,9 +287,15 @@ def validate(model, spec_extractor, loader, criterion, device,
         }
         for name in cfg.CALL_TYPES_3
     }
+    # Paper-convention macro-F1: F1 of mean-P and mean-R across the 3 classes
+    # (Geldenhuys et al. DCASE 2025 — the 0.440 reference). Headline metric.
+    p_bar = sum(per_class[n]["precision"] for n in cfg.CALL_TYPES_3) / 3
+    r_bar = sum(per_class[n]["recall"]    for n in cfg.CALL_TYPES_3) / 3
+    macro_paper = 2.0 * p_bar * r_bar / (p_bar + r_bar + 1e-8)
     return {
         "loss": losses / max(n, 1),
         "f1": metrics.get("overall", {}).get("f1", 0.0),
+        "macro_paper": macro_paper,
         "per_class": per_class,
     }
 
@@ -493,9 +499,11 @@ def main():
         )
         epoch_time = time.time() - t0
 
-        improved = val["f1"] > best_f1
+        # Checkpoint selection on paper-convention macro-F1 (the headline
+        # metric from the experiment plan, Section 1.2).
+        improved = val["macro_paper"] > best_f1
         if improved:
-            best_f1 = val["f1"]
+            best_f1 = val["macro_paper"]
         marker = " *** new best" if improved else ""
 
         print(f"\nEpoch {epoch:2d}/{args.epochs}  ({epoch_time:.0f}s){marker}")
@@ -506,7 +514,8 @@ def main():
                   f"FN={pc['fn']:5}  P={pc['precision']:.3f} "
                   f"R={pc['recall']:.3f} F1={pc['f1']:.3f}")
         macro = sum(val["per_class"][n]["f1"] for n in cfg.CALL_TYPES_3) / 3
-        print(f"    OVERALL F1={val['f1']:.3f}  MACRO F1={macro:.3f}")
+        print(f"    OVERALL F1={val['f1']:.3f}  MACRO F1={macro:.3f}  "
+              f"MACRO_PAPER F1={val['macro_paper']:.3f}")
 
         if run is not None:
             wbu.log_epoch_3class(epoch, train_loss, val)
@@ -517,12 +526,14 @@ def main():
             "val_loss": val["loss"],
             "f1": val["f1"],
             "macro_f1": macro,
+            "macro_paper_f1": val["macro_paper"],
             "per_class": val["per_class"],
         })
 
         ckpt = {
             "epoch": epoch, "model_state_dict": model.state_dict(),
-            "f1": val["f1"], "history": history,
+            "f1": val["f1"], "macro_paper_f1": val["macro_paper"],
+            "history": history,
             "pos_weight": pos_weight.detach().cpu().tolist(),
         }
         torch.save(ckpt, run_dir / f"final_epoch_{epoch:02d}.pt")
@@ -536,24 +547,30 @@ def main():
 
     f1s = [h["f1"] for h in history]
     macros = [h["macro_f1"] for h in history]
-    print(f"\nMicro F1 by epoch: {[f'{f:.3f}' for f in f1s]}")
-    print(f"Macro F1 by epoch: {[f'{m:.3f}' for m in macros]}")
-    print(f"\nBest micro F1: {max(f1s):.3f}  (epoch {f1s.index(max(f1s)) + 1})")
-    print(f"Best macro F1: {max(macros):.3f}")
+    macro_papers = [h["macro_paper_f1"] for h in history]
+    print(f"\nMicro F1 by epoch:       {[f'{f:.3f}' for f in f1s]}")
+    print(f"Macro F1 by epoch:       {[f'{m:.3f}' for m in macros]}")
+    print(f"Macro_paper F1 by epoch: {[f'{m:.3f}' for m in macro_papers]}")
+    print(f"\nBest micro F1:       {max(f1s):.3f}  (epoch {f1s.index(max(f1s)) + 1})")
+    print(f"Best macro F1:       {max(macros):.3f}")
+    print(f"Best macro_paper F1: {max(macro_papers):.3f}  "
+          f"(epoch {macro_papers.index(max(macro_papers)) + 1})")
     for name in cfg.CALL_TYPES_3:
         best = max(h["per_class"][name]["f1"] for h in history)
         print(f"  best {name}: {best:.3f}")
 
-    second_half = f1s[len(f1s) // 2:]
+    # Second-half stability tracked on the selection metric (paper-macro).
+    second_half = macro_papers[len(macro_papers) // 2:]
     swings = [abs(second_half[i] - second_half[i - 1])
               for i in range(1, len(second_half))]
     mean_swing = sum(swings) / max(len(swings), 1)
     max_swing = max(swings) if swings else 0.0
-    print(f"\nSecond-half stability: mean swing {mean_swing:.3f}, "
+    print(f"\nSecond-half stability (macro_paper): mean swing {mean_swing:.3f}, "
           f"max swing {max_swing:.3f}")
 
-    verdict = (f"Best micro F1 {max(f1s):.3f}, best macro F1 {max(macros):.3f}; "
-               f"second-half mean F1 swing {mean_swing:.3f}.")
+    verdict = (f"Best macro_paper F1 {max(macro_papers):.3f} "
+               f"(micro {max(f1s):.3f}, macro {max(macros):.3f}); "
+               f"second-half mean swing {mean_swing:.3f}.")
     if run is not None:
         wbu.finalize_phase(history, verdict=verdict,
                            best_ckpt=run_dir / "final_best.pt")

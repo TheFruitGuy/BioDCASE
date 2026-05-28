@@ -317,6 +317,23 @@ def macro_f1(metrics: dict[str, dict[str, float]]) -> float:
     return float(np.mean(f1s))
 
 
+def macro_f1_paper(metrics: dict[str, dict[str, float]]) -> float:
+    """
+    Paper-convention macro-F1: F1 computed from mean-precision and
+    mean-recall across ``cfg.CALL_TYPES_3``.
+
+    This is the headline metric reported in Geldenhuys et al. (DCASE 2025)
+    Whale-VAD (the 0.440 reference number). Differs from ``macro_f1`` —
+    that one averages per-class F1s, this one averages P and R separately
+    then takes F1 of the means. Missing classes contribute 0 to both.
+    """
+    precisions = [metrics.get(c, {}).get("precision", 0.0) for c in CLASS_NAMES]
+    recalls = [metrics.get(c, {}).get("recall", 0.0) for c in CLASS_NAMES]
+    p_bar = float(np.mean(precisions))
+    r_bar = float(np.mean(recalls))
+    return 2.0 * p_bar * r_bar / (p_bar + r_bar + 1e-8)
+
+
 def tune_and_evaluate(
     probs: dict[tuple, np.ndarray],
     gt_events: Sequence[Detection],
@@ -350,5 +367,6 @@ __all__ = [
     "tune_thresholds_per_class",
     "evaluate_with_thresholds",
     "macro_f1",
+    "macro_f1_paper",
     "tune_and_evaluate",
 ]
