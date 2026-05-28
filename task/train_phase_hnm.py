@@ -65,6 +65,7 @@ from ensemble_predict import (
 )
 from validation_core import (
     tune_thresholds_per_class, evaluate_with_thresholds, macro_f1,
+    macro_f1_paper,
 )
 
 
@@ -104,9 +105,11 @@ def parse_args():
                         "epoch so they're not drowned by standard data.")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--run_name", type=str, default=None)
-    p.add_argument("--select_by", type=str, default="macro",
-                   choices=["macro", "overall"],
-                   help="Checkpoint selection criterion (default: macro).")
+    p.add_argument("--select_by", type=str, default="macro_paper",
+                   choices=["macro", "overall", "macro_paper"],
+                   help="Checkpoint selection criterion (default: macro_paper, "
+                        "i.e. F1 of macro-P and macro-R — the paper convention "
+                        "used as the headline metric in the experiment plan).")
     p.add_argument("--val-workers", type=int, default=1,
                    help="Number of CPU worker processes for the per-class "
                         "threshold sweep at validation time. 1 = sequential "
@@ -402,6 +405,7 @@ def validate_hnm(model, model_type, spec_extractor, val_loader, device,
     metrics = evaluate_with_thresholds(all_probs, gt_events, thresholds)
     overall_f1 = metrics.get("overall", {}).get("f1", 0.0)
     macro = macro_f1(metrics)
+    macro_paper = macro_f1_paper(metrics)
 
     print(f"  Val (loss={val_loss:.4f}):")
     for c, name in enumerate(cfg.CALL_TYPES_3):
@@ -410,12 +414,14 @@ def validate_hnm(model, model_type, spec_extractor, val_loader, device,
               f"TP={m.get('tp', 0):5} FP={m.get('fp', 0):6} "
               f"FN={m.get('fn', 0):6}  P={m.get('precision', 0):.3f} "
               f"R={m.get('recall', 0):.3f} F1={m.get('f1', 0):.3f}")
-    print(f"    OVERALL F1={overall_f1:.3f}  MACRO F1={macro:.3f}")
+    print(f"    OVERALL F1={overall_f1:.3f}  MACRO F1={macro:.3f}  "
+          f"MACRO_PAPER F1={macro_paper:.3f}")
 
     per_class_only = {k: v for k, v in metrics.items()
                       if k in cfg.CALL_TYPES_3}
 
     return {"loss": val_loss, "overall_f1": overall_f1, "macro_f1": macro,
+            "macro_paper_f1": macro_paper,
             "per_class": per_class_only, "thresholds": thresholds.tolist()}
 
 
@@ -686,7 +692,8 @@ def main():
         print(f"  Val {args.select_by} F1: {selected_f1:.3f}  "
               f"Best: {best_f1:.3f}  "
               f"(macro={val['macro_f1']:.3f}, "
-              f"overall={val['overall_f1']:.3f})")
+              f"overall={val['overall_f1']:.3f}, "
+              f"macro_paper={val['macro_paper_f1']:.3f})")
         print(f"  Tuned thresholds: "
               f"{['%.2f' % t for t in val['thresholds']]}")
 
@@ -703,6 +710,7 @@ def main():
             "model_state_dict": model.state_dict(),
             "best_f1": max(best_f1, selected_f1),
             "macro_f1": val["macro_f1"],
+            "macro_paper_f1": val["macro_paper_f1"],
             "overall_f1": val["overall_f1"],
             "thresholds": torch.tensor(val["thresholds"]),
             "hnm_meta": hnm_meta_list,

@@ -73,6 +73,7 @@ from postprocess import (
 )
 from validation_core import (
     tune_thresholds_per_class, evaluate_with_thresholds, macro_f1,
+    macro_f1_paper,
 )
 
 # HNM machinery — reused as-is from your existing pipeline
@@ -181,8 +182,11 @@ def parse_args():
     p.add_argument("--output-dir", type=Path, default=None)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no-wandb", action="store_true")
-    p.add_argument("--select_by", type=str, default="macro",
-                   choices=["macro", "overall"])
+    p.add_argument("--select_by", type=str, default="macro_paper",
+                   choices=["macro", "overall", "macro_paper"],
+                   help="Checkpoint selection criterion (default: macro_paper, "
+                        "i.e. F1 of macro-P and macro-R — the paper convention "
+                        "used as the headline metric in the experiment plan).")
     p.add_argument("--val-workers", type=int, default=1,
                    help="Number of CPU worker processes for the per-class "
                         "threshold sweep at validation time. 1 = sequential "
@@ -266,7 +270,13 @@ def validate_teacher(teacher_module, spec_extractor, val_loader, criterion,
     metrics = evaluate_with_thresholds(all_probs, gt_events, used_thresholds)
     overall_f1 = metrics.get("overall", {}).get("f1", 0.0)
     macro = macro_f1(metrics)
-    selection_f1 = macro if select_by == "macro" else overall_f1
+    macro_paper = macro_f1_paper(metrics)
+    if select_by == "macro":
+        selection_f1 = macro
+    elif select_by == "macro_paper":
+        selection_f1 = macro_paper
+    else:
+        selection_f1 = overall_f1
 
     print(f"\n  Teacher event-level (tuned thresholds):")
     for c, name in enumerate(cfg.CALL_TYPES_3):
@@ -276,13 +286,15 @@ def validate_teacher(teacher_module, spec_extractor, val_loader, criterion,
         print(f"    {name.upper():6} t={used_thresholds[c]:.2f}  "
               f"TP={m['tp']:5} FP={m['fp']:6} FN={m['fn']:6}  "
               f"P={m['precision']:.3f} R={m['recall']:.3f} F1={m['f1']:.3f}")
-    print(f"    OVERALL F1={overall_f1:.3f}  MACRO F1={macro:.3f}")
+    print(f"    OVERALL F1={overall_f1:.3f}  MACRO F1={macro:.3f}  "
+          f"MACRO_PAPER F1={macro_paper:.3f}")
 
     return {
         "loss": total_loss / max(n_batches, 1),
         "selection_f1": selection_f1,
         "overall_f1": overall_f1,
         "macro_f1": macro,
+        "macro_paper_f1": macro_paper,
         "per_class": metrics,
         "thresholds": used_thresholds.tolist(),
     }
@@ -649,8 +661,9 @@ def main():
                 "train/sup_loss":  sup_loss,
                 "train/cons_loss": cons_loss,
                 "val/loss":        val["loss"],
-                "val/f1_overall": val["overall_f1"],
-                "val/f1_macro":    val["macro_f1"],
+                "val/f1_overall":      val["overall_f1"],
+                "val/f1_macro":        val["macro_f1"],
+                "val/f1_macro_paper":  val["macro_paper_f1"],
             }
             for ci, cname in enumerate(cfg.CALL_TYPES_3):
                 pc = val["per_class"].get(cname, {})
