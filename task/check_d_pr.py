@@ -92,8 +92,7 @@ def main():
     val_segments = build_val_segments(val_manifest, val_anns)
     val_fsd = {(r["dataset"], r["filename"]): r["start_dt"]
                for _, r in val_manifest.iterrows()}
-    gt_events = build_gt_events(val_anns, val_fsd)
-    val_ds = WhaleDataset(val_segments)
+    gt_events = build_gt_events(val_anns, val_fsd)   # always 3-class GT (flag-independent)
 
     rows = []   # (name, head, paper_f1, thresholds, per_class)
     for ckpt_path in args.checkpoint:
@@ -102,8 +101,11 @@ def main():
         is_3class = (n_classes == 3)
         head = "3class" if is_3class else "7class"
 
-        # workers fork with the model's flag (targets in native class space)
+        # WhaleDataset bakes target WIDTH (cfg.n_classes()) and the class map at
+        # CONSTRUCTION time, so it must be (re)built AFTER the flag is set for
+        # this checkpoint's head — otherwise a 3-class model gets 7-wide targets.
         cfg.USE_3CLASS = is_3class
+        val_ds = WhaleDataset(val_segments)
         val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
                                 num_workers=args.num_workers, collate_fn=collate_fn,
                                 pin_memory=True)
