@@ -372,3 +372,164 @@ def consistency_loss_asymmetric(
 
     norm = (weight * conf.float()).sum() + 1e-8
     return sq.sum() / norm
+
+
+# ======================================================================
+# Self-Adaptive Thresholding (SAT) + marginal alignment  [_final extension]
+# ======================================================================
+# Two FreeMatch-style mechanisms (Wang et al., ICLR 2023), ported from the
+# single-label multiclass setting to the per-frame MULTI-LABEL SED setting:
+#
+#   * AdaptiveClassThreshold   — a per-class confidence gate whose level is
+#     EMA-tracked from the teacher's own positive-side confidence on the
+#     unlabeled stream. The class the teacher is most confident about anchors
+#     at ``tau_global``; a timid class (e.g. the rare D-call) gets a
+#     proportionally LOWER gate so its weak-but-real positives still enter the
+#     consistency loss instead of being thrown away by a fixed 0.7 gate.
+#
+#   * marginal_alignment_penalty — a (one-sided, prior-as-cap) anti-collapse
+#     term that penalizes a class whose batch-mean positive RATE on the
+#     unlabeled stream exceeds a reference prior. The BMABZ "fire-on-every-
+#     weak-pattern" guard; silent on rare classes (D never exceeds the prior,
+#     so it is never penalized).
+#
+# MULTI-LABEL ADAPTATION NOTE (this is where a naive port breaks).
+# In multiclass FreeMatch "confidence" is the max softmax prob and the local
+# threshold tracks the confidence of samples *predicted as that class*. If you
+# instead average ``max(p, 1-p)`` over ALL frames in multi-label SED, a rare
+# class is dominated by its sea of confident NEGATIVES, so its mean confidence
+# is HIGH and it would get a high threshold — the exact opposite of what we
+# want. We therefore track the EMA of the teacher prob among frames the teacher
+# predicts POSITIVE for each class (p_c > 0.5): confident classes -> high
+# positive-side prob -> high gate; timid classes -> low gate.
+
+
+class AdaptiveClassThreshold:
+    """
+    FreeMatch-style self-adaptive per-class confidence gate for the
+    multi-label SED consistency stream.
+
+    Tracks an EMA of the teacher's POSITIVE-SIDE confidence per class on the
+    unlabeled (weak-view) predictions: for class ``c``, the mean teacher
+    sigmoid prob over the frames where it leans positive (``p_c > 0.5``). The
+    per-class gate is then
+
+        tau_c = clamp( tau_global * posconf_c / max_c posconf , lo, hi )
+
+    so the best-learned class sits at ``tau_global`` and a timid class (the
+    rare D-call) gets a proportionally lower bar. Classes with no positive
+    frame in a batch are left unchanged that step (no spurious pull toward 0).
+
+    Parameters
+    ----------
+    n_classes : int
+    ema : float, default 0.999
+        EMA decay for the positive-side confidence tracker.
+    tau_global : float, default 0.7
+        Anchor gate for the most-confident class. Matches the old fixed
+        ``--conf-threshold`` so SAT reduces to ``consistency_loss_confident``
+        when all classes are equally confident.
+    init : float, default 0.7
+        Initial positive-side confidence for every class; with all classes
+        equal the step-0 gate is ``tau_global`` everywhere.
+    lo, hi : float
+        Hard clamp on the resulting per-class gate. ``lo`` stops a runaway-low
+        gate from admitting everything (D hallucinations); ``hi`` stops a
+        confident class from gating out all of its own signal.
+    device : str or torch.device
+    """
+
+    def __init__(self, n_classes: int, ema: float = 0.999,
+                 tau_global: float = 0.7, init: float = 0.7,
+                 lo: float = 0.30, hi: float = 0.90, device="cpu"):
+        self.ema = float(ema)
+        self.tau_global = float(tau_global)
+        self.lo, self.hi = float(lo), float(hi)
+        self.posconf = torch.full((n_classes,), float(init), device=device)
+
+    @torch.no_grad()
+    def update(self, teacher_probs: torch.Tensor) -> None:
+        """EMA-update positive-side confidence from teacher sigmoid probs (B,T,C)."""
+        pos = teacher_probs > 0.5
+        cnt = pos.sum(dim=(0, 1))                          # (C,)
+        sm = (teacher_probs * pos).sum(dim=(0, 1))         # (C,)
+        has_pos = cnt > 0
+        if not bool(has_pos.any()):
+            return
+        batch_posconf = torch.where(has_pos, sm / cnt.clamp(min=1), self.posconf)
+        upd = self.ema * self.posconf + (1.0 - self.ema) * batch_posconf
+        self.posconf = torch.where(has_pos, upd, self.posconf)
+
+    def thresholds(self) -> torch.Tensor:
+        """Current per-class gate vector (C,), in cfg.CALL_TYPES order."""
+        denom = self.posconf.max().clamp(min=1e-6)
+        tau = self.tau_global * (self.posconf / denom)
+        return tau.clamp(self.lo, self.hi)
+
+
+def consistency_loss_adaptive(
+    student_logits: torch.Tensor,            # (B, T, C)
+    teacher_logits: torch.Tensor,            # (B, T, C), should be detached
+    thresholds: torch.Tensor,                # (C,) per-class gate
+    gate: Optional[torch.Tensor] = None,     # (B, T, C) in [0,1], optional
+    mask: Optional[torch.Tensor] = None,     # (B, T)
+) -> torch.Tensor:
+    """
+    Confidence-masked MSE consistency with a PER-CLASS gate vector, plus an
+    optional external per-element ``gate`` (e.g. the verifier-gate).
+
+    An element (b, t, c) contributes iff the teacher is confident for class
+    ``c`` at its own per-class threshold (``p_t > tau_c`` or ``p_t < 1-tau_c``)
+    AND, if supplied, ``gate[b,t,c] > 0``. With scalar-equal ``thresholds`` and
+    ``gate=None`` this reduces exactly to ``consistency_loss_confident``.
+    """
+    s = torch.sigmoid(student_logits)
+    t = torch.sigmoid(teacher_logits)
+    thr = thresholds.view(1, 1, -1).to(t.device)
+    conf = (t > thr) | (t < (1.0 - thr))               # (B,T,C) bool
+    w = conf.float()
+    if gate is not None:
+        w = w * gate.float()
+    sq = (s - t).pow(2) * w
+    if mask is not None:
+        m = mask.unsqueeze(-1).float()
+        return (sq * m).sum() / ((m * w).sum() + 1e-8)
+    return sq.sum() / (w.sum() + 1e-8)
+
+
+def marginal_alignment_penalty(
+    student_logits: torch.Tensor,            # (B, T, C)
+    prior: torch.Tensor,                     # (C,) reference positive-rate
+    mode: str = "cap",                       # "cap" (one-sided) | "kl"
+    mask: Optional[torch.Tensor] = None,     # (B, T)
+) -> torch.Tensor:
+    """
+    Anti-collapse marginal regularizer on the unlabeled student prediction.
+
+    Computes the batch-mean per-class positive rate of the student's sigmoid
+    output and compares it to ``prior``:
+
+      * ``mode="cap"`` (default): one-sided squared penalty on the EXCESS
+        positive rate, ``sum_c relu(rate_c - prior_c)**2``. Penalizes a class
+        that fires MORE on the unlabeled stream than the (positive-enriched)
+        labeled prior allows — the BMABZ-collapse guard — and is silent on rare
+        classes that stay under prior. Safe default when the true unlabeled
+        call rate is unknown.
+
+      * ``mode="kl"``: symmetric per-class Bernoulli KL of ``rate`` toward
+        ``prior``. Use only if ``prior`` is trusted as the genuine unlabeled
+        rate (it pulls rare classes UP as well as common ones down).
+    """
+    p = torch.sigmoid(student_logits)                  # (B,T,C)
+    if mask is not None:
+        m = mask.unsqueeze(-1).float()
+        rate = (p * m).sum(dim=(0, 1)) / (m.sum() + 1e-8)
+    else:
+        rate = p.mean(dim=(0, 1))                      # (C,)
+    pri = prior.to(rate.device)
+    if mode == "cap":
+        excess = (rate - pri).clamp(min=0.0)
+        return (excess ** 2).sum()
+    r = rate.clamp(1e-6, 1 - 1e-6)
+    q = pri.clamp(1e-6, 1 - 1e-6)
+    return (r * torch.log(r / q) + (1 - r) * torch.log((1 - r) / (1 - q))).sum()
