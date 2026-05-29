@@ -83,9 +83,6 @@ from mean_teacher_core_final import (
     consistency_loss_asymmetric, sigmoid_ramp, cosine_alpha,
     align_lengths_pair, make_weak_view, make_strong_view,
     freeze_bn_running_stats,
-    # Block E: SAT (self-adaptive per-class threshold) + marginal alignment.
-    AdaptiveClassThreshold, consistency_loss_adaptive,
-    marginal_alignment_penalty,
 )
 
 # Unlabeled AADC stream (_final). Needs the AADC audio at --aadc-root present
@@ -112,39 +109,26 @@ ALPHA_WARMUP_EPOCHS = 5
 EPOCH_UNLABELED_CLIPS = 10_000
 
 
+# BioDCASE val/test sites — must never appear in the unlabeled consistency
+# stream (matches the test-set guard in the original MT/FlatMatch scripts).
+_TEST_SET_SITES = {"kerguelen2020", "ddu2021"}
+
+
 def quarantine_check(aadc_sites):
-    overlap = set(aadc_sites) & set(cfg.VAL_DATASETS)
-    if overlap:
-        raise SystemExit(f"AADC unlabeled sites overlap VAL sites {sorted(overlap)} "
+    blocked = _TEST_SET_SITES | {s.lower() for s in cfg.VAL_DATASETS}
+    bad = sorted(s for s in aadc_sites if s.lower() in blocked)
+    if bad:
+        raise SystemExit(f"AADC unlabeled sites overlap the val/test set {bad} "
                          f"— refusing to leak val data into the consistency stream.")
-
-
-@torch.no_grad()
-def estimate_label_prior(labeled_loader, n_classes, device):
-    """Mean per-class positive frame-rate over the labeled stream (one pass, no
-    model). Used as the reference prior for the marginal-alignment 'cap'. The
-    labeled stream is positive-enriched, so this is a generous upper bound —
-    exactly the semantics the one-sided cap wants (penalize a class that fires
-    MORE on unlabeled ocean than on positive-enriched labeled clips)."""
-    pos = torch.zeros(n_classes, device=device)
-    valid = torch.zeros(n_classes, device=device)
-    for _, targets, mask, _ in tqdm(labeled_loader, desc="prior", leave=False):
-        targets = targets.to(device)
-        m = mask.to(device).unsqueeze(-1).float()
-        pos += (targets * m).sum(dim=(0, 1))
-        valid += m.expand_as(targets).sum(dim=(0, 1))
-    return (pos / valid.clamp(min=1.0)).clamp(1e-4, 1.0)
 
 
 def train_epoch_mt(student, teacher, spec, pos_weight, labeled_loader,
                    unlab_loader, unlab_iter, optimizer, device, epoch,
                    lambda_w, alpha, hard_neg_class_map, n_classes, use_focal,
-                   ctype, conf_thr, cpos, cneg,
-                   sat=None, da_prior=None, lambda_da=0.0, da_mode="cap",
-                   vgate=None):
+                   ctype, conf_thr, cpos, cneg):
     student.train()
     freeze_bn_running_stats(student)        # critical (cross-domain unlabeled)
-    tot_sup, tot_cons, tot_da, n = 0.0, 0.0, 0.0, 0
+    tot_sup, tot_cons, n = 0.0, 0.0, 0
     pbar = tqdm(labeled_loader, desc=f"ep{epoch}", leave=False)
     for audio, targets, mask, metas in pbar:
         audio = audio.to(device, non_blocking=True)
@@ -173,34 +157,15 @@ def train_epoch_mt(student, teacher, spec, pos_weight, labeled_loader,
         with torch.no_grad():
             logits_u_t = teacher.teacher(make_weak_view(audio_u, sites_u, spec))
         ls, lt = align_lengths_pair(logits_u_s, logits_u_t)
-
         if ctype == "mse":
             loss_cons = consistency_loss(ls, lt)
         elif ctype == "confident":
             loss_cons = consistency_loss_confident(ls, lt, conf_threshold=conf_thr)
-        elif ctype == "asymmetric_mse":
+        else:
             loss_cons = consistency_loss_asymmetric(
                 ls, lt, pos_weight=cpos, neg_weight=cneg, conf_threshold=conf_thr)
-        else:  # "sat" — per-class adaptive threshold (+ optional verifier-gate)
-            with torch.no_grad():
-                t_probs = torch.sigmoid(lt)
-                sat.update(t_probs)
-            thr = sat.thresholds()
-            gate = None
-            if vgate is not None:
-                g = vgate.gate_mask(audio_u, t_probs)        # (B, T_t, C) in {0,1}
-                Tg = min(g.size(1), ls.size(1))
-                ls, lt, gate = ls[:, :Tg], lt[:, :Tg], g[:, :Tg]
-            loss_cons = consistency_loss_adaptive(ls, lt, thr, gate=gate)
 
-        # anti-collapse marginal alignment on the unlabeled student prediction
-        if lambda_da > 0.0 and da_prior is not None:
-            loss_da = marginal_alignment_penalty(logits_u_s, da_prior, mode=da_mode)
-        else:
-            loss_da = logits_u_s.new_zeros(())
-
-        # DA shares the consistency sigmoid ramp (lambda_w) so it phases in with MT.
-        loss = loss_sup + lambda_w * (loss_cons + lambda_da * loss_da)
+        loss = loss_sup + lambda_w * loss_cons
         if torch.isnan(loss) or torch.isinf(loss):
             continue
         loss.backward()
@@ -208,13 +173,10 @@ def train_epoch_mt(student, teacher, spec, pos_weight, labeled_loader,
         optimizer.step()
         teacher.update(student, alpha=alpha)
 
-        tot_sup += loss_sup.item(); tot_cons += loss_cons.item()
-        tot_da += float(loss_da); n += 1
+        tot_sup += loss_sup.item(); tot_cons += loss_cons.item(); n += 1
         pbar.set_postfix(sup=f"{loss_sup.item():.4f}", cons=f"{loss_cons.item():.4f}",
-                         da=f"{float(loss_da):.4f}",
                          **{"λ": f"{lambda_w:.2f}", "α": f"{alpha:.4f}"})
-    return (tot_sup / max(n, 1), tot_cons / max(n, 1),
-            tot_da / max(n, 1), unlab_iter)
+    return tot_sup / max(n, 1), tot_cons / max(n, 1), unlab_iter
 
 
 def parse_args():
@@ -237,44 +199,10 @@ def parse_args():
     p.add_argument("--alpha-warmup-epochs", type=int, default=ALPHA_WARMUP_EPOCHS)
     # consistency variant
     p.add_argument("--consistency-type", default="mse",
-                   choices=["mse", "confident", "asymmetric_mse", "sat"])
+                   choices=["mse", "confident", "asymmetric_mse"])
     p.add_argument("--conf-threshold", type=float, default=0.7)
     p.add_argument("--pos-weight", type=float, default=2.0, help="asymmetric_mse teacher-positive mult.")
     p.add_argument("--neg-weight", type=float, default=1.0, help="asymmetric_mse teacher-negative mult.")
-    # SAT (self-adaptive per-class threshold) — used when --consistency-type sat
-    p.add_argument("--sat-ema", type=float, default=0.999,
-                   help="EMA decay for the SAT positive-side confidence tracker.")
-    p.add_argument("--sat-tau", type=float, default=0.7,
-                   help="SAT anchor gate for the most-confident class (== the old "
-                        "fixed conf-threshold; SAT reduces to 'confident' if all "
-                        "classes are equally confident).")
-    p.add_argument("--sat-lo", type=float, default=0.30, help="Lower clamp on SAT gates.")
-    p.add_argument("--sat-hi", type=float, default=0.90, help="Upper clamp on SAT gates.")
-    # DA (marginal anti-collapse) — applied on the unlabeled stream, any ctype
-    p.add_argument("--lambda-da", type=float, default=0.0,
-                   help="Weight on the marginal-alignment penalty (0=off). Shares "
-                        "the consistency sigmoid ramp, so peaks at lambda_da.")
-    p.add_argument("--da-mode", default="cap", choices=["cap", "kl"],
-                   help="'cap': one-sided excess-rate penalty (safe default, the "
-                        "BMABZ-collapse guard). 'kl': symmetric Bernoulli KL.")
-    p.add_argument("--da-prior", type=float, nargs="+", default=None,
-                   help="Per-class reference positive-rate in MODEL class order "
-                        "(3 or 7 values). Default: measured once from the labeled "
-                        "stream via estimate_label_prior.")
-    # Verifier-gate (optional stretch arm; 3-class heads only)
-    p.add_argument("--verifier-gate", action="store_true",
-                   help="Gate the target-class consistency through the stage-2 "
-                        "SupCon verifier. Requires --consistency-type sat and a "
-                        "3-class checkpoint.")
-    p.add_argument("--verifier-checkpoint", default=None,
-                   help="Verifier best.pt (required with --verifier-gate).")
-    p.add_argument("--gate-classes", nargs="+", default=["d"],
-                   help="CALL_TYPES_3 names whose positive pseudo-labels the "
-                        "verifier gates (default: d).")
-    p.add_argument("--verifier-accept-threshold", type=float, default=0.5,
-                   help="Verifier P(real) below which a teacher event is masked out.")
-    p.add_argument("--verifier-fire-threshold", type=float, default=0.5,
-                   help="Teacher prob above which a frame is a candidate-event frame.")
     # training
     p.add_argument("--epochs", type=int, default=EPOCHS)
     p.add_argument("--lr", type=float, default=LR)
@@ -330,10 +258,6 @@ def main():
                 "mt_hnm_final", head, "pgi_on" if args.isolate_classes else "pgi_off",
                 f"consistency_{args.consistency_type}",
                 "focal" if args.focal else "weighted_bce"]
-            if args.lambda_da > 0.0:
-                tags.append(f"da_{args.da_mode}")
-            if args.verifier_gate:
-                tags.append("verifier_gate")
             run = wbu.init_phase("6", extra_tags=tags, job_type="mt_hnm",
                                  config={"lr": args.lr, "epochs": args.epochs,
                                          "oversample": args.oversample, "seed": args.seed,
@@ -344,12 +268,6 @@ def main():
                                          "alpha_start": args.alpha_start,
                                          "alpha_end": args.alpha_end,
                                          "consistency_type": args.consistency_type,
-                                         "lambda_da": args.lambda_da,
-                                         "da_mode": args.da_mode,
-                                         "sat": (args.consistency_type == "sat"),
-                                         "verifier_gate": bool(args.verifier_gate),
-                                         "gate_classes": (list(args.gate_classes)
-                                                          if args.verifier_gate else None),
                                          "aadc_sites": list(args.aadc_sites),
                                          "source_checkpoint": str(args.checkpoint),
                                          "hard_negatives": list(args.hard_negatives),
@@ -417,48 +335,6 @@ def main():
     scheduler = ReduceLROnPlateau(optimizer, mode="max", factor=args.lr_factor,
                                   patience=args.lr_patience, min_lr=args.min_lr)
 
-    # ---- Block E: SAT / DA / verifier-gate setup --------------------
-    # Defaults (mse, lambda_da=0, no gate) leave all three None/0 -> the loop
-    # is byte-for-byte the old Block C and existing runs reproduce.
-    if args.verifier_gate and args.consistency_type != "sat":
-        raise SystemExit("--verifier-gate only applies with --consistency-type sat.")
-
-    sat = None
-    if args.consistency_type == "sat":
-        sat = AdaptiveClassThreshold(n_classes, ema=args.sat_ema,
-                                     tau_global=args.sat_tau, init=args.sat_tau,
-                                     lo=args.sat_lo, hi=args.sat_hi, device=device)
-        print(f"  SAT on: ema={args.sat_ema} tau={args.sat_tau} "
-              f"clamp=[{args.sat_lo},{args.sat_hi}]")
-
-    da_prior = None
-    if args.lambda_da > 0.0:
-        if args.da_prior is not None:
-            da_prior = torch.tensor(args.da_prior, dtype=torch.float32, device=device)
-            if da_prior.numel() != n_classes:
-                raise SystemExit(f"--da-prior needs {n_classes} values "
-                                 f"(model class count), got {da_prior.numel()}")
-        else:
-            cfg.USE_3CLASS = is_3class           # workers fork with the right flag
-            da_prior = estimate_label_prior(labeled_loader, n_classes, device)
-        print(f"  DA on: mode={args.da_mode} lambda_da={args.lambda_da} "
-              f"prior={[round(x, 4) for x in da_prior.tolist()]}")
-
-    vgate = None
-    if args.verifier_gate:
-        if not is_3class:
-            raise SystemExit("--verifier-gate is 3-class only (verifier heads are in "
-                             "CALL_TYPES_3 space). Drop it for a 7-class run.")
-        if not args.verifier_checkpoint:
-            raise SystemExit("--verifier-gate requires --verifier-checkpoint.")
-        from verifier_gate import VerifierGate
-        vgate = VerifierGate(args.verifier_checkpoint, device,
-                             gate_classes=tuple(args.gate_classes),
-                             accept_threshold=args.verifier_accept_threshold,
-                             fire_threshold=args.verifier_fire_threshold)
-        print(f"  Verifier-gate on: {args.verifier_checkpoint} | gate={args.gate_classes} "
-              f"| accept>{args.verifier_accept_threshold} | crop_s={vgate.crop_s}")
-
     # ---- epoch 0 (teacher == base) ----------------------------------
     print(f"\n{'='*60}\nInitial validation (teacher = base)\n{'='*60}")
     v0 = validate(teacher.teacher, spec, val_loader, device, gt_events, pos_weight,
@@ -482,24 +358,19 @@ def main():
         cfg.USE_3CLASS = is_3class       # labeled workers fork with the model's flag
 
         t0 = time.time()
-        sup, cons, da, unlab_iter = train_epoch_mt(
+        sup, cons, unlab_iter = train_epoch_mt(
             student, teacher, spec, pos_weight, labeled_loader, unlab_loader,
             unlab_iter, optimizer, device, epoch, lambda_w, alpha,
             hard_neg_class_map, n_classes, args.focal, args.consistency_type,
-            args.conf_threshold, args.pos_weight, args.neg_weight,
-            sat=sat, da_prior=da_prior, lambda_da=args.lambda_da,
-            da_mode=args.da_mode, vgate=vgate)
+            args.conf_threshold, args.pos_weight, args.neg_weight)
         v = validate(teacher.teacher, spec, val_loader, device, gt_events, pos_weight,
                      n_classes, is_3class, args.val_workers, args.focal)
 
         improved = v["paper_f1"] > best_f1
         print(f"\nEpoch {epoch:2d}/{args.epochs} ({time.time()-t0:.0f}s)"
               f"{'  *** new best' if improved else ''}")
-        print(f"  sup {sup:.4f} | cons {cons:.4f} | da {da:.4f} | val {v['loss']:.4f} | "
+        print(f"  sup {sup:.4f} | cons {cons:.4f} | val {v['loss']:.4f} | "
               f"teacher paper-F1 {v['paper_f1']:.4f} (best {best_f1:.4f}) | λ={lambda_w:.2f}")
-        if sat is not None:
-            print(f"  SAT thr {[f'{t:.2f}' for t in sat.thresholds().tolist()]} "
-                  f"({'/'.join(cfg.CALL_TYPES_3)})")
         for c in cfg.CALL_TYPES_3:
             m = v["per_class"].get(c, {})
             print(f"    {c.upper():6} P={m.get('precision',0):.3f} "
@@ -511,8 +382,8 @@ def main():
         if run is not None:
             try:
                 run.log({"epoch": epoch, "train/sup": sup, "train/cons": cons,
-                         "train/da": da, "val/loss": v["loss"],
-                         "paper_f1": v["paper_f1"], "lambda": lambda_w, "alpha": alpha})
+                         "val/loss": v["loss"], "paper_f1": v["paper_f1"],
+                         "lambda": lambda_w, "alpha": alpha})
             except Exception:
                 pass
 
@@ -522,11 +393,6 @@ def main():
                 "paper_f1": v["paper_f1"], "thresholds": torch.tensor(v["thresholds"]),
                 "n_classes": n_classes, "isolate_classes": args.isolate_classes,
                 "lambda": lambda_w, "alpha": alpha, "consistency_type": args.consistency_type,
-                "lambda_da": args.lambda_da, "da_mode": args.da_mode,
-                "sat": (args.consistency_type == "sat"),
-                "sat_thresholds": (sat.thresholds().cpu().tolist() if sat is not None else None),
-                "verifier_gate": bool(args.verifier_gate),
-                "gate_classes": (list(args.gate_classes) if args.verifier_gate else None),
                 "source_checkpoint": str(args.checkpoint), "hnm_meta": hnm_meta,
                 "aadc_sites": list(args.aadc_sites),
                 "pos_weight": (pos_weight.cpu().tolist() if pos_weight is not None else None)}
@@ -559,15 +425,9 @@ def main():
                 run.summary[f"is_target_{c}"] = bool(is_tgt)
             except Exception:
                 pass
-    vbits = []
-    if args.lambda_da > 0:
-        vbits.append(f"da={args.da_mode}@{args.lambda_da}")
-    if args.verifier_gate:
-        vbits.append("vgate=" + ",".join(args.gate_classes))
-    vsuffix = (", " + ", ".join(vbits)) if vbits else ""
     verdict = (f"MT+HNM {head} PGI={'on' if args.isolate_classes else 'off'} "
-               f"({args.consistency_type}{vsuffix}): teacher paper-F1 "
-               f"{v0['paper_f1']:.4f} -> {best_f1:.4f} ({delta:+.4f}).")
+               f"({args.consistency_type}): teacher paper-F1 {v0['paper_f1']:.4f} -> "
+               f"{best_f1:.4f} ({delta:+.4f}).")
     print(f"{verdict}\nBest: {run_dir/'best_model.pt'}\n{'='*60}")
     if run is not None:
         try:
