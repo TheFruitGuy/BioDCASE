@@ -72,6 +72,7 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import config_final as cfg
 from dataset_final import (
@@ -311,7 +312,8 @@ def train_epoch(model, spec, loader, optimizer, pos_weight, device,
                 hard_neg_class_map, n_classes, use_focal):
     model.train()
     tot, n = 0.0, 0
-    for audio, targets, mask, metas in loader:
+    pbar = tqdm(loader, desc="train", leave=False)
+    for audio, targets, mask, metas in pbar:
         audio = audio.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -325,6 +327,7 @@ def train_epoch(model, spec, loader, optimizer, pos_weight, device,
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
         tot += loss.item(); n += 1
+        pbar.set_postfix(loss=f"{loss.item():.4f}")
     return tot / max(n, 1)
 
 
@@ -343,7 +346,7 @@ def validate(model, spec, loader, device, gt_events, pos_weight, n_classes,
     hop = spec.hop_length
     tot, n = 0.0, 0
     probs = {}
-    for audio, targets, mask, metas in loader:
+    for audio, targets, mask, metas in tqdm(loader, desc="val", leave=False):
         audio = audio.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         mask = mask.to(device, non_blocking=True)
@@ -516,7 +519,7 @@ def main():
     print(f"  start paper-F1 = {v0['paper_f1']:.4f}  (loss {v0['loss']:.4f})")
     best_f1 = v0["paper_f1"]
     history = [{"epoch": 0, "train_loss": float("nan"), "paper_f1": best_f1,
-                "loss": v0["loss"]}]
+                "loss": v0["loss"], "per_class": v0["per_class"]}]
     save_posteriors(v0["probs3"], run_dir / "best_posteriors.npz")
     no_improve = 0
 
@@ -548,7 +551,8 @@ def main():
 
         scheduler.step(v["paper_f1"])
         history.append({"epoch": epoch, "train_loss": train_loss,
-                        "paper_f1": v["paper_f1"], "loss": v["loss"]})
+                        "paper_f1": v["paper_f1"], "loss": v["loss"],
+                        "per_class": v["per_class"]})
         if run is not None:
             try:
                 run.log({"epoch": epoch, "train_loss": train_loss,
@@ -578,11 +582,31 @@ def main():
                f"targets={targets_used}: paper-F1 {v0['paper_f1']:.4f} -> "
                f"{best_f1:.4f} ({delta:+.4f}).")
     print(f"\n{'='*60}\n{verdict}\nBest: {run_dir/'best_model.pt'}\n{'='*60}")
+    # Per-class deltas: did fine-tuning move each 3-class group's F1?
+    # is_target flags the groups this run actually mined FPs for (group or
+    # subclass), so the runs table can filter "all d-target runs" cleanly.
+    subs_of = {c3: {c7 for c7 in cfg.CALL_TYPES_7 if cfg.COLLAPSE_MAP[c7] == c3}
+               for c3 in cfg.CALL_TYPES_3}
+    per_class_delta = {}
+    for c in cfg.CALL_TYPES_3:
+        start_c = v0["per_class"].get(c, {}).get("f1", 0.0)
+        best_c = max(h["per_class"].get(c, {}).get("f1", 0.0) for h in history)
+        is_tgt = (c in targets_used) or bool(subs_of[c] & set(targets_used))
+        per_class_delta[c] = {"start": start_c, "best": best_c,
+                              "delta": best_c - start_c, "is_target": is_tgt}
+        print(f"  {c.upper():6} F1 {start_c:.3f} -> {best_c:.3f} "
+              f"({best_c - start_c:+.3f}){'  [target]' if is_tgt else ''}")
     if run is not None:
         try:
             run.summary["start_paper_f1"] = float(v0["paper_f1"])
             run.summary["best_paper_f1"] = float(best_f1)
             run.summary["delta_paper_f1"] = float(delta)
+            for c, d in per_class_delta.items():
+                run.summary[f"start_f1_{c}"] = float(d["start"])
+                run.summary[f"best_f1_{c}"] = float(d["best"])
+                run.summary[f"delta_f1_{c}"] = float(d["delta"])
+                run.summary[f"is_target_{c}"] = bool(d["is_target"])
+            run.summary["mining_targets"] = list(targets_used)
             run.summary["verdict"] = verdict
             run.finish()
         except Exception:
