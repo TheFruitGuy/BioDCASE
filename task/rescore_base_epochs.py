@@ -280,15 +280,18 @@ def collapse_to_3class(probs_raw: dict, num_classes: int) -> dict:
 # classifier -> 7 outputs, ~1,033,159 params). Used as the default set when
 # neither --only nor --runs-glob is given. Edit here if your dirs differ.
 DEFAULT_RUNS = [
-    "runs/final_3c_s9999_20260527_200852",   # 3-class
-    "runs/final_3c_s7777_20260527_200401",   # 3-class
-    "runs/final_3c_s2024_20260527_200309",   # 3-class
-    "runs/final_3c_s42_20260527_200054",     # 3-class
-    "runs/final_20260527_141710",            # 7-class
-    "runs/final_20260527_060332",            # 7-class
-    "runs/final_20260526_074410",            # 7-class
-    "runs/final_20260526_074308",            # 7-class
-    "runs/final_20260524_171403",            # 7-class (30 epochs)
+    # --- 3-class (5 seeds; classifier -> 3 outputs, ~1,032,131 params) ---
+    "runs/final_3c_s42_20260527_200054",     # seed 42
+    "runs/final_3c_s2024_20260527_200309",   # seed 2024
+    "runs/final_3c_s7777_20260527_200401",   # seed 7777
+    "runs/final_3c_s9999_20260527_200852",   # seed 9999
+    "runs/final_3c_s1337_20260528_202023",   # seed 1337
+    # --- 7-class (5; classifier -> 7 outputs, ~1,033,159 params) ---
+    "runs/final_7c_s42_20260528_204414",     # seed 42 (new-style name)
+    "runs/final_20260526_074308",            # seed 7777 (recovered) -- old-style
+    "runs/final_20260527_141710",            # seed ? -- old-style
+    "runs/final_20260527_060332",            # seed ? -- old-style
+    "runs/final_20260526_074410",            # seed ? -- old-style
 ]
 
 
