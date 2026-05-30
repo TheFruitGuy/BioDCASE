@@ -93,7 +93,7 @@ import torch
 import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 import config_final as cfg
@@ -161,6 +161,66 @@ def quarantine_check(aadc_sites):
     if overlap:
         raise SystemExit(f"AADC unlabeled sites overlap VAL sites {sorted(overlap)} "
                          f"— refusing to leak val data into the unlabeled stream.")
+
+
+# ======================================================================
+# FlatMatch (Fix label): frozen pseudo-labeled AADC clips
+# ======================================================================
+
+class FixedLabelDataset(Dataset):
+    """
+    Confident AADC clips with FROZEN hard pseudo-labels (from
+    select_fixed_labels.py). Yields ``(audio, targets, mask, meta)`` in the
+    exact WhaleDataset/collate_fn format, with a SYNTHETIC meta whose key
+    ``(dataset, filename, start_sample)`` never collides with the hard-negative
+    map -> build_class_mask gives these rows an all-ones (full-gradient) mask,
+    i.e. they act as positives, exactly as Algorithm 2 intends ("fixed labels
+    act as labeled data when computing the sharpness").
+    """
+
+    def __init__(self, npz_path: str, n_classes: int):
+        d = np.load(npz_path, allow_pickle=True)
+        self.audios = d["audios"].astype(np.float32)        # (M, n_samples)
+        self.targets = d["targets"].astype(np.float32)      # (M, T, C)
+        self.masks = d["masks"].astype(bool)                # (M, T)
+        c = int(d["n_classes"])
+        if c != n_classes:
+            raise SystemExit(f"--fixed-labels has {c}-class targets but the "
+                             f"checkpoint is {n_classes}-class. Re-select with the "
+                             f"matching base model.")
+        self.M = self.audios.shape[0]
+
+    def __len__(self):
+        return self.M
+
+    def __getitem__(self, i):
+        audio = torch.from_numpy(self.audios[i])
+        targets = torch.from_numpy(self.targets[i])
+        mask = torch.from_numpy(self.masks[i])
+        meta = {"dataset": "aadc_fixed", "filename": f"fixed_{i}",
+                "start_sample": int(i), "end_sample": int(i) + audio.size(0)}
+        return audio, targets, mask, meta
+
+
+class CombinedLabeledDataset(Dataset):
+    """
+    Concatenate the (mutable) HNM labeled dataset with the (static) fixed-label
+    set for the eps* supervised stream. Length is recomputed on every call so
+    that HnmTrainingDataset.resample_negatives() (which changes the HNM length
+    between epochs) is picked up by the DataLoader's sampler next epoch — unlike
+    torch ConcatDataset, whose cumulative sizes are cached at construction.
+    """
+
+    def __init__(self, hnm_ds, fixed_ds):
+        self.hnm_ds = hnm_ds
+        self.fixed_ds = fixed_ds
+
+    def __len__(self):
+        return len(self.hnm_ds) + len(self.fixed_ds)
+
+    def __getitem__(self, i):
+        n = len(self.hnm_ds)
+        return self.hnm_ds[i] if i < n else self.fixed_ds[i - n]
 
 
 def _mt_consistency(ctype, ls, lt, conf_thr, cpos, cneg):
@@ -318,6 +378,11 @@ def parse_args():
     p.add_argument("--hard-negatives", nargs="+", required=True)
     p.add_argument("--isolate-classes", action="store_true")
     p.add_argument("--oversample", type=int, default=OVERSAMPLE)
+    p.add_argument("--fixed-labels", default=None,
+                   help="Path to a fixed-label .npz from select_fixed_labels.py "
+                        "(FlatMatch Fix-label). Adds frozen pseudo-labeled AADC clips "
+                        "to the eps* supervised stream to stabilise the perturbation. "
+                        "Omit for vanilla FlatMatch.")
     # unlabeled AADC stream
     p.add_argument("--aadc-root", required=True)
     p.add_argument("--aadc-sites", nargs="+", required=True)
@@ -431,6 +496,7 @@ def main():
                 "pgi_on" if args.isolate_classes else "pgi_off",
                 f"flatmatch_{args.flatmatch_mode}",
                 ("pure_xs" if args.lambda_mt == 0 else "xs_plus_mt"),
+                ("fixlabel" if args.fixed_labels else "no_fixlabel"),
                 "focal" if args.focal else "weighted_bce"]
             run = wbu.init_phase("6", extra_tags=tags, job_type="flatmatch_hnm",
                                  config={"lr": args.lr, "epochs": args.epochs,
@@ -439,6 +505,8 @@ def main():
                                          "isolate_classes": args.isolate_classes,
                                          "grad_accum_steps": K,
                                          "effective_batch": cfg.BATCH_SIZE,
+                                         "fixed_labels": (str(args.fixed_labels)
+                                                          if args.fixed_labels else None),
                                          "flatmatch_mode": args.flatmatch_mode,
                                          "rho": args.rho, "lambda_xs": args.lambda_xs,
                                          "lambda_mt": args.lambda_mt,
@@ -469,7 +537,16 @@ def main():
                           if args.isolate_classes else {})
     labeled_ds = HnmTrainingDataset(pos_segs, hard_segs, args.oversample,
                                     train_manifest, train_anns)
-    labeled_loader = DataLoader(labeled_ds, batch_size=micro_bs, shuffle=True,
+    # FlatMatch (Fix label): fold frozen pseudo-labeled AADC clips into the
+    # eps* supervised stream. The unlabeled cross-sharpness stream is untouched.
+    if args.fixed_labels:
+        fixed_ds = FixedLabelDataset(args.fixed_labels, n_classes)
+        print(f"  Fix-label: +{len(fixed_ds)} frozen pseudo-labeled AADC clips in "
+              f"the eps* labeled stream (unlabeled consistency unchanged)")
+        labeled_train = CombinedLabeledDataset(labeled_ds, fixed_ds)
+    else:
+        labeled_train = labeled_ds
+    labeled_loader = DataLoader(labeled_train, batch_size=micro_bs, shuffle=True,
                                 num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn,
                                 pin_memory=True)
 
@@ -619,6 +696,7 @@ def main():
                 pass
     verdict = (f"FlatMatch+HNM {head} PGI={'on' if args.isolate_classes else 'off'} "
                f"(mode={args.flatmatch_mode}, rho={args.rho}, accum={K}, "
+               f"{'fixlabel' if args.fixed_labels else 'no_fix'}, "
                f"{'pure_xs' if args.lambda_mt == 0 else 'xs+mt'}): teacher paper-F1 "
                f"{v0['paper_f1']:.4f} -> {best_f1:.4f} ({delta:+.4f}).")
     print(f"{verdict}\nBest: {run_dir/'best_model.pt'}\n{'='*60}")
