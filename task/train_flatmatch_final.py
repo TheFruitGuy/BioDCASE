@@ -8,8 +8,8 @@ HNM hard-negative + PGI labeled stream that ``train_mt_final`` uses. This is
 the FlatMatch sibling of ``train_mt_final.py``: byte-for-byte the same _final
 stack, warm start, supervised half, validation, paper-F1 metric, and
 checkpoint format — the ONLY thing that changes is the unlabeled-side
-objective (cross-sharpness instead of mean-teacher consistency). That is
-what makes its numbers directly comparable to the MT-from-base runs.
+objective (cross-sharpness instead of mean-teacher consistency). That is what
+makes its numbers directly comparable to the MT-from-base runs.
 
 Per step
 --------
@@ -25,39 +25,61 @@ Per step
   * total = L_sup + lambda_xs * R_xs; step the student; EMA-update the
     teacher. BN running stats frozen (cross-domain unlabeled), exactly as MT.
 
-Pure-replacement by default (lambda_mt = 0). The optional MT consistency term
-is one flag away (``--lambda-mt > 0``) for a stacking A/B; it is NOT used in
-the head-to-head-vs-MT comparison.
+Gradient accumulation (for small GPUs)
+--------------------------------------
+``--grad-accum-steps K`` keeps the effective batch == cfg.BATCH_SIZE while
+running micro-batches of size cfg.BATCH_SIZE // K, so the trainer fits on an
+~11 GB card yet stays *mathematically identical* to the un-accumulated bs-32
+run (and therefore comparable to the bs-32 MT runs). This is NOT a naive
+"step every K": FlatMatch's eps* is a globally-normalised function of the
+FULL-batch gradient, so each optimiser step is a TWO-PASS accumulation —
+
+  Phase A (params = theta):  stream K labeled micro-batches, accumulate the
+    full grad(L_l); for each paired unlabeled micro-batch store its strong
+    view + clean target f_u = g_theta(x_u) (no grad).
+  -> eps* built ONCE from the full accumulated grad(L_l) (mode 'full') or the
+     EMA buffer (mode 'e'); applied once.
+  Phase B (params = theta + eps*):  re-forward each stored unlabeled
+    micro-batch, accumulate the full grad(R_xs).
+  -> restore, step, EMA-teacher update.
+
+Wrapping the per-batch loop with "step every K" would instead build K
+different eps* from K noisier sub-gradients (micro-batch SAM) — a DIFFERENT
+algorithm. K=1 reproduces the plain per-batch step exactly.
 
 Validation runs on the TEACHER (EMA) and is scored with the exact Block
 A/B/C paper-F1 (threshold sweep re-tuned from 0.5 each epoch), so the number
-stays directly comparable to the MT runs. ``best_model.pt`` stores the
-TEACHER weights (+ student) and the teacher's stitched 3-class posteriors.
+stays directly comparable to the MT runs. ``best_model.pt`` stores the TEACHER
+weights (+ student) and the teacher's stitched 3-class posteriors.
 
-Head (3c / 7c) is auto-detected from the checkpoint; PGI is subclass-level
-for 7-class. Loss matches the base (weighted BCE, pos_weight from the
-checkpoint, focal off) so PGI / FlatMatch are the only things that vary.
+Head (3c / 7c) is auto-detected from the checkpoint; PGI is subclass-level for
+7-class. Loss matches the base (weighted BCE, pos_weight from the checkpoint,
+focal off) so PGI / FlatMatch are the only things that vary.
 
 Module dependencies
 --------------------
 Self-contained _final stack: ``flatmatch_core`` + ``mean_teacher_core_final``
 (EMA teacher + view builders + schedules only) + ``ssl_dataset_final`` +
 ``ssl_augmentations_final``, plus the Block B supervised/validation pieces
-from ``train_hnm_final`` and the metric primitives from
-``rescore_base_epochs``. The only runtime *data* dependency is the AADC
-unlabeled audio at ``--aadc-root`` (same data your MT runs use).
+from ``train_hnm_final`` and the metric primitives from ``rescore_base_epochs``.
+The only runtime *data* dependency is the AADC unlabeled audio at --aadc-root.
 
 Usage
 -----
 ::
 
-    CUDA_VISIBLE_DEVICES=0 python train_flatmatch_final.py \\
-        --checkpoint runs/final_3c_s42_20260527_200054/paper_best.pt \\
-        --hard-negatives runs/hardnegs_final/3class/ensemble/{bmabz,d,bp}.json \\
-        --isolate-classes \\
-        --aadc-root /path/to/aadc --aadc-sites <site1> <site2> \\
-        --flatmatch-mode e --rho 0.1 --lambda-xs 1.0 \\
+    # one 48 GB card (no accumulation):
+    CUDA_VISIBLE_DEVICES=0 python train_flatmatch_final.py \
+        --checkpoint runs/final_3c_s42_20260527_200054/paper_best.pt \
+        --hard-negatives runs/hardnegs_final/3class/ensemble/{bmabz,d,bp}.json \
+        --isolate-classes \
+        --aadc-root /path/to/aadc --aadc-sites <site1> <site2> \
+        --flatmatch-mode e --rho 0.1 --lambda-xs 1.0 \
         --seed 42 --run-name fmfb_3c_s42_ens_pgi
+
+    # one ~11 GB card (micro-batch 16 x accum 2 = same effective batch 32):
+    CUDA_VISIBLE_DEVICES=0 python train_flatmatch_final.py ... \
+        --grad-accum-steps 2
 """
 
 from __future__ import annotations
@@ -124,6 +146,7 @@ ALPHA_START = 0.99
 ALPHA_END = 0.999
 ALPHA_WARMUP_EPOCHS = 5
 EPOCH_UNLABELED_CLIPS = 10_000
+GRAD_ACCUM_STEPS = 1
 # FlatMatch knobs (paper defaults).
 FLATMATCH_MODE = "e"
 RHO = 0.1
@@ -154,20 +177,29 @@ def train_epoch_flatmatch(student, teacher, perturbation, spec, pos_weight,
                           labeled_loader, unlab_loader, unlab_iter, optimizer,
                           device, epoch, lambda_xs, lambda_mt, alpha,
                           hard_neg_class_map, n_classes, use_focal,
-                          flatmatch_mode, ctype, conf_thr, cpos, cneg):
+                          flatmatch_mode, ctype, conf_thr, cpos, cneg,
+                          accum_steps):
     """
-    One FlatMatch+HNM epoch. Per-step ordering (rationale in ``flatmatch_core``):
+    One FlatMatch+HNM epoch with optional two-pass gradient accumulation.
 
-      1. supervised forward + masked weighted BCE (+ PGI).
-      2. unlabeled clean forward at theta under no_grad -> f_u (target).
-         (+ optional teacher weak-view forward for the MT term.)
-      3. supervised backward -> grad(L_l) in .grad.
-      4. apply eps* (reads .grad in mode 'full', the EMA buffer in mode 'e').
-      5. mode 'e': EMA-update the buffer NOW, while .grad is still clean grad(L_l).
-      6. perturbed unlabeled forward at theta + eps* -> f_tilde_u (with grad).
-      7. restore params (undo eps*).
-      8. lambda_xs * R_xs(f_tilde_u, f_u.detach()) backward -> accumulates into .grad.
-      9. optimiser step + EMA teacher update.
+    accum_steps == 1 is the plain per-batch FlatMatch step. accum_steps > 1
+    builds ONE optimiser step from accum_steps micro-batches such that the
+    result is *bit-identical* to the un-accumulated step at the same effective
+    batch:
+
+      * supervised term: ``masked_bce`` is a MEAN over valid frame x class
+        entries (denominator = the valid count over the first
+        T=min(logits_len, target_len) frames), and that count varies per
+        micro-batch (PGI). A flat 1/K would be wrong. Instead each micro-batch
+        backward-s its UN-normalised weighted sum (masked_bce x its own count,
+        the count taken AFTER the forward so T is exact), accumulating
+        grad(sum_total) into .grad; then .grad is scaled once by 1/count_total.
+        That equals grad(full-batch masked_bce) exactly.
+      * cross-sharpness term: an unmasked mean over a fixed-shape tensor
+        (constant element count per micro-batch), so 1/K is exact there.
+
+    eps* is built ONCE from the full accumulated grad(L_l) (or the EMA buffer
+    in mode 'e'); the perturbed forwards reuse the stored strong views.
     """
     student.train()
     freeze_bn_running_stats(student)        # critical (cross-domain unlabeled)
@@ -175,6 +207,78 @@ def train_epoch_flatmatch(student, teacher, perturbation, spec, pos_weight,
     n_skipped_xs = 0
     use_mt = lambda_mt > 0.0
 
+    def _run_step(batch_group):
+        """batch_group: list of (audio, targets, mask, cm, audio_u, sites_u)."""
+        nonlocal tot_sup, tot_xs, tot_mt, n, n_skipped_xs
+        optimizer.zero_grad()
+
+        # --- PHASE A (params = theta): un-normalised weighted sup grad + targets ---
+        stored = []
+        count_total = torch.zeros((), device=device)
+        sup_sum = torch.zeros((), device=device)        # sum of (masked_bce_k * cnt_k)
+        for audio, targets, mask, cm, audio_u, sites_u in batch_group:
+            logits_l = student(spec(audio))
+            T = min(logits_l.size(1), targets.size(1))
+            raw_sup = masked_bce(logits_l[:, :T], targets[:, :T], mask[:, :T],
+                                 cm, pos_weight, use_focal)
+            # exact denominator masked_bce used (mask sliced to the real T)
+            valid = mask[:, :T].unsqueeze(-1).float() * cm.unsqueeze(1)
+            cnt = valid.sum().clamp(min=1.0).detach()
+            if not (torch.isnan(raw_sup) or torch.isinf(raw_sup)):
+                (raw_sup * cnt).backward()               # accumulates grad(sum_k)
+                count_total = count_total + cnt
+                sup_sum = sup_sum + raw_sup.detach() * cnt
+            # one strong view per unlabeled micro-batch, reused for f_u (theta)
+            # and f_tilde_u (theta+eps*), per the paper's Eq. 4
+            spec_u = make_strong_view(audio_u, sites_u, spec).detach()
+            with torch.no_grad():
+                f_u = student(spec_u).detach()
+                logits_u_t = (teacher.teacher(make_weak_view(audio_u, sites_u, spec)).detach()
+                              if use_mt else None)
+            stored.append((spec_u, f_u, logits_u_t))
+
+        # normalise the accumulated supervised gradient by the TOTAL count ->
+        # exactly grad(full-batch masked_bce). (eps* is scale-invariant, but the
+        # supervised contribution to the step and the mode-'e' buffer need this.)
+        inv = 1.0 / count_total.clamp(min=1.0)
+        for p in student.parameters():
+            if p.grad is not None:
+                p.grad.mul_(inv)
+
+        # --- eps* from the full accumulated grad(L_l) (or buffer in mode 'e') ---
+        applied = perturbation.apply()
+        if flatmatch_mode == "e":
+            perturbation.update_buffer()                  # while .grad is clean grad(L_l)
+
+        # --- PHASE B (params = theta+eps*): cross-sharpness grad, 1/K exact ---
+        k = len(stored)
+        xs_log, mt_log = 0.0, 0.0
+        if applied:
+            for spec_u, f_u, logits_u_t in stored:
+                f_tilde = student(spec_u)
+                fa, ua = align_lengths_pair(f_tilde, f_u)
+                loss_xs = cross_sharpness_loss(fa, ua.detach())
+                terms = [(lambda_xs * loss_xs) / k]
+                xs_log += loss_xs.item()
+                if use_mt and logits_u_t is not None:
+                    ls, lt = align_lengths_pair(f_tilde, logits_u_t)
+                    loss_mt = _mt_consistency(ctype, ls, lt, conf_thr, cpos, cneg)
+                    terms.append((lambda_mt * loss_mt) / k)
+                    mt_log += loss_mt.item()
+                loss_u = sum(terms)
+                if not (torch.isnan(loss_u) or torch.isinf(loss_u)):
+                    loss_u.backward()                     # accumulates grad(R_xs)
+        else:
+            n_skipped_xs += k                             # mode 'e' before buffer is warm
+
+        perturbation.restore()
+        nn.utils.clip_grad_norm_(student.parameters(), 1.0)
+        optimizer.step()
+        teacher.update(student, alpha=alpha)
+        tot_sup += float((sup_sum / count_total.clamp(min=1.0)).item())
+        tot_xs += xs_log / max(k, 1); tot_mt += mt_log / max(k, 1); n += 1
+
+    batch_group = []
     pbar = tqdm(labeled_loader, desc=f"ep{epoch}", leave=False)
     for audio, targets, mask, metas in pbar:
         audio = audio.to(device, non_blocking=True)
@@ -190,79 +294,20 @@ def train_epoch_flatmatch(student, teacher, perturbation, spec, pos_weight,
         audio_u = ub["audio"].to(device, non_blocking=True)
         sites_u = ub["sites"]
 
-        optimizer.zero_grad()
+        batch_group.append((audio, targets, mask, cm, audio_u, sites_u))
+        if len(batch_group) == accum_steps:
+            _run_step(batch_group)
+            batch_group = []
+            pbar.set_postfix(sup=f"{tot_sup/max(n,1):.4f}", xs=f"{tot_xs/max(n,1):.4f}",
+                             **({"mt": f"{tot_mt/max(n,1):.4f}"} if use_mt else {}),
+                             **{"λxs": f"{lambda_xs:.2f}", "α": f"{alpha:.4f}"})
 
-        # (1) supervised forward + loss (same as Block B / MT)
-        logits_l = student(spec(audio))
-        T = min(logits_l.size(1), targets.size(1))
-        loss_sup = masked_bce(logits_l[:, :T], targets[:, :T], mask[:, :T],
-                              cm, pos_weight, use_focal)
-
-        # (2) unlabeled clean forward at theta (target side, no grad). One
-        #     strong view is reused for f_u (at theta) and f_tilde_u (at
-        #     theta + eps*), matching the paper's Eq. 4 (same x_u both sides).
-        spec_u = make_strong_view(audio_u, sites_u, spec)
-        with torch.no_grad():
-            f_u = student(spec_u)
-
-        logits_u_t = None
-        if use_mt:
-            with torch.no_grad():
-                logits_u_t = teacher.teacher(make_weak_view(audio_u, sites_u, spec))
-
-        # (3) supervised backward -> grad(L_l) in .grad
-        if torch.isnan(loss_sup) or torch.isinf(loss_sup):
-            continue
-        loss_sup.backward()
-
-        # (4) apply eps* (reads .grad if 'full', EMA buffer if 'e')
-        applied = perturbation.apply()
-
-        # (5) EMA-update the buffer NOW (mode 'e'), while .grad is clean grad(L_l)
-        if flatmatch_mode == "e":
-            perturbation.update_buffer()
-
-        # (6) perturbed unlabeled forward at theta + eps*, with grad
-        if applied:
-            f_tilde_u = student(spec_u)
-        else:
-            f_tilde_u = None        # mode 'e' first step: buffer not warm yet
-            n_skipped_xs += 1
-
-        # (7) restore params (undo eps*)
-        perturbation.restore()
-
-        # (8) unlabeled-side loss(es) + backward -> accumulates grad(R_xs) into .grad
-        loss_xs_val, loss_mt_val, terms = 0.0, 0.0, []
-        if f_tilde_u is not None:
-            fa, ua = align_lengths_pair(f_tilde_u, f_u)
-            loss_xs = cross_sharpness_loss(fa, ua.detach())
-            terms.append(lambda_xs * loss_xs)
-            loss_xs_val = loss_xs.item()
-        if use_mt and logits_u_t is not None:
-            ls = f_tilde_u if f_tilde_u is not None else student(spec_u)
-            ls, lt = align_lengths_pair(ls, logits_u_t)
-            loss_mt = _mt_consistency(ctype, ls, lt, conf_thr, cpos, cneg)
-            terms.append(lambda_mt * loss_mt)
-            loss_mt_val = loss_mt.item()
-        if terms:
-            loss_u = sum(terms)
-            if not (torch.isnan(loss_u) or torch.isinf(loss_u)):
-                loss_u.backward()
-
-        # (9) step + EMA teacher update
-        nn.utils.clip_grad_norm_(student.parameters(), 1.0)
-        optimizer.step()
-        teacher.update(student, alpha=alpha)
-
-        tot_sup += loss_sup.item(); tot_xs += loss_xs_val; tot_mt += loss_mt_val; n += 1
-        pbar.set_postfix(sup=f"{loss_sup.item():.4f}", xs=f"{loss_xs_val:.4f}",
-                         **({"mt": f"{loss_mt_val:.4f}"} if use_mt else {}),
-                         **{"λxs": f"{lambda_xs:.2f}", "α": f"{alpha:.4f}"})
+    if batch_group:                                       # trailing partial group
+        _run_step(batch_group)
 
     if n_skipped_xs:
         print(f"  [mode 'e' warmup] cross-sharpness skipped on {n_skipped_xs} "
-              f"step(s) before the gradient buffer was populated.")
+              f"micro-batch(es) before the gradient buffer was populated.")
     return tot_sup / max(n, 1), tot_xs / max(n, 1), tot_mt / max(n, 1), unlab_iter
 
 
@@ -278,6 +323,13 @@ def parse_args():
     p.add_argument("--aadc-sites", nargs="+", required=True)
     p.add_argument("--unlabeled-batch-size", type=int, default=None)
     p.add_argument("--epoch-unlabeled-clips", type=int, default=EPOCH_UNLABELED_CLIPS)
+    # memory / batch
+    p.add_argument("--grad-accum-steps", type=int, default=GRAD_ACCUM_STEPS,
+                   help="Two-pass gradient accumulation. Keeps the effective batch "
+                        "== cfg.BATCH_SIZE while using micro-batches of "
+                        "cfg.BATCH_SIZE // K (must divide evenly). K=1 = plain "
+                        "per-batch step (default). Use 2 (micro 16) or 4 (micro 8) "
+                        "to fit an ~11 GB card; the result is identical to bs-32.")
     # FlatMatch
     p.add_argument("--flatmatch-mode", default=FLATMATCH_MODE, choices=["e", "full"],
                    help="eps* source. 'e': EMA buffer of past grad(L_l) (paper "
@@ -342,6 +394,23 @@ def main():
     cfg.USE_3CLASS = is_3class
     print(f"Device: {device} | checkpoint head: {head} ({n_classes}-class)")
 
+    # ---- effective batch / micro-batch (grad accumulation) ----------
+    K = max(1, args.grad_accum_steps)
+    if cfg.BATCH_SIZE % K != 0:
+        raise SystemExit(f"--grad-accum-steps {K} must divide cfg.BATCH_SIZE "
+                         f"({cfg.BATCH_SIZE}) evenly so the effective batch is "
+                         f"preserved. Try K in {{1,2,4}}.")
+    micro_bs = cfg.BATCH_SIZE // K
+    unlab_eff = args.unlabeled_batch_size or cfg.BATCH_SIZE
+    if unlab_eff % K != 0:
+        raise SystemExit(f"--grad-accum-steps {K} must divide the unlabeled batch "
+                         f"({unlab_eff}) evenly.")
+    unlab_micro = unlab_eff // K
+    if K > 1:
+        print(f"Grad accumulation: K={K} | labeled micro-bs={micro_bs} "
+              f"(effective {cfg.BATCH_SIZE}) | unlabeled micro-bs={unlab_micro} "
+              f"(effective {unlab_eff}) — two-pass, identical to bs-{cfg.BATCH_SIZE}.")
+
     fp_records, hnm_meta = load_hard_negatives_json(args.hard_negatives)
     targets_used = sorted({r["target_class"] for r in fp_records})
     print(f"Loaded {len(fp_records)} hard negatives; targets={targets_used} | "
@@ -368,6 +437,8 @@ def main():
                                          "oversample": args.oversample, "seed": args.seed,
                                          "head": head, "n_classes": n_classes,
                                          "isolate_classes": args.isolate_classes,
+                                         "grad_accum_steps": K,
+                                         "effective_batch": cfg.BATCH_SIZE,
                                          "flatmatch_mode": args.flatmatch_mode,
                                          "rho": args.rho, "lambda_xs": args.lambda_xs,
                                          "lambda_mt": args.lambda_mt,
@@ -398,7 +469,7 @@ def main():
                           if args.isolate_classes else {})
     labeled_ds = HnmTrainingDataset(pos_segs, hard_segs, args.oversample,
                                     train_manifest, train_anns)
-    labeled_loader = DataLoader(labeled_ds, batch_size=cfg.BATCH_SIZE, shuffle=True,
+    labeled_loader = DataLoader(labeled_ds, batch_size=micro_bs, shuffle=True,
                                 num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn,
                                 pin_memory=True)
 
@@ -414,19 +485,18 @@ def main():
     gt_events = build_gt_events(val_anns, val_fsd)
 
     # ---- unlabeled AADC stream --------------------------------------
-    unlab_bs = args.unlabeled_batch_size or cfg.BATCH_SIZE
     unlab_manifest = build_pretrain_manifest(train_datasets=None,
                                              aadc_sites=list(args.aadc_sites),
                                              aadc_root=args.aadc_root)
     unlab_ds = SSLClipDataset(unlab_manifest, clip_seconds=cfg.TRAIN_SEGMENT_S,
                               sample_rate=cfg.SAMPLE_RATE,
                               epoch_clips=args.epoch_unlabeled_clips)
-    unlab_loader = DataLoader(unlab_ds, batch_size=unlab_bs, shuffle=True,
+    unlab_loader = DataLoader(unlab_ds, batch_size=unlab_micro, shuffle=True,
                               num_workers=cfg.NUM_WORKERS, collate_fn=collate_ssl,
                               pin_memory=True, drop_last=True)
     unlab_iter = iter(unlab_loader)
     print(f"  unlabeled: {len(unlab_manifest)} files, "
-          f"{args.epoch_unlabeled_clips} clips/epoch, bs={unlab_bs}")
+          f"{args.epoch_unlabeled_clips} clips/epoch, micro-bs={unlab_micro}")
 
     # ---- student (warm start) + EMA teacher -------------------------
     student, spec = build_model(n_classes, device)
@@ -461,7 +531,7 @@ def main():
     print(f"\nFlatMatch+HNM {args.epochs} ep | mode={args.flatmatch_mode} rho={args.rho} "
           f"lambda_xs={args.lambda_xs} ramp={args.lambda_ramp_epochs} "
           f"lambda_mt={args.lambda_mt} | alpha {args.alpha_start}->{args.alpha_end} "
-          f"| PGI={args.isolate_classes}")
+          f"| PGI={args.isolate_classes} | accum={K}")
 
     for epoch in range(1, args.epochs + 1):
         if epoch > 1 and (epoch - 1) % args.resample_every == 0:
@@ -480,7 +550,7 @@ def main():
             unlab_loader, unlab_iter, optimizer, device, epoch,
             lambda_xs, lambda_mt, alpha, hard_neg_class_map, n_classes, args.focal,
             args.flatmatch_mode, args.consistency_type, args.conf_threshold,
-            args.pos_weight, args.neg_weight)
+            args.pos_weight, args.neg_weight, K)
         v = validate(teacher.teacher, spec, val_loader, device, gt_events, pos_weight,
                      n_classes, is_3class, args.val_workers, args.focal)
 
@@ -512,6 +582,7 @@ def main():
                 "student_state_dict": student_module.state_dict(),
                 "paper_f1": v["paper_f1"], "thresholds": torch.tensor(v["thresholds"]),
                 "n_classes": n_classes, "isolate_classes": args.isolate_classes,
+                "grad_accum_steps": K, "effective_batch": cfg.BATCH_SIZE,
                 "flatmatch_mode": args.flatmatch_mode, "rho": args.rho,
                 "lambda_xs": lambda_xs, "lambda_mt": lambda_mt, "alpha": alpha,
                 "source_checkpoint": str(args.checkpoint), "hnm_meta": hnm_meta,
@@ -547,7 +618,7 @@ def main():
             except Exception:
                 pass
     verdict = (f"FlatMatch+HNM {head} PGI={'on' if args.isolate_classes else 'off'} "
-               f"(mode={args.flatmatch_mode}, rho={args.rho}, "
+               f"(mode={args.flatmatch_mode}, rho={args.rho}, accum={K}, "
                f"{'pure_xs' if args.lambda_mt == 0 else 'xs+mt'}): teacher paper-F1 "
                f"{v0['paper_f1']:.4f} -> {best_f1:.4f} ({delta:+.4f}).")
     print(f"{verdict}\nBest: {run_dir/'best_model.pt'}\n{'='*60}")

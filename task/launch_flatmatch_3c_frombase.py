@@ -34,6 +34,14 @@ Falls back to 3,4,8,9 if the env var is unset. ``--gpus`` overrides either.
 Each run is pinned to one GPU via a per-subprocess CUDA_VISIBLE_DEVICES
 override (physical ids — the launcher itself never touches CUDA).
 
+Small GPUs (~11 GB)
+-------------------
+A run uses ~15 GB at bs-32, so on an 11 GB card pass ``--grad-accum-steps 2``
+(micro-batch 16) or ``--grad-accum-steps 4`` (micro-batch 8). The effective
+batch stays 32 and the two-pass accumulation is mathematically identical to
+the bs-32 run, so results remain directly comparable to the MT runs — you
+just free the 48 GB cards. Forwarded to every run.
+
 AADC data
 ---------
 train_flatmatch_final.py needs the unlabeled AADC audio: pass --aadc-root +
@@ -57,6 +65,13 @@ Usage
 
     # full 10 across four GPUs, once the pilot looks sane:
     CUDA_VISIBLE_DEVICES=3,4,8,9 python launch_flatmatch_3c_frombase.py \
+        --aadc-root /home/matthias-nagl/BioDCASE/task/data_pretrain/audio \
+        --aadc-sites Casey2018 DDU2018 DDU2019 Kerguelen2018 Kerguelen2019 \
+        --skip-existing
+
+    # full 10 on a pool of ~11 GB cards (effective batch still 32):
+    CUDA_VISIBLE_DEVICES=10,11,12,13 python launch_flatmatch_3c_frombase.py \
+        --grad-accum-steps 2 \
         --aadc-root /home/matthias-nagl/BioDCASE/task/data_pretrain/audio \
         --aadc-sites Casey2018 DDU2018 DDU2019 Kerguelen2018 Kerguelen2019 \
         --skip-existing
@@ -116,7 +131,8 @@ def enumerate_jobs(runs_root, hn_root, ckpt_name, seeds, sources, modes, pgi):
     return jobs
 
 
-def build_cmd(job, val_workers, aadc_root, aadc_sites, out_dir, rho, lambda_xs, extra):
+def build_cmd(job, val_workers, aadc_root, aadc_sites, out_dir, rho, lambda_xs,
+              grad_accum_steps, extra):
     cmd = [sys.executable, TRAINER,
            "--checkpoint", str(job["ckpt"]),
            "--hard-negatives", *job["hn_files"],
@@ -126,6 +142,7 @@ def build_cmd(job, val_workers, aadc_root, aadc_sites, out_dir, rho, lambda_xs, 
            "--flatmatch-mode", job["mode"],
            "--rho", str(rho),
            "--lambda-xs", str(lambda_xs),
+           "--grad-accum-steps", str(grad_accum_steps),
            "--aadc-root", str(aadc_root),
            "--aadc-sites", *aadc_sites,
            "--val-workers", str(val_workers)]
@@ -168,6 +185,11 @@ def parse_args():
                    help="Perturbation magnitude (paper default 0.1). Forwarded to every run.")
     p.add_argument("--lambda-xs", type=float, default=1.0,
                    help="Cross-sharpness weight. Forwarded to every run.")
+    p.add_argument("--grad-accum-steps", type=int, default=1,
+                   help="Two-pass gradient accumulation forwarded to every run. "
+                        "K=1 = bs-32 (needs a ~16 GB+ card); K=2 (micro 16) or "
+                        "K=4 (micro 8) fits an ~11 GB card with the SAME effective "
+                        "batch 32, so results stay identical/comparable to MT.")
     p.add_argument("--pgi", choices=["on", "off"], default="on",
                    help="Per-class gradient isolation (HNM+PGI). Default on.")
     p.add_argument("--aadc-root", default=None,
@@ -262,7 +284,8 @@ def main():
             except queue.Empty:
                 return
             cmd = build_cmd(j, val_workers, args.aadc_root, args.aadc_sites,
-                            args.out_dir, args.rho, args.lambda_xs, args.extra)
+                            args.out_dir, args.rho, args.lambda_xs,
+                            args.grad_accum_steps, args.extra)
             env = os.environ.copy()
             env["CUDA_VISIBLE_DEVICES"] = str(gpu)
             env["OMP_NUM_THREADS"] = str(omp)
