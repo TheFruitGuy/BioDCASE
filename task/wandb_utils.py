@@ -748,6 +748,82 @@ PHASE_REGISTRY: dict[str, dict] = {
         interventions=["conformer_encoder"],
     ),
 
+    # ------------------------------------------------------------------
+    # Phase 13 ladder: strategies to push the Conformer's macro_paper F1.
+    # Chained in intended build order; re-parent to the actual winner if a
+    # rung loses. See conformer_experiment_plan.md.
+    # ------------------------------------------------------------------
+    "13a": dict(
+        parent="13",
+        hypothesis=(
+            "LR warmup + schedule for the Conformer. The fixed 5e-5 is BiLSTM-tuned; "
+            "without warmup the Conformer underfits and oscillates early (seen in phase "
+            "13's first epochs). Add linear warmup (~1-2 epochs) -> cosine decay with a "
+            "higher peak LR (~3e-4-1e-3), or RAdam (Miyazaki's DCASE2020 Conformer-SED "
+            "used RAdam@1e-3, x0.1 every 10k iters). Possibly 40-50 epochs. Expect a "
+            "higher, smoother converged macro_paper with a smaller second-half swing. "
+            "Highest-priority Conformer fix; the foundation for the rest of the ladder."
+        ),
+        interventions=["lr_warmup_schedule"],
+    ),
+    "13b": dict(
+        parent="13a",
+        hypothesis=(
+            "EMA weight averaging. Maintain an exponential moving average of the "
+            "Conformer weights (decay ~0.999) and evaluate/checkpoint the EMA model. "
+            "Smooths the noisy fixed-threshold val trajectory and typically nets a small "
+            "gain -- the mean-teacher 'teacher' is exactly a weight EMA. Builds on 13a."
+        ),
+        interventions=["ema_weights"],
+    ),
+    "13c": dict(
+        parent="13b",
+        hypothesis=(
+            "Conformer capacity/kernel sweep on the stabilised recipe. Sweep conv kernel "
+            "{7,15,31}, blocks {4,6,8}, d_model {128,192}. Phase 13's kernel 31 / 4 "
+            "blocks may be off-optimum; Miyazaki used kernel 7 and 2-10 blocks. Pure-CLI "
+            "(--conv-kernel/--layers/--d-model already exist). Best config becomes the base."
+        ),
+        interventions=["conformer_arch_sweep"],
+    ),
+    "13d": dict(
+        parent="13c",
+        hypothesis=(
+            "FDY-conv frontend -- the D-class lever. Replace the stem's Conv2d with "
+            "frequency dynamic convolution (4 basis kernels + frequency attention), "
+            "removing the wrong freq-axis translation equivariance of standard 2D conv. "
+            "Nam 2022 reports +6.3% PSDS / +7.56% F1 on DESED and that it is 'especially "
+            "effective on non-stationary sound events' -- the D downsweep is exactly that, "
+            "so this targets the shared-frontend D ceiling. ~2x stem cost; official "
+            "frednam93/FDY-SED. Highest-ceiling lever for D; pairs with the Conformer "
+            "(the modern DCASE recipe)."
+        ),
+        interventions=["fdy_conv_frontend"],
+    ),
+    "13e": dict(
+        parent="13d",
+        hypothesis=(
+            "Mean-teacher + unlabelled AADC. Train the Conformer with a mean-teacher "
+            "consistency loss on unlabelled in-domain hydrophone segments (AADC hosts) "
+            "via the existing MT pipeline. Miyazaki's framework was MT; DCASE2023 adds "
+            "pseudo-labelling. Caveat: prior whale MT was per-model-flat / "
+            "ensemble-diversity-only, so manage expectations -- may pay off mainly as an "
+            "ensemble member."
+        ),
+        interventions=["mean_teacher_aadc"],
+    ),
+    "13f": dict(
+        parent="13d",
+        hypothesis=(
+            "Frequency-targeted augmentation (exploratory). FilterAugment + frequency "
+            "warping -- NOT generic SpecAugment, which Phase 1 already showed is negative "
+            "for this task. Frequency-domain aug is what the FDY/DCASE2023 systems pair "
+            "with; worth re-testing for the higher-capacity Conformer. Adopt only on a "
+            "clear gain."
+        ),
+        interventions=["filteraugment_freqwarp"],
+    ),
+
 }
 
 
