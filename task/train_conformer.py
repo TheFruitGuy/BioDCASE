@@ -85,9 +85,11 @@ def parse_args() -> argparse.Namespace:
                    help=f"Number of training epochs (default {cfg.EPOCHS}).")
     p.add_argument("--seed", type=int, default=cfg.SEED,
                    help=f"Master random seed (default {cfg.SEED}).")
-    p.add_argument("--num-classes", type=int, default=7, choices=[3, 7],
-                   help="Train as 3-class (coarse) or 7-class (fine, default; "
-                        "collapsed to 3 at eval). Matches train_final.py.")
+    p.add_argument("--num-classes", type=int, default=3, choices=[3, 7],
+                   help="Train as 3-class (coarse, DEFAULT — your 3-class-direct "
+                        "setting outperformed 7-class for the CNN-BiLSTM) or "
+                        "7-class (fine, collapsed to 3 at eval; train_final.py's "
+                        "own default).")
     return p.parse_args()
 
 
