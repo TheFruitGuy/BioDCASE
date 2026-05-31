@@ -1,29 +1,30 @@
 """
-Conformer-SED Variant of WhaleVAD
-=================================
+Conformer-SED Variant of WhaleVAD (final pipeline)
+==================================================
 
-A *new* standalone architecture for the BioDCASE Task 2 whale-call SED
-problem: the WhaleVAD CNN stem (learnable filterbank + feature extractor
-+ residual/depthwise stack) feeds a stack of Conformer blocks instead of
-the 2-layer BiLSTM. There is no recurrence anywhere in this model.
+A *new* standalone architecture for BioDCASE Task 2 whale-call SED, built
+on the **final** pipeline (``*_final`` modules, ``config_final``). The
+WhaleVAD CNN stem (learnable filterbank + feature extractor + residual/
+depthwise stack, from ``model_final``) feeds a stack of Conformer blocks
+instead of the 2-layer BiLSTM. No recurrence anywhere.
+
+Like the rest of the final pipeline, the classifier head defaults to the
+7 fine call types (``cfg.USE_3CLASS=False``); probabilities are collapsed
+to the 3 coarse classes at evaluation time by ``postprocess_final``.
 
 How this differs from Phase 2b (and why it should clear parity)
 ---------------------------------------------------------------
-Phase 2b (``model_transformer.py``) tested attention on this task and
-landed in the seed-noise band. Two structural reasons, both fixed here:
+Phase 2b tested attention on this task and landed in the seed-noise band.
+Two structural reasons, both fixed here:
 
-  1. **Width.** Phase 2b reused WhaleVAD's existing 64-dim projection
-     (``cfg.PROJECTION_DIM``) and ran attention at d_model=64 / 4 heads
-     = 16 dims per head. That is almost nothing for attention to work
-     with. Here we add our *own* projection from the flattened CNN
-     features straight to ``d_model`` (default 128), so attention has
-     real capacity. The inner WhaleVAD's 64-dim projection is left
-     untouched and unused.
-
+  1. **Width.** Phase 2b reused WhaleVAD's existing 64-dim projection and
+     ran attention at d_model=64 / 4 heads = 16 dims per head. Here we add
+     our *own* projection from the flattened CNN features straight to
+     ``d_model`` (default 128); the inner model's 64-dim projection is left
+     unused.
   2. **No conv module.** Phase 2b was a *plain* Transformer encoder. A
      Conformer interleaves a depthwise-separable convolution module with
-     self-attention inside every block — local spectro-temporal modelling
-     (what makes Conformers beat vanilla Transformers on audio/SED) plus
+     self-attention in every block — local spectro-temporal modelling plus
      global attention. That conv module is the main reason this is worth
      trying when the plain Transformer was not.
 
@@ -35,28 +36,18 @@ Block structure (canonical Conformer, Gulati et al. 2020):
       → x + ½·FFN(x)
       → LayerNorm(x)
 
-Positional encoding: Rotary (RoPE) applied to Q/K. RoPE is a *relative*
-scheme (what the original Conformer found best) but implemented as a
-position-dependent rotation of Q/K, which avoids the index-shift
-bookkeeping of Transformer-XL relative attention and is robust to the
-variable sequence lengths this task produces.
-
 Interface
 ---------
 ``forward(spec, key_padding_mask=None) -> (B, T, num_classes)``
 
-The ``spec`` contract is identical to ``WhaleVAD.forward`` — a
-``(B, 3, F, T)`` phase-aware spectrogram from ``SpectrogramExtractor`` —
-so this model is drop-in for the existing training / validation /
-inference machinery. ``key_padding_mask`` (``(B, T)`` bool, ``True`` =
-padded) is optional: when supplied (e.g. by ``train_conformer.py`` during
-training, where variable-length segments are zero-padded to the batch
-max) attention ignores padded frames; when omitted (e.g. by the reused
-``train.validate``) the model behaves exactly like the unmasked BiLSTM
-baseline, keeping evaluation apples-to-apples.
-
-NOTE the stem preserves the time axis exactly (all CNN strides are 1 in
-time, all pools are kernel-1 in time), so the model's internal sequence
+The ``spec`` contract matches ``model_final.WhaleVAD.forward`` — a
+``(B, 3, F, T)`` phase-aware spectrogram from ``spectrogram_final``. So
+this is drop-in for the final training / validation machinery.
+``key_padding_mask`` (``(B, T)`` bool, ``True`` = padded) is optional:
+``train_conformer.py`` passes it during training (variable-length 30 s
+segments are zero-padded to the batch max), while ``train_final.validate``
+calls the model without it — keeping validation identical to the baseline.
+The stem preserves the time axis exactly, so the model's internal sequence
 length equals the STFT frame count; a length guard reconciles any
 off-by-one between an externally supplied mask and that count.
 """
@@ -67,8 +58,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import config as cfg
-from model import WhaleVAD
+import config_final as cfg
+from model_final import WhaleVAD
 
 
 # ======================================================================
@@ -216,22 +207,23 @@ class ConformerBlock(nn.Module):
 
 class WhaleVAD_Conformer(nn.Module):
     """
-    WhaleVAD CNN stem + Conformer encoder, per-frame SED head.
+    WhaleVAD CNN stem (from model_final) + Conformer encoder, per-frame head.
 
     Parameters
     ----------
     num_classes, feat_channels
-        Same meaning as ``WhaleVAD``.
+        Same meaning as ``model_final.WhaleVAD``. Defaults to 7 (the final
+        pipeline trains on the fine call types and collapses to 3 at eval).
     d_model
-        Conformer width. Default 128 (vs. Phase 2b's 64). The flattened
-        CNN features (C*F, typically ~384) are projected to this.
+        Conformer width. Default 128 (vs. Phase 2b's 64). The flattened CNN
+        features (C*F, typically ~384) are projected to this.
     nhead, num_layers, ffn_mult, conv_kernel, dropout
         Standard Conformer hyperparameters.
     """
 
     def __init__(
         self,
-        num_classes: int = 3,
+        num_classes: int = 7,
         feat_channels: int = 3,
         d_model: int = 128,
         nhead: int = 4,
@@ -242,9 +234,8 @@ class WhaleVAD_Conformer(nn.Module):
     ):
         super().__init__()
 
-        # Reuse WhaleVAD's CNN stem by composition (so any change to the
-        # stem in model.py is picked up automatically). The inner model's
-        # BiLSTM, classifier and 64-dim projection are dead here.
+        # Reuse the final pipeline's CNN stem by composition. The inner
+        # model's BiLSTM, classifier and 64-dim projection are dead here.
         self._inner = WhaleVAD(num_classes=num_classes, feat_channels=feat_channels)
         for p in self._inner.lstm.parameters():
             p.requires_grad = False
@@ -310,7 +301,7 @@ class WhaleVAD_Conformer(nn.Module):
 # ======================================================================
 
 if __name__ == "__main__":
-    from spectrogram import SpectrogramExtractor
+    from spectrogram_final import SpectrogramExtractor
 
     extractor = SpectrogramExtractor()
     model = WhaleVAD_Conformer(num_classes=cfg.n_classes())
@@ -319,6 +310,6 @@ if __name__ == "__main__":
     spec = extractor(audio)
     logits = model(spec)
     print(f"Spec:    {tuple(spec.shape)}")
-    print(f"Logits:  {tuple(logits.shape)}")
+    print(f"Logits:  {tuple(logits.shape)}   (num_classes={cfg.n_classes()})")
     n = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Params:  {n:,}")

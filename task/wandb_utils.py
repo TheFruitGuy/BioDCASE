@@ -717,33 +717,33 @@ PHASE_REGISTRY: dict[str, dict] = {
     ),
 
     # ------------------------------------------------------------------
-    # Phase 13: Conformer-SED. Successor to phase 2b (transformer_encoder).
+    # Phase 13: Conformer-SED. Successor to phase 2b (transformer_encoder),
+    # rebuilt on the final recipe (joins the 10a/11a/12a architecture cohort).
     # ------------------------------------------------------------------
     "13": dict(
-        parent="baseline",
+        parent="final",
         hypothesis=(
-            "Conformer-SED on the baseline recipe: replace the 2-layer "
-            "BiLSTM with a stack of Conformer blocks (macaron FFN + "
-            "RoPE-relative self-attention + depthwise conv module) on top "
-            "of the unchanged WhaleVAD CNN stem. No recurrence anywhere. "
-            "Direct successor to phase 2b (plain Transformer, d_model=64, "
-            "no conv module) which landed in the seed-noise band: 2b's two "
-            "structural flaws are fixed here -- attention runs at "
-            "d_model=128 via a dedicated wide projection (not the reused "
-            "64-dim one), and every block interleaves a depthwise conv "
-            "module for local spectro-temporal modelling, which is what "
-            "lets a Conformer beat a vanilla Transformer on audio. "
-            "Variable-length training segments are attention-masked "
-            "(key_padding_mask); validation is left unmasked to match "
-            "train.validate exactly. Trained via train_conformer.py, which "
-            "reuses train.validate verbatim and selects checkpoints on "
-            "paper_f1 (F1 of mean-P/mean-R, the rescore_base_epochs "
-            "convention) by default. Parent is 'baseline' (not 'final') "
-            "because it mirrors train.py's recipe -- focal + weighted BCE, "
-            "ReduceLROnPlateau, periodic resampling -- so it is directly "
-            "comparable to the 2a/2b sequence-model ablations and the "
-            "single-model baseline. Variants (d_model, layers, select-by) "
-            "ride on config + tags."
+            "Conformer-SED on the final recipe: replace the 2-layer BiLSTM "
+            "with a stack of Conformer blocks (macaron FFN + RoPE-relative "
+            "self-attention + depthwise conv module) on top of the unchanged "
+            "WhaleVAD CNN stem. No recurrence anywhere. Direct successor to "
+            "phase 2b (plain Transformer, d_model=64, no conv module) which "
+            "landed in the seed-noise band: 2b's two structural flaws are "
+            "fixed here -- attention runs at d_model=128 via a dedicated wide "
+            "projection (not the reused 64-dim one), and every block "
+            "interleaves a depthwise conv module for local spectro-temporal "
+            "modelling, which is what lets a Conformer beat a vanilla "
+            "Transformer on audio. Built on the consolidated 'final' pipeline "
+            "(7-class targets collapsed to 3 at eval, segment-count weighted "
+            "BCE, per-epoch negative resampling, fixed-threshold validation) "
+            "via train_conformer.py, which reuses train_final's validate, "
+            "compute_pos_weight and resampling verbatim and selects on "
+            "macro_paper (F1 of mean-P/mean-R). Variable-length training "
+            "segments are attention-masked; validation is unmasked to match "
+            "train_final exactly. Same parent as 10a (multi-res STFT), 11a "
+            "(PCEN) and 12a (FDConv) -- an architecture change on top of the "
+            "final recipe, here in the sequence model rather than the "
+            "frontend. Variants (d_model, layers) ride on config + tags."
         ),
         interventions=["conformer_encoder"],
     ),
