@@ -159,7 +159,7 @@ def main():
     run = None
     if not args.no_wandb:
         run = wbu.init_phase(
-            "conformer",
+            "13",
             extra_tags=["from_scratch", "conformer", f"select_{args.select_by}"],
             config={
                 "arch": "conformer", "d_model": args.d_model, "nhead": args.nhead,

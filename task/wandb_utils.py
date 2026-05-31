@@ -716,6 +716,38 @@ PHASE_REGISTRY: dict[str, dict] = {
         interventions=["pcen_stacked_asymmetric"],
     ),
 
+    # ------------------------------------------------------------------
+    # Phase 13: Conformer-SED. Successor to phase 2b (transformer_encoder).
+    # ------------------------------------------------------------------
+    "13": dict(
+        parent="baseline",
+        hypothesis=(
+            "Conformer-SED on the baseline recipe: replace the 2-layer "
+            "BiLSTM with a stack of Conformer blocks (macaron FFN + "
+            "RoPE-relative self-attention + depthwise conv module) on top "
+            "of the unchanged WhaleVAD CNN stem. No recurrence anywhere. "
+            "Direct successor to phase 2b (plain Transformer, d_model=64, "
+            "no conv module) which landed in the seed-noise band: 2b's two "
+            "structural flaws are fixed here -- attention runs at "
+            "d_model=128 via a dedicated wide projection (not the reused "
+            "64-dim one), and every block interleaves a depthwise conv "
+            "module for local spectro-temporal modelling, which is what "
+            "lets a Conformer beat a vanilla Transformer on audio. "
+            "Variable-length training segments are attention-masked "
+            "(key_padding_mask); validation is left unmasked to match "
+            "train.validate exactly. Trained via train_conformer.py, which "
+            "reuses train.validate verbatim and selects checkpoints on "
+            "paper_f1 (F1 of mean-P/mean-R, the rescore_base_epochs "
+            "convention) by default. Parent is 'baseline' (not 'final') "
+            "because it mirrors train.py's recipe -- focal + weighted BCE, "
+            "ReduceLROnPlateau, periodic resampling -- so it is directly "
+            "comparable to the 2a/2b sequence-model ablations and the "
+            "single-model baseline. Variants (d_model, layers, select-by) "
+            "ride on config + tags."
+        ),
+        interventions=["conformer_encoder"],
+    ),
+
 }
 
 
