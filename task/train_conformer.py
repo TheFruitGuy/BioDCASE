@@ -29,8 +29,8 @@ What differs (and only this):
 Usage
 -----
     CUDA_VISIBLE_DEVICES=5 python train_conformer.py
-    CUDA_VISIBLE_DEVICES=5 python train_conformer.py --wandb
-    CUDA_VISIBLE_DEVICES=5 python train_conformer.py --d-model 144 --layers 4 --wandb
+    CUDA_VISIBLE_DEVICES=5 python train_conformer.py --d-model 144 --layers 4
+    CUDA_VISIBLE_DEVICES=5 python train_conformer.py --wandb-mode offline
 """
 
 from __future__ import annotations
@@ -44,7 +44,9 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import wandb
 
+import wandb_utils as wbu
 import config_final as cfg
 from dataset_final import (
     load_annotations, get_file_manifest,
@@ -75,11 +77,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--ffn-mult", type=int, default=4)
     p.add_argument("--conv-kernel", type=int, default=31)
     p.add_argument("--dropout", type=float, default=0.1)
-    # Recipe / bookkeeping — mirror train_final.py
-    p.add_argument("--wandb", action="store_true",
-                   help="Log this run to Weights & Biases (phase 13). Off by default.")
+    # Recipe / bookkeeping — mirror train_final.py (W&B logging is always on)
     p.add_argument("--wandb-mode", default="online",
-                   choices=["online", "offline", "disabled"])
+                   choices=["online", "offline", "disabled"],
+                   help="W&B run mode (default online; use 'offline' to sync later).")
     p.add_argument("--epochs", type=int, default=cfg.EPOCHS,
                    help=f"Number of training epochs (default {cfg.EPOCHS}).")
     p.add_argument("--seed", type=int, default=cfg.SEED,
@@ -169,27 +170,23 @@ def main():
           f"{len(train_sites)} sites...")
     pos_weight, weight_info = compute_pos_weight(train_sites, device, verbose=True)
 
-    # --- optional W&B run (phase 13) ---
-    run = None
-    if args.wandb:
-        import wandb_utils as wbu
-        import wandb
-        run = wbu.init_phase("13", config={
-            "arch": "conformer",
-            "d_model": args.d_model, "nhead": args.nhead, "layers": args.layers,
-            "ffn_mult": args.ffn_mult, "conv_kernel": args.conv_kernel,
-            "dropout": args.dropout,
-            "lr": cfg.LR, "weight_decay": cfg.WEIGHT_DECAY,
-            "batch_size": cfg.BATCH_SIZE, "threshold": cfg.THRESHOLD,
-            "seed": seed, "num_classes": cfg.n_classes(), "use_3class": cfg.USE_3CLASS,
-            "neg_ratio": cfg.NEG_RATIO, "neg_resample_each_epoch": True,
-            "segment_s": cfg.TRAIN_SEGMENT_S, "epochs": args.epochs,
-            "train_sites": train_sites, "val_sites": val_sites,
-            "lstm_hidden": cfg.LSTM_HIDDEN, "lstm_layers": cfg.LSTM_LAYERS,
-            "pos_weight": weight_info["pos_weight"],
-            "pos_weight_counts": weight_info["annotation_counts"],
-            "pos_weight_ratio": weight_info["weight_ratio"],
-        }, mode=args.wandb_mode, extra_tags=["from_scratch", "conformer"])
+    # --- W&B run (phase 13) — always on ---
+    run = wbu.init_phase("13", config={
+        "arch": "conformer",
+        "d_model": args.d_model, "nhead": args.nhead, "layers": args.layers,
+        "ffn_mult": args.ffn_mult, "conv_kernel": args.conv_kernel,
+        "dropout": args.dropout,
+        "lr": cfg.LR, "weight_decay": cfg.WEIGHT_DECAY,
+        "batch_size": cfg.BATCH_SIZE, "threshold": cfg.THRESHOLD,
+        "seed": seed, "num_classes": cfg.n_classes(), "use_3class": cfg.USE_3CLASS,
+        "neg_ratio": cfg.NEG_RATIO, "neg_resample_each_epoch": True,
+        "segment_s": cfg.TRAIN_SEGMENT_S, "epochs": args.epochs,
+        "train_sites": train_sites, "val_sites": val_sites,
+        "lstm_hidden": cfg.LSTM_HIDDEN, "lstm_layers": cfg.LSTM_LAYERS,
+        "pos_weight": weight_info["pos_weight"],
+        "pos_weight_counts": weight_info["annotation_counts"],
+        "pos_weight_ratio": weight_info["weight_ratio"],
+    }, mode=args.wandb_mode, extra_tags=["from_scratch", "conformer"])
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
     tag = f"conformer_{cfg.n_classes()}c_s{seed}"
@@ -236,8 +233,7 @@ def main():
     model, spec_extractor = build_conformer(device, args)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nModel parameters: {n_params:,}")
-    if run is not None:
-        run.config.update({"n_params": n_params}, allow_val_change=True)
+    run.config.update({"n_params": n_params}, allow_val_change=True)
 
     criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight).to(device)
     optimizer = AdamW(
@@ -296,15 +292,14 @@ def main():
         print(f"    OVERALL F1={val['f1']:.3f}  MACRO F1={macro:.3f}  "
               f"MACRO_PAPER F1={val['macro_paper']:.3f}")
 
-        if run is not None:
-            wbu.log_epoch_3class(epoch, train_loss, val)
-            # log the actual selection metric explicitly (log_epoch_3class
-            # labels micro F1 as "f1_macro", so surface macro_paper too).
-            wandb.log({
-                "val/f1_micro": val["f1"],
-                "val/f1_macro_mean": macro,
-                "val/f1_macro_paper": val["macro_paper"],
-            }, step=epoch)
+        wbu.log_epoch_3class(epoch, train_loss, val)
+        # log the actual selection metric explicitly (log_epoch_3class
+        # labels micro F1 as "f1_macro", so surface macro_paper too).
+        wandb.log({
+            "val/f1_micro": val["f1"],
+            "val/f1_macro_mean": macro,
+            "val/f1_macro_paper": val["macro_paper"],
+        }, step=epoch)
 
         history.append({
             "epoch": epoch,
@@ -361,9 +356,8 @@ def main():
     verdict = (f"Conformer (d_model={args.d_model}, {args.layers}L): best "
                f"macro_paper F1 {max(macro_papers):.3f} (micro {max(f1s):.3f}, "
                f"macro {max(macros):.3f}); second-half mean swing {mean_swing:.3f}.")
-    if run is not None:
-        wbu.finalize_phase(history, verdict=verdict,
-                           best_ckpt=run_dir / "conformer_best.pt")
+    wbu.finalize_phase(history, verdict=verdict,
+                       best_ckpt=run_dir / "conformer_best.pt")
 
 
 if __name__ == "__main__":
