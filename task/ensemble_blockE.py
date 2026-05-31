@@ -142,13 +142,13 @@ def main():
     base = next((r for r in rows if r[0] == "A0"), None)
 
     print(f"\n{'='*86}\nENSEMBLE (posterior-average, _final posteriors)\n{'='*86}")
-    print(f"  {'combo':16} {'mem':>4} {'macroF1':>9} {'D P':>7} {'D R':>7} "
-          f"{'D F1':>7} {'BMABZ':>7} {'BP':>7} {'Δmacro vs A0':>13}")
+    print(f"  {'combo':16} {'mem':>4} {'paperF1':>9} {'D P':>7} {'D R':>7} "
+          f"{'D F1':>7} {'BMABZ':>7} {'BP':>7} {'ΔpaperF1 vs A0':>15}")
     for combo, n, mp, pc, thr in rows:
         dM = f"{mp - base[2]:+.4f}" if base else "   —"
         print(f"  {combo:16} {n:>4} {mp:>9.4f} {pc['d']['precision']:>7.3f} "
               f"{pc['d']['recall']:>7.3f} {pc['d']['f1']:>7.3f} "
-              f"{pc['bmabz']['f1']:>7.3f} {pc['bp']['f1']:>7.3f} {dM:>13}")
+              f"{pc['bmabz']['f1']:>7.3f} {pc['bp']['f1']:>7.3f} {dM:>15}")
 
     print(f"\n  tuned thresholds (bmabz/d/bp):")
     for combo, n, mp, pc, thr in rows:
@@ -159,16 +159,16 @@ def main():
     if base:
         best = max(rows, key=lambda r: r[2])
         gain = best[2] - base[2]
-        print(f"Baseline A0 ensemble (5): macro {base[2]:.4f}, D-F1 {base[3]['d']['f1']:.3f}")
+        print(f"Baseline A0 ensemble (5): paper-F1 {base[2]:.4f}, D-F1 {base[3]['d']['f1']:.3f}")
         if best[0] == "A0":
             print("No combo beats the A0-only ensemble — the Block E models add no "
                   "ensemble value (expected: their single-model posteriors ≈ A0).")
         elif gain < 0.005:
-            print(f"Best combo {best[0]} is +{gain:.4f} macro over A0 — within noise; "
+            print(f"Best combo {best[0]} is +{gain:.4f} paper-F1 over A0 — within noise; "
                   "any lift is likely 'more members', not Block E decorrelation. "
                   "Check it against extra A0 seeds before claiming a gain.")
         else:
-            print(f"Best combo {best[0]} is +{gain:.4f} macro over A0 ({best[1]} members). "
+            print(f"Best combo {best[0]} is +{gain:.4f} paper-F1 over A0 ({best[1]} members). "
                   "If equal-size arm combos (A2/A3 at 5) don't show it, the lift is "
                   "from pooling more models, not the Block E arms specifically.")
     print("Scored from saved _final posteriors; no re-inference, no stack mismatch.")

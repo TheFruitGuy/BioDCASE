@@ -136,7 +136,7 @@ def main():
 
     # ---- per-arm absolute table -------------------------------------
     print(f"\n{'='*72}\nPER-ARM (mean ± std over seeds present)\n{'='*72}")
-    print(f"  {'arm':22} {'macroF1':>14} {'D P':>11} {'D R':>11} {'D F1':>11} "
+    print(f"  {'arm':22} {'paperF1':>14} {'D P':>11} {'D R':>11} {'D F1':>11} "
           f"{'BMABZ F1':>10} {'BP F1':>9}")
     for arm in args.arms:
         seeds_here = sorted(res[arm])
@@ -171,7 +171,7 @@ def main():
     deltas = {}   # arm -> dict of mean deltas
     if "A0" in res and res["A0"]:
         print(f"\n{'='*72}\nPAIRED vs A0 (same seeds): mean Δ [seeds up / n]\n{'='*72}")
-        print(f"  {'arm':22} {'ΔD-F1':>16} {'ΔD-recall':>16} {'ΔD-prec':>16} {'Δmacro':>16}")
+        print(f"  {'arm':22} {'ΔD-F1':>16} {'ΔD-recall':>16} {'ΔD-prec':>16} {'ΔpaperF1':>16}")
         for arm in args.arms:
             if arm == "A0":
                 continue
