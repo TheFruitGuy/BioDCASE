@@ -79,7 +79,8 @@ def score_run(run_dir: Path, gt_events, tol: float):
     mp = paper_f1(metrics)
     pc = per_class_block(metrics)
     match = (not np.isnan(saved_mp)) and abs(mp - saved_mp) <= tol
-    return {"macro": mp, "saved_macro": saved_mp, "match": match, "pc": pc}
+    return {"macro": mp, "saved_macro": saved_mp, "match": match, "pc": pc,
+            "thr": np.asarray(thr, dtype=np.float64)}
 
 
 def agg(vals):
@@ -151,6 +152,20 @@ def main():
         print(f"  {arm+' '+ARM_DESC[arm]:22} {macro[0]:.4f}±{macro[1]:.3f} "
               f"{dP[0]:.3f}±{dP[1]:.2f} {dR[0]:.3f}±{dR[1]:.2f} {dF[0]:.3f}±{dF[1]:.2f} "
               f"{bF[0]:.3f}±{bF[1]:.2f} {pF[0]:.3f}±{pF[1]:.2f}  (n={len(seeds_here)})")
+
+    # ---- tuned thresholds per arm (diagnostic: did posteriors shift?) ----
+    print(f"\n{'='*72}\nTUNED THRESHOLDS (mean ± std, bmabz / d / bp)\n{'='*72}")
+    for arm in args.arms:
+        sh = sorted(res[arm])
+        if not sh:
+            continue
+        thrs = np.array([res[arm][s]["thr"] for s in sh])      # (n, 3)
+        m, sd = thrs.mean(0), thrs.std(0)
+        print(f"  {arm+' '+ARM_DESC[arm]:22} bmabz {m[0]:.2f}±{sd[0]:.2f}   "
+              f"d {m[1]:.2f}±{sd[1]:.2f}   bp {m[2]:.2f}±{sd[2]:.2f}")
+    print("  (if SAT's tuned D threshold ≈ A0's, the consistency change barely "
+          "moved the D posteriors; if it shifts but D-F1 doesn't, the sweep is "
+          "absorbing the change — same frontier either way.)")
 
     # ---- paired vs A0 -----------------------------------------------
     deltas = {}   # arm -> dict of mean deltas
