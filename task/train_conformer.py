@@ -20,12 +20,13 @@ What differs (and only this):
      batches (the BiLSTM ignored them only in the loss; for global
      attention masking them in the model matters). Validation is left
      unmasked, exactly matching how the baseline is measured.
-  3. ``--select-by {micro,macro}``. ``train.py`` selects the best
-     checkpoint on the *micro*-averaged F1 (``metrics["overall"]``,
-     see postprocess.py line ~566), even though the official BioDCASE
-     metric is macro F1. ``micro`` (default) reproduces the baseline's
-     selection; ``macro`` selects on the metric you actually report.
-     Macro F1 is logged every epoch regardless.
+  3. ``--select-by {paper,micro,macro}``. Defaults to ``paper`` — the F1 of
+     mean-precision/mean-recall across the 3 classes, exactly as
+     ``rescore_base_epochs.paper_f1`` and your ``_final``/``flatmatch``
+     trainers compute it. This is the convention your 0.443 / 0.464 / 0.475
+     reference numbers live in, so the Conformer is directly comparable.
+     ``micro`` reproduces ``train.py``'s pooled-TP/FP/FN selection; ``macro``
+     is the mean of per-class F1. All three are logged every epoch.
 
 Usage
 -----
@@ -74,16 +75,37 @@ def parse_args():
     p.add_argument("--conv-kernel", type=int, default=31)
     p.add_argument("--dropout", type=float, default=0.1)
     # Selection / bookkeeping
-    p.add_argument("--select-by", choices=["micro", "macro"], default="micro",
-                   help="Checkpoint-selection metric. 'micro' matches train.py; "
-                        "'macro' selects on the official BioDCASE metric.")
+    p.add_argument("--select-by", choices=["paper", "micro", "macro"], default="paper",
+                   help="Checkpoint-selection metric. 'paper' = F1 of mean-P/mean-R "
+                        "(rescore_base_epochs convention; matches your _final pipeline "
+                        "and reference numbers; default). 'micro' reproduces train.py's "
+                        "pooled-TP/FP/FN selection. 'macro' = mean of per-class F1.")
     p.add_argument("--seed", type=int, default=cfg.SEED)
     p.add_argument("--no-wandb", action="store_true")
     return p.parse_args()
 
 
+def paper_f1_from(val: dict) -> float:
+    """F1 of mean-precision and mean-recall across the 3 classes.
+
+    This is the *paper convention* used by rescore_base_epochs.paper_f1 and by
+    your _final / flatmatch trainers for checkpoint selection — i.e. the metric
+    your 0.443 / 0.464 / 0.475 reference numbers live in. It is distinct from
+    both micro F1 (pooled TP/FP/FN) and the mean-of-per-class-F1 "macro".
+
+    Computed here from the same postprocess.compute_metrics (IoU=0.3, greedy 1D
+    matching) the baseline's train.validate uses, so the Conformer-vs-baseline
+    comparison stays internally consistent on this metric.
+    """
+    pc = val["per_class"]
+    P = [pc.get(c, {}).get("precision", 0.0) for c in cfg.CALL_TYPES_3]
+    R = [pc.get(c, {}).get("recall", 0.0) for c in cfg.CALL_TYPES_3]
+    pb, rb = float(np.mean(P)), float(np.mean(R))
+    return 2.0 * pb * rb / (pb + rb + 1e-8)
+
+
 def macro_f1_from(val: dict) -> float:
-    """Mean of per-class event-level F1 over the 3 coarse classes."""
+    """Mean of per-class event-level F1 (a *different* average; logged for reference)."""
     pc = val["per_class"]
     return float(np.mean([pc.get(c, {}).get("f1", 0.0) for c in cfg.CALL_TYPES_3]))
 
@@ -232,11 +254,12 @@ def main():
 
         micro_f1 = val["mean_f1"]
         macro_f1 = macro_f1_from(val)
-        select_metric = micro_f1 if args.select_by == "micro" else macro_f1
+        pf1 = paper_f1_from(val)
+        select_metric = {"paper": pf1, "micro": micro_f1, "macro": macro_f1}[args.select_by]
         scheduler.step(select_metric)
 
         print(f"\n  Train loss: {train_loss:.4f}  Val loss: {val['loss']:.4f}")
-        print(f"  micro F1: {micro_f1:.3f}   macro F1: {macro_f1:.3f}   "
+        print(f"  paper F1: {pf1:.3f}   micro F1: {micro_f1:.3f}   macro F1: {macro_f1:.3f}   "
               f"(selecting by {args.select_by}, best={best_metric:.3f})")
         print(f"  Tuned thresholds: {['%.2f' % t for t in val['thresholds']]}")
 
@@ -244,8 +267,8 @@ def main():
             import wandb
             payload = {
                 "epoch": epoch, "lr": current_lr, "train/loss": train_loss,
-                "val/loss": val["loss"], "val/f1_micro": micro_f1,
-                "val/f1_macro": macro_f1,
+                "val/loss": val["loss"], "val/f1_paper": pf1,
+                "val/f1_micro": micro_f1, "val/f1_macro": macro_f1,
             }
             for ci, cname in enumerate(cfg.CALL_TYPES_3):
                 pc = val["per_class"].get(cname, {})
@@ -259,7 +282,7 @@ def main():
                        else model.state_dict())
         ckpt = {
             "epoch": epoch, "model_state_dict": model_state,
-            "best_micro_f1": micro_f1, "best_macro_f1": macro_f1,
+            "paper_f1": pf1, "micro_f1": micro_f1, "macro_f1": macro_f1,
             "select_by": args.select_by, "thresholds": thresholds.cpu(),
             "arch_kwargs": {
                 "d_model": args.d_model, "nhead": args.nhead, "num_layers": args.layers,
@@ -272,7 +295,7 @@ def main():
             best_metric = select_metric
             torch.save(ckpt, run_dir / "best_model.pt")
             print(f"  *** New best ({args.select_by}) F1: {best_metric:.3f}  "
-                  f"[micro={micro_f1:.3f} macro={macro_f1:.3f}]")
+                  f"[paper={pf1:.3f} micro={micro_f1:.3f} macro={macro_f1:.3f}]")
             no_improve_epochs = 0
         else:
             no_improve_epochs += 1
@@ -305,14 +328,15 @@ def main():
     }, run_dir / "final_model.pt")
 
     print(f"\nDone. Best {args.select_by} F1: {best_metric:.3f}  "
-          f"[best ckpt: micro={best_ckpt['best_micro_f1']:.3f} "
-          f"macro={best_ckpt['best_macro_f1']:.3f}]")
+          f"[best ckpt: paper={best_ckpt['paper_f1']:.3f} "
+          f"micro={best_ckpt['micro_f1']:.3f} macro={best_ckpt['macro_f1']:.3f}]")
     print(f"Run dir: {run_dir}")
 
     if run is not None:
         import wandb
-        wandb.summary["best_micro_f1"] = float(best_ckpt["best_micro_f1"])
-        wandb.summary["best_macro_f1"] = float(best_ckpt["best_macro_f1"])
+        wandb.summary["best_paper_f1"] = float(best_ckpt["paper_f1"])
+        wandb.summary["best_micro_f1"] = float(best_ckpt["micro_f1"])
+        wandb.summary["best_macro_f1"] = float(best_ckpt["macro_f1"])
         wandb.summary["select_by"] = args.select_by
         wandb.summary["final_thresholds"] = list(map(float, tuned))
         wandb.finish()
