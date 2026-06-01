@@ -173,14 +173,26 @@ def load_conformer(ckpt_path, device):
         return default
 
     cfg.USE_3CLASS = (num_classes == 3)
-    model = WhaleVAD_Conformer(
+    common = dict(
         num_classes=num_classes, d_model=d_model,
         nhead=pick("nhead", default=4),
         num_layers=pick("layers", "num_layers", default=4),
         ffn_mult=pick("ffn_mult", default=4),
         conv_kernel=pick("conv_kernel", default=31),
         dropout=pick("dropout", default=0.1),
-    ).to(device)
+    )
+    # FDY checkpoints (phase 13d) carry `fdy_targets` in arch_kwargs and have a
+    # different stem; build the matching subclass so the state_dict loads.
+    if a.get("fdy_targets"):
+        from model_conformer_fdy import WhaleVAD_Conformer_FDY
+        model = WhaleVAD_Conformer_FDY(
+            fdy_targets=tuple(a["fdy_targets"]),
+            fdy_basis=pick("fdy_basis", default=4),
+            fdy_temp=pick("fdy_temp", default=1.0),
+            **common,
+        ).to(device)
+    else:
+        model = WhaleVAD_Conformer(**common).to(device)
     spec = SpectrogramExtractor().to(device)
     with torch.no_grad():  # materialise the lazy projection before loading
         model(spec(torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)))
