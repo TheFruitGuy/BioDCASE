@@ -11,16 +11,18 @@ Each WAV is streamed from S3 into memory, decimated with anti-aliased two-stage
 IIR (8x then 6x = 48x), and written as 16-bit PCM WAV to disk. The full-rate
 12 kHz file is never written to disk.
 
-Test-set sites (Kerguelen2020, DDU2021) are HARD-BLOCKED — the script refuses to
-download them to prevent accidental data leakage into pretraining.
+Test-set sites (Kerguelen2019, Kerguelen2020, DDU2019, DDU2021) are HARD-BLOCKED —
+the script refuses to download them to prevent data leakage into pretraining. The
+2026 BioDCASE Task 2 eval set added ddu2019 + kerguelen2019 on top of the original
+two, so both are now quarantined.
 
 Output layout (compatible with dataset.py manifest):
 
     <output-dir>/
-      DDU2018/
-        201_2018-01-15_03-00-00.wav   (already decimated to target SR)
+      Kerguelen2021/
+        <deploy>_2021-02-10_03-00-00.wav   (already decimated to target SR)
         ...
-      Kerguelen2018/
+      Kerguelen2023/
         ...
 
 Usage
@@ -28,7 +30,7 @@ Usage
     export AADC_ACCESS_KEY=...
     export AADC_SECRET_KEY=...
     python download_aadc.py \\
-        --datasets DDU2018 DDU2019 Kerguelen2018 Kerguelen2019 \\
+        --datasets Kerguelen2021 Kerguelen2023 \\
         --output-dir /var/home/matthias-nagl/AMP_data/ssl_pretrain/audio \\
         --workers 4
 
@@ -79,34 +81,22 @@ DECIM_STAGES_DEFAULT = (8, 6)
 # Test set — refuse to download these. The whole point of an isolated test set
 # is that no part of the pipeline ever sees them during training/pretraining.
 QUARANTINE = {
+    "Kerguelen2019", "kerguelen2019", "KERGUELEN2019",
     "Kerguelen2020", "kerguelen2020", "KERGUELEN2020",
+    "DDU2019",       "ddu2019",       "Ddu2019",
     "DDU2021",       "ddu2021",       "Ddu2021",
 }
 
 # Short name -> S3 key prefix (folder in the bucket).
+# Scoped to the two safe Kerguelen replacement deployments only. The 2026
+# BioDCASE Task 2 eval set is {ddu2019, ddu2021, kerguelen2019, kerguelen2020},
+# so DDU2019 and Kerguelen2019 — previously used for SSL — are now off-limits.
+# Every other site has been removed so this script physically cannot re-fetch a
+# train/val/eval site. Add an entry back here only after checking it against the
+# eval set. (DDU2018 is the one remaining safe DDU year if you ever need it.)
 DATASET_PREFIXES = {
-    "Casey2014":     "AAS_4102_longTermAcousticRecordings_Casey2014/",
-    "Casey2016":     "AAS_4102_longTermAcousticRecordings_Casey2016/",
-    "Casey2017":     "AAS_4102_longTermAcousticRecordings_Casey2017/",
-    "Casey2018":     "AAS_4102_longTermAcousticRecordings_Casey2018/",
-    "Casey2019":     "AAS_4102_longTermAcousticRecordings_Casey2019/",
-    "Casey2020":     "AAS_4102_longTermAcousticRecordings_Casey2020/",
-    "Casey2022":     "AAS_4102_longTermAcousticRecordings_Casey2022/",
-    "Casey2023":     "AAS_4102_longTermAcousticRecordings_Casey2023/",
-    "Casey2024":     "AAS_4102_longTermAcousticRecordings_Casey2024/",
-    "Kerguelen2014": "AAS_4102_longTermAcousticRecordings_Kerguelen2014/",
-    "Kerguelen2015": "AAS_4102_longTermAcousticRecordings_Kerguelen2015/",
-    "Kerguelen2016": "AAS_4102_longTermAcousticRecordings_Kerguelen2016/",
-    "Kerguelen2017": "AAS_4102_longTermAcousticRecordings_Kerguelen2017/",
-    "Kerguelen2018": "AAS_4102_longTermAcousticRecordings_Kerguelen2018/",
-    "Kerguelen2019": "AAS_4102_longTermAcousticRecordings_Kerguelen2019/",
     "Kerguelen2021": "AAS_4102_longTermAcousticRecordings_Kerguelen2021/",
     "Kerguelen2023": "AAS_4102_longTermAcousticRecordings_Kerguelen2023/",
-    "Kerguelen2024": "AAS_4102_longTermAcousticRecordings_Kerguelen2024/",
-    "DDU2018":       "AAS_4102_longTermAcousticRecordings_DDU2018/",
-    "DDU2019":       "AAS_4102_longTermAcousticRecordings_DDU2019/",
-    "Prydz2013":     "AAS_4102_longTermAcousticRecordings_Prydz2013/",
-    "Scott2019":     "AAS_4102_longTermAcousticRecordings_Scott2019/",
 }
 
 
