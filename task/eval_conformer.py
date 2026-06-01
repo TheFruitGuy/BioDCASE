@@ -151,7 +151,18 @@ def load_conformer(ckpt_path, device):
 
     ckpt = torch.load(ckpt_path, map_location=device)
     sd = ckpt["model_state_dict"]
-    cls_w = next(v for k, v in sd.items() if k.endswith("classifier.weight"))
+    # The composed inner WhaleVAD also has a `classifier` (its dead BiLSTM head),
+    # so its weight key ALSO ends in "classifier.weight" — but with a different
+    # width (2*LSTM_HIDDEN). Match the Conformer's OWN top-level head, never
+    # `_inner.*`, or d_model is read wrong and the load fails on a size mismatch.
+    def _param(suffix):
+        if suffix in sd:                       # exact top-level key
+            return sd[suffix]
+        cands = [k for k in sd if k.endswith("." + suffix) and "_inner" not in k]
+        if not cands:
+            raise KeyError(f"checkpoint has no top-level {suffix}")
+        return sd[cands[0]]
+    cls_w = _param("classifier.weight")        # [num_classes, d_model]
     num_classes, d_model = int(cls_w.shape[0]), int(cls_w.shape[1])
 
     a = ckpt.get("arch_kwargs", {})
