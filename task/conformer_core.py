@@ -68,14 +68,23 @@ def add_arch_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     return p
 
 
-def add_opt_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
+def add_opt_args(p: argparse.ArgumentParser,
+                 default_optimizer: str = "sf-radam") -> argparse.ArgumentParser:
     """Optimiser + warmup/decay args (phase 13a lever; inherited by 13b/13c)."""
-    p.add_argument("--optimizer", choices=["adamw", "radam"], default="radam",
-                   help="RAdam (Miyazaki's choice; built-in warmup) or AdamW.")
+    p.add_argument("--optimizer", choices=["sf-radam", "radam", "adamw"],
+                   default=default_optimizer,
+                   help="sf-radam = Schedule-Free RAdam (folds warmup + weight "
+                        "averaging; constant LR; ignores --warmup-epochs/--lr-schedule). "
+                        "radam / adamw use --warmup-epochs + --lr-schedule (the "
+                        "lower-variance Miyazaki-style fallback).")
     p.add_argument("--peak-lr", type=float, default=1e-3,
-                   help="Peak LR after warmup (vs the BiLSTM recipe's fixed 5e-5).")
-    p.add_argument("--warmup-epochs", type=float, default=2.0)
-    p.add_argument("--lr-schedule", choices=["cosine", "step", "const"], default="cosine")
+                   help="Peak/constant LR (vs the BiLSTM recipe's fixed 5e-5). "
+                        "Schedule-free wants this set a bit higher than a scheduled "
+                        "run; tune up if it underperforms the Step-0 baseline.")
+    p.add_argument("--warmup-epochs", type=float, default=1.0,
+                   help="Linear warmup epochs (radam/adamw only; ignored by sf-radam).")
+    p.add_argument("--lr-schedule", choices=["cosine", "step", "const"], default="cosine",
+                   help="Decay shape after warmup (radam/adamw only; ignored by sf-radam).")
     return p
 
 
@@ -131,19 +140,33 @@ class EMA:
 def build_optim_sched(model: nn.Module, opt_kwargs: dict,
                       steps_per_epoch: int, total_epochs: int):
     """
-    Build (optimizer, per-step scheduler) from ``opt_kwargs``:
-      optimizer    : "adamw" | "radam"
+    Build ``(optimizer, scheduler, is_schedule_free)`` from ``opt_kwargs``:
+      optimizer    : "sf-radam" | "radam" | "adamw"
       peak_lr      : float
       weight_decay : float
-      warmup_epochs: float   (linear warmup 0 -> peak over this many epochs)
-      schedule     : "cosine" | "step" | "const"  (decay after warmup)
+      warmup_epochs: float   (linear warmup 0 -> peak; radam/adamw only)
+      schedule     : "cosine" | "step" | "const"  (decay after warmup; radam/adamw only)
 
-    The scheduler is stepped once per optimiser step (per batch).
+    For "sf-radam" the scheduler is None (constant LR, averaging instead of a
+    schedule) and is_schedule_free is True; the caller must flip the optimizer
+    .train()/.eval() around training/validation. For radam/adamw the scheduler is
+    a per-step LambdaLR (warmup -> decay) and is_schedule_free is False.
     """
     name = opt_kwargs.get("optimizer", "adamw").lower()
     peak_lr = float(opt_kwargs.get("peak_lr", cfg.LR))
     wd = float(opt_kwargs.get("weight_decay", cfg.WEIGHT_DECAY))
     betas = (cfg.BETA1, cfg.BETA2)
+
+    # Schedule-Free RAdam (phase 13a default): iterate averaging replaces BOTH
+    # warmup and the decay schedule. RAdam's variance rectification *is* the
+    # warmup, so RAdamScheduleFree has no warmup_steps arg and runs at constant
+    # LR. The optimizer must be flipped .train()/.eval() around train/val (the
+    # averaged iterate only materialises in eval mode). Returns is_sf=True.
+    if name in ("sf-radam", "radam-sf", "schedulefree-radam"):
+        from schedulefree import RAdamScheduleFree
+        optimizer = RAdamScheduleFree(model.parameters(), lr=peak_lr,
+                                      betas=betas, weight_decay=wd)
+        return optimizer, None, True
 
     if name == "radam":
         optimizer = torch.optim.RAdam(model.parameters(), lr=peak_lr,
@@ -169,7 +192,7 @@ def build_optim_sched(model: nn.Module, opt_kwargs: dict,
         return 1.0                                          # const
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    return optimizer, scheduler
+    return optimizer, scheduler, False
 
 
 # ======================================================================
@@ -305,8 +328,12 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
 
     criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight).to(device)
 
-    steps_per_epoch = max(1, len(pos_segs + [0] * n_neg) // cfg.BATCH_SIZE)
-    optimizer, scheduler = build_optim_sched(model, opt_kwargs, steps_per_epoch, epochs)
+    steps_per_epoch = max(1, (len(pos_segs) + n_neg) // cfg.BATCH_SIZE)
+    optimizer, scheduler, is_sf = build_optim_sched(model, opt_kwargs, steps_per_epoch, epochs)
+    if use_ema and is_sf:
+        print(f"[phase {phase}] schedule-free optimiser already averages weights; "
+              f"ignoring EMA (subsumed).")
+        use_ema = False
     ema = EMA(model, decay=ema_decay) if use_ema else None
 
     # --- training loop ---
@@ -324,10 +351,15 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
             **seeded_dataloader_kwargs(seed),
         )
 
+        if is_sf:
+            optimizer.train()                 # gradient-evaluation point
         train_loss = _train_epoch(model, spec_extractor, train_loader, criterion,
                                   optimizer, scheduler, device, ema, augment_fn)
 
-        # Evaluate the EMA weights when enabled (and checkpoint those).
+        # Switch to the weights we select/checkpoint on: the schedule-free
+        # averaged iterate, or the EMA shadow (these are mutually exclusive).
+        if is_sf:
+            optimizer.eval()                  # materialise the averaged iterate
         if ema is not None:
             ema.store_and_copy(model)
         val = validate(model, spec_extractor, val_loader, criterion, device,
@@ -335,6 +367,8 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
         eval_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         if ema is not None:
             ema.restore(model)
+        # (schedule-free stays in eval; next epoch's optimizer.train() restores
+        #  the gradient-evaluation weights.)
 
         macro = sum(val["per_class"][c]["f1"] for c in cfg.CALL_TYPES_3) / 3
         improved = val["macro_paper"] > best_f1

@@ -1,19 +1,27 @@
 """
-Phase 13a — Conformer + LR warmup / schedule
-=============================================
+Phase 13a — Conformer + Schedule-Free RAdam
+===========================================
 
-The first and highest-priority rung of the Conformer ladder. The final recipe's
-fixed 5e-5 was tuned for the BiLSTM; the Conformer underfits and oscillates early
-without warmup (seen in phase 13). This swaps to RAdam (or AdamW) with a higher
-peak LR, linear warmup, and cosine decay. Everything else (data, weighted-BCE
-loss, per-epoch resampling, fixed-0.3 validation, macro_paper selection) is the
-final pipeline, reused verbatim via conformer_core.
+The first and highest-priority rung of the Conformer ladder, and the optimiser
+fix for the early oscillation seen in phase 13. Defaults to **Schedule-Free
+RAdam**: RAdam's variance rectification is an automatic warmup, and schedule-free
+iterate-averaging replaces the decay schedule *and* folds in the weight-averaging
+that 13b's EMA would otherwise add — so this single rung subsumes 13a+13b. No
+warmup-epoch or schedule tuning; constant LR.
+
+Fallback (lower-variance, Miyazaki-style): ``--optimizer radam`` (or ``adamw``)
+uses warmup + cosine decay; pair with ``train_phase13b.py`` for the cleanly
+separable A→B ladder if you'd rather measure warmup and EMA independently.
+
+Everything else (data, weighted-BCE loss, per-epoch resampling, fixed-0.3
+validation, macro_paper selection) is the final pipeline, reused verbatim via
+conformer_core. Requires ``pip install schedulefree`` in the env.
 
 Usage
 -----
-    CUDA_VISIBLE_DEVICES=5 python train_phase13a.py
-    CUDA_VISIBLE_DEVICES=5 python train_phase13a.py --optimizer adamw --peak-lr 3e-4
-    CUDA_VISIBLE_DEVICES=5 python train_phase13a.py --warmup-epochs 1 --epochs 30
+    CUDA_VISIBLE_DEVICES=5 python train_phase13a.py                       # sf-radam (default)
+    CUDA_VISIBLE_DEVICES=5 python train_phase13a.py --peak-lr 2.5e-3      # sf often likes higher LR
+    CUDA_VISIBLE_DEVICES=5 python train_phase13a.py --optimizer radam --warmup-epochs 1  # fallback
 """
 
 import argparse
@@ -33,7 +41,7 @@ def main():
         "13a", build_model=build_conformer, arch_kwargs=a,
         opt_kwargs=opt_kwargs_from(a),
         epochs=a.epochs, seed=a.seed, wandb_mode=a.wandb_mode,
-        use_ema=False, extra_tags=["conformer", "warmup"],
+        use_ema=False, extra_tags=["conformer", "sf_radam"],
     )
 
 

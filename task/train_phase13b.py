@@ -22,7 +22,7 @@ from conformer_core import run_training, build_conformer, add_arch_args, add_opt
 def main():
     p = argparse.ArgumentParser(description="Phase 13b: Conformer + warmup + EMA")
     add_arch_args(p)
-    add_opt_args(p)
+    add_opt_args(p, default_optimizer="radam")
     p.add_argument("--ema-decay", type=float, default=0.999)
     a = p.parse_args()
 

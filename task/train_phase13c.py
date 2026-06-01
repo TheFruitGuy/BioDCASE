@@ -2,11 +2,14 @@
 Phase 13c — capacity & kernel sweep
 ===================================
 
-Same stabilised recipe as 13b (warmup + EMA); the experiment is varying the
-Conformer's capacity. Phase 13 used conv kernel 31 / 4 blocks / d_model 128;
-Miyazaki's DCASE2020 Conformer-SED used conv kernel 7 and 2–10 blocks, so the
-optimum may be elsewhere. Run several configs and pick the best macro_paper as
-the new base for 13d.
+Sweeps the Conformer's capacity on the stabilised recipe (defaults to the 13a
+winner, Schedule-Free RAdam; pass ``--optimizer radam`` to sweep the 13b
+warmup+EMA recipe instead). Phase 13 used conv kernel 31 / 4 blocks / d_model
+128; Miyazaki's DCASE2020 Conformer-SED used conv kernel 7 and 2–10 blocks, so
+the optimum may be elsewhere. Run several configs and take the best macro_paper
+as the new base for 13d.
+
+(Under schedule-free, --ema is auto-disabled since the optimiser already averages.)
 
 Suggested sweep
 ---------------
