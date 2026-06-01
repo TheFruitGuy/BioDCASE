@@ -120,7 +120,7 @@ def main():
         print(f"\n[{i + 1}/{len(args.checkpoints)}] {ckpt}")
         all_prob_dicts.append(get_or_compute_probs(
             ckpt, spec_extractor, val_loader, device,
-            args.cache_dir, no_cache=args.no_cache, use_fp16=args.use_fp16))
+            Path(args.cache_dir), no_cache=args.no_cache, use_fp16=args.use_fp16))
 
     weights = None
     if args.weights:
