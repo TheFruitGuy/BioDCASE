@@ -78,6 +78,20 @@ WIN_LENGTH = 256
 #: STFT hop length in samples (= SAMPLE_RATE * FRAME_STRIDE_S = 5).
 HOP_LENGTH = 5
 
+#: Dual-resolution magnitude input (phase 13-rep experiment). When True the
+#: extractor appends a 4th channel: a magnitude spectrogram from a *shorter*
+#: window (``SHORT_WIN_LENGTH``), same ``N_FFT``/``HOP_LENGTH`` so the (freq,
+#: time) grid is identical and it stacks straight in. The long ~1 s window
+#: keeps the near-stationary tonals (bmabz/bp) sharp; the short window sharpens
+#: D's frequency-modulated downsweep, whose ridge the long window smears.
+#: Frontend channel count flows from ``n_feat_channels()`` so the models build
+#: their filterbank to match automatically.
+DUAL_RESOLUTION = False
+
+#: Short analysis window (samples) for the dual-resolution 4th channel.
+#: 64 @ 250 Hz ~ 256 ms, ~4x finer time resolution than the 1 s main window.
+SHORT_WIN_LENGTH = 64
+
 #: Per-frequency normalisation mode. "demean" subtracts, per frequency bin,
 #: the temporal mean of the complex STFT before magnitude/phase decomposition.
 NORM_FEATURES = "demean"
@@ -278,6 +292,14 @@ SEED = 42
 def n_classes() -> int:
     """Return the number of output classes the model should produce."""
     return 3 if USE_3CLASS else 7
+
+
+def n_feat_channels() -> int:
+    """Number of input feature channels the extractor produces and the model's
+    filterbank must accept: 3 (magnitude, cos-phase, sin-phase), or 4 with
+    ``DUAL_RESOLUTION`` (+ short-window magnitude). Read at model construction,
+    so set ``DUAL_RESOLUTION`` before building the model and the extractor."""
+    return 4 if DUAL_RESOLUTION else 3
 
 
 def class_names() -> list[str]:

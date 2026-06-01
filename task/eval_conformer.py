@@ -173,6 +173,9 @@ def load_conformer(ckpt_path, device):
         return default
 
     cfg.USE_3CLASS = (num_classes == 3)
+    # Match the input channel count the checkpoint was trained with, so the
+    # rebuilt filterbank and the extractor agree (else load/forward mismatch).
+    cfg.DUAL_RESOLUTION = bool(a.get("dual_res", False))
     common = dict(
         num_classes=num_classes, d_model=d_model,
         nhead=pick("nhead", default=4),

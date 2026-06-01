@@ -65,8 +65,12 @@ class WhaleVAD(nn.Module):
     layer exists; the training entry point handles this automatically.
     """
 
-    def __init__(self, num_classes: int = 7, feat_channels: int = 3):
+    def __init__(self, num_classes: int = 7, feat_channels: int | None = None):
         super().__init__()
+        # Default the input channel count to the extractor's (3, or 4 with
+        # dual-resolution) so the filterbank always matches the spectrogram.
+        if feat_channels is None:
+            feat_channels = cfg.n_feat_channels()
 
         # 1. Learnable filterbank: a (7, 1) kernel over frequency, stride 3,
         #    compressing spectral resolution while keeping all time frames.

@@ -224,7 +224,7 @@ class WhaleVAD_Conformer(nn.Module):
     def __init__(
         self,
         num_classes: int = 7,
-        feat_channels: int = 3,
+        feat_channels: int | None = None,
         d_model: int = 128,
         nhead: int = 4,
         num_layers: int = 4,

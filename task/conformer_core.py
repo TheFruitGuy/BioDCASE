@@ -65,6 +65,9 @@ def add_arch_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
                    help="3-class direct (default, your better setting) or 7-class.")
     p.add_argument("--wandb-mode", default="online",
                    choices=["online", "offline", "disabled"])
+    p.add_argument("--dual-res", action="store_true",
+                   help="Append a short-window magnitude channel (4-ch input); "
+                        "sharpens the D-call downsweep. Off = the 3-ch baseline.")
     return p
 
 
@@ -272,6 +275,11 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
         seed_everything, seeded_dataloader_kwargs, compute_pos_weight,
         validate, resample_negatives_for_epoch,
     )
+
+    # Dual-resolution input is a global feature flag: set it before building the
+    # model or ANY spectrogram extractor so the filterbank's in-channels and the
+    # extractor's output channels stay consistent everywhere downstream.
+    cfg.DUAL_RESOLUTION = bool(getattr(arch_kwargs, "dual_res", False))
 
     seed = seed_everything(seed, deterministic=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
