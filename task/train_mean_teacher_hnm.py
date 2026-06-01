@@ -35,7 +35,7 @@ Usage
                          runs/hardnegs/bmabz_<source>.json \\
         --isolate_classes \\
         --aadc-root ~/BioDCASE/task/data_pretrain/audio \\
-        --aadc-sites Casey2018 DDU2018 DDU2019 Kerguelen2018 Kerguelen2019 \\
+        --aadc-sites Casey2018 DDU2018 Kerguelen2018 Kerguelen2021 Kerguelen2023 \\
         --epochs 20 \\
         --lr 1e-5 \\
         --lambda-max 1.0 --lambda-ramp-epochs 3 \\
@@ -107,7 +107,7 @@ from mean_teacher_core import (
 # Quarantine
 # ======================================================================
 
-_TEST_SET_SITES = {"kerguelen2020", "ddu2021"}
+_TEST_SET_SITES = {"ddu2019", "ddu2021", "kerguelen2019", "kerguelen2020"}
 
 
 def quarantine_check(sites: list[str]) -> None:

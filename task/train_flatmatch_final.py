@@ -157,10 +157,13 @@ LAMBDA_RAMP_EPOCHS = 3
 
 
 def quarantine_check(aadc_sites):
-    overlap = set(aadc_sites) & set(cfg.VAL_DATASETS)
+    forbidden = ({s.lower() for s in cfg.VAL_DATASETS}
+                 | {s.lower() for s in cfg.TEST_DATASETS})
+    overlap = sorted(s for s in aadc_sites if s.lower() in forbidden)
     if overlap:
-        raise SystemExit(f"AADC unlabeled sites overlap VAL sites {sorted(overlap)} "
-                         f"— refusing to leak val data into the unlabeled stream.")
+        raise SystemExit(f"AADC unlabeled sites overlap held-out VAL/TEST sites "
+                         f"{overlap} — refusing to leak held-out data into the "
+                         f"unlabeled stream.")
 
 
 # ======================================================================

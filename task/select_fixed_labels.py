@@ -33,7 +33,7 @@ Usage
     CUDA_VISIBLE_DEVICES=0 python select_fixed_labels.py \\
         --checkpoint runs/final_3c_s42_20260527_200054/paper_best.pt \\
         --aadc-root /home/matthias-nagl/BioDCASE/task/data_pretrain/audio \\
-        --aadc-sites Casey2018 DDU2018 DDU2019 Kerguelen2018 Kerguelen2019 \\
+        --aadc-sites Casey2018 DDU2018 Kerguelen2018 Kerguelen2021 Kerguelen2023 \\
         --n-fix-per-class 200 --sample-clips 5000 \\
         --out runs/fixed_labels/fixed_3c_s42.npz
 """
@@ -55,9 +55,13 @@ from ssl_dataset_final import build_pretrain_manifest, SSLClipDataset, collate_s
 
 
 def quarantine_check(aadc_sites):
-    overlap = set(aadc_sites) & set(cfg.VAL_DATASETS)
+    forbidden = ({s.lower() for s in cfg.VAL_DATASETS}
+                 | {s.lower() for s in cfg.TEST_DATASETS})
+    overlap = sorted(s for s in aadc_sites if s.lower() in forbidden)
     if overlap:
-        raise SystemExit(f"AADC sites overlap VAL sites {sorted(overlap)} — refusing.")
+        raise SystemExit(f"AADC unlabeled sites overlap held-out VAL/TEST sites "
+                         f"{overlap} — refusing to leak held-out data into the "
+                         f"unlabeled stream.")
 
 
 def parse_args():

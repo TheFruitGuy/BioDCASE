@@ -40,9 +40,9 @@ eval_verifier macro-F1 on the val candidates.
 
 AADC data
 ---------
-Forward --aadc-root + --aadc-sites to every run (SAFE sites only: Casey2018
-Scott2019 Prydz2013 — the trainer hard-fails on the quarantined Kerguelen2020 /
-DDU2021). --dry-run works without them.
+Forward --aadc-root + --aadc-sites to every run (SAFE sites only: Casey2018 DDU2018
+Kerguelen2018 Kerguelen2021 Kerguelen2023 — the trainer hard-fails on the
+quarantined eval set (ddu2019/ddu2021/kerguelen2019/kerguelen2020)). --dry-run works without them.
 
 Usage
 -----
@@ -56,19 +56,19 @@ Usage
 
     # smoke A3 on one seed
     CUDA_VISIBLE_DEVICES=3 python launch_mt_3c_ablation.py \
-        --arms A3 --seeds 42 --aadc-root /data/aadc --aadc-sites Casey2018 Scott2019 Prydz2013
+        --arms A3 --seeds 42 --aadc-root /data/aadc --aadc-sites Casey2018 DDU2018 Kerguelen2018 Kerguelen2021 Kerguelen2023
 
     # A3-vs-A4 head-to-head on one seed (A4 needs the verifier)
     CUDA_VISIBLE_DEVICES=3,4 python launch_mt_3c_ablation.py \
         --arms A3 A4 --seeds 42 \
         --verifier-checkpoint runs_verifier/<best>/best.pt \
-        --aadc-root /data/aadc --aadc-sites Casey2018 Scott2019 Prydz2013
+        --aadc-root /data/aadc --aadc-sites Casey2018 DDU2018 Kerguelen2018 Kerguelen2021 Kerguelen2023
 
     # full ladder on the winner across 5 seeds (drop A4 if the gate didn't help)
     CUDA_VISIBLE_DEVICES=3,4,8,9 python launch_mt_3c_ablation.py \
         --arms A1 A2 A3 A4 \
         --verifier-checkpoint runs_verifier/<best>/best.pt \
-        --aadc-root /data/aadc --aadc-sites Casey2018 Scott2019 Prydz2013
+        --aadc-root /data/aadc --aadc-sites Casey2018 DDU2018 Kerguelen2018 Kerguelen2021 Kerguelen2023
 """
 
 from __future__ import annotations
@@ -205,7 +205,7 @@ def parse_args():
     p.add_argument("--aadc-root", default=None,
                    help="Root dir of AADC unlabeled audio (forwarded to every run).")
     p.add_argument("--aadc-sites", nargs="+", default=None,
-                   help="SAFE AADC sites only (forwarded). Casey2018 Scott2019 Prydz2013.")
+                   help="SAFE AADC sites only (forwarded). Casey2018 DDU2018 Kerguelen2018 Kerguelen2021 Kerguelen2023.")
     p.add_argument("--skip-existing", action="store_true",
                    help="Skip runs whose <out-dir>/<run-name>/best_model.pt exists.")
     p.add_argument("--logdir", default="runs/mtE_logs")

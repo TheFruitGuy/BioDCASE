@@ -61,19 +61,19 @@ Usage
     CUDA_VISIBLE_DEVICES=3 python launch_flatmatch_3c_frombase.py \
         --seeds 42 --sources ens \
         --aadc-root /home/matthias-nagl/BioDCASE/task/data_pretrain/audio \
-        --aadc-sites Casey2018 DDU2018 DDU2019 Kerguelen2018 Kerguelen2019
+        --aadc-sites Casey2018 DDU2018 Kerguelen2018 Kerguelen2021 Kerguelen2023
 
     # full 10 across four GPUs, once the pilot looks sane:
     CUDA_VISIBLE_DEVICES=3,4,8,9 python launch_flatmatch_3c_frombase.py \
         --aadc-root /home/matthias-nagl/BioDCASE/task/data_pretrain/audio \
-        --aadc-sites Casey2018 DDU2018 DDU2019 Kerguelen2018 Kerguelen2019 \
+        --aadc-sites Casey2018 DDU2018 Kerguelen2018 Kerguelen2021 Kerguelen2023 \
         --skip-existing
 
     # full 10 on a pool of ~11 GB cards (effective batch still 32):
     CUDA_VISIBLE_DEVICES=10,11,12,13 python launch_flatmatch_3c_frombase.py \
         --grad-accum-steps 2 \
         --aadc-root /home/matthias-nagl/BioDCASE/task/data_pretrain/audio \
-        --aadc-sites Casey2018 DDU2018 DDU2019 Kerguelen2018 Kerguelen2019 \
+        --aadc-sites Casey2018 DDU2018 Kerguelen2018 Kerguelen2021 Kerguelen2023 \
         --skip-existing
 """
 

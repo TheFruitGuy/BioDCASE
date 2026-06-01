@@ -60,6 +60,17 @@ VAL_DATASETS = [
 ]
 
 
+#: Held-out challenge eval/test sites (revised 2026 set). NEVER used for
+#: training or as unlabeled AADC pretraining data — the quarantine checks
+#: reject any AADC site matching one of these (case-insensitive).
+TEST_DATASETS = [
+    "ddu2019",
+    "ddu2021",
+    "kerguelen2019",
+    "kerguelen2020",
+]
+
+
 # ======================================================================
 # Audio and spectrogram parameters
 # ======================================================================
