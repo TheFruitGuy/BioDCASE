@@ -78,6 +78,12 @@ CKPT_DIR_3C = {
 # bio cu118 build. Warned about if passed via --gpus. Harmless on other boxes.
 BLACKWELL_GPUS = {2, 7}
 
+# Default GPU pool: honour a CUDA_VISIBLE_DEVICES prepended at launch so the user
+# stays flexible (e.g. CUDA_VISIBLE_DEVICES=0,1,3,4,6); fall back to rk10's free
+# L40S (3,4) + A6000 (8,9) only if nothing was set. Each child is still pinned to
+# one physical id via its own CUDA_VISIBLE_DEVICES, so these are absolute ids.
+DEFAULT_GPUS = os.environ.get("CUDA_VISIBLE_DEVICES") or "3,4,8,9"
+
 
 def enumerate_jobs(runs_root, hn_root, ckpt_name, seeds, sources, consistencies, pgi):
     head = "3class"
@@ -134,8 +140,9 @@ def parse_args():
                    help="Base-model checkpoint filename to warm-start from.")
     p.add_argument("--out-dir", default="runs",
                    help="Where the MT trainer writes run dirs.")
-    p.add_argument("--gpus", default="3,4,8,9",
-                   help="Comma-separated GPU ids (default = rk10's free L40S+A6000).")
+    p.add_argument("--gpus", default=DEFAULT_GPUS,
+                   help="Comma-separated physical GPU ids. Defaults to "
+                        "CUDA_VISIBLE_DEVICES if set at launch, else 3,4,8,9.")
     p.add_argument("--val-workers", type=int, default=0,
                    help="Threshold-sweep workers per run (0 = auto: cores//n_gpus, "
                         "capped at 13).")
