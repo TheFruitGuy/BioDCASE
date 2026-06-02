@@ -39,10 +39,20 @@ Usage
 
 from __future__ import annotations
 
+import os
+# Parallelism is at the RUN level (many runs scored at once), so each worker must
+# stay single-threaded — otherwise N run-workers each spawn a BLAS thread pool and
+# oversubscribe the cores. Must be set before numpy is imported.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import argparse
 import csv as _csv
+import multiprocessing as mp
 import re
 import statistics
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 
 import numpy as np
@@ -78,6 +88,12 @@ def load_member(run_dir: Path):
     return None
 
 
+def has_posteriors(run_dir: Path) -> bool:
+    """Cheap finished-check: does either posteriors file exist (no load)?"""
+    return any((run_dir / n).exists()
+               for n in ("best_posteriors.npz", "paper_best_posteriors.npz"))
+
+
 def rekey(members: list[dict]) -> dict:
     """Mean posteriors across members, re-keyed {(ds,fn,0): (T,3)} for the metric path."""
     keys = set(members[0])
@@ -98,6 +114,22 @@ def score(members: list[dict], gt_events, workers):
     thr = tune_thresholds(probs, gt_events, workers)
     metrics = evaluate(probs, gt_events, thr)
     return paper_f1(metrics), per_class_block(metrics), np.asarray(thr, dtype=np.float64)
+
+
+# Set in main() before the worker pool is forked; workers inherit it via fork
+# copy-on-write, so the val ground-truth is never pickled per task.
+_GT = None
+
+
+def _score_payload(payload):
+    """Worker: score one run (or one stage ensemble) by tuning its thresholds.
+
+    workers=1 -> tune_thresholds takes its sequential (no-fork) branch, so this
+    never nests a pool inside the run-level pool.
+    """
+    kind, key, members = payload
+    f1, pc, thr = score(members, _GT, 1)
+    return kind, key, f1, pc, thr
 
 
 def seed_of(name: str):
@@ -155,8 +187,17 @@ def parse_args():
     p.add_argument("--fm-glob", default="fmfb_*")
     p.add_argument("--seeds", type=int, nargs="+", default=DEFAULT_SEEDS,
                    help="Seeds expected per stage; absent ones are reported MISSING.")
-    p.add_argument("--val-workers", type=int, default=13)
+    p.add_argument("--jobs", type=int, default=None,
+                   help="How many runs to score at once; each tunes sequentially. "
+                        "Default = min(#finished jobs, CPU cores). "
+                        "Set 1 for serial scoring (then --val-workers parallelises one sweep).")
+    p.add_argument("--val-workers", type=int, default=13,
+                   help="Workers for ONE run's threshold sweep; only used when --jobs 1. "
+                        "In parallel mode each run tunes single-threaded.")
     p.add_argument("--csv", default=None, help="Write the full per-model table here.")
+    p.add_argument("--dry-run", action="store_true",
+                   help="Only print RUN STATUS (which runs are found / in-progress / "
+                        "MISSING) and exit — no scoring, no GT build, instant.")
     return p.parse_args()
 
 
@@ -165,21 +206,18 @@ def main():
     rr = args.runs_root
     seeds = args.seeds
 
-    print("Building val ground-truth events ...")
-    val_anns = load_annotations(list(cfg.VAL_DATASETS))
-    val_manifest = get_file_manifest(list(cfg.VAL_DATASETS))
-    val_fsd = {(r["dataset"], r["filename"]): r["start_dt"]
-               for _, r in val_manifest.iterrows()}
-    gt = build_gt_events(val_anns, val_fsd)
-
     def discover(glob_pat, stage_tag=None):
         out = []
         for d in sorted(rr.glob(glob_pat)):
             if not d.is_dir():
                 continue
-            m = load_member(d)
-            out.append({"name": d.name, "seed": seed_of(d.name), "src": src_of(d.name),
-                        "members": m, "finished": m is not None, "stage": stage_tag})
+            if args.dry_run:                      # existence only: no npz load, no GT
+                out.append({"name": d.name, "seed": seed_of(d.name), "src": src_of(d.name),
+                            "members": None, "finished": has_posteriors(d), "stage": stage_tag})
+            else:
+                m = load_member(d)
+                out.append({"name": d.name, "seed": seed_of(d.name), "src": src_of(d.name),
+                            "members": m, "finished": m is not None, "stage": stage_tag})
         return out
 
     print("Discovering runs (base / HNM / MT / FlatMatch) ...")
@@ -194,11 +232,6 @@ def main():
 
     stages = [("base", base), ("HNM", hnm), ("MT", mt)] + \
              [(v, fm[v]) for v in FM_VARIANTS]
-
-    # ---- score finished runs only (progress + ETA) -----------------
-    all_fin = [r for _tag, rows in stages for r in fin(rows)]
-    for r in tqdm(all_fin, desc="scoring runs", unit="run"):
-        r["f1"], r["pc"], r["thr"] = score([r["members"]], gt, args.val_workers)
 
     # ---- run status (finished / in-progress / MISSING) -------------
     print("\n" + "=" * 96)
@@ -218,6 +251,56 @@ def main():
         if missing:
             line += f"  | MISSING: {', '.join('s'+str(s) for s in missing)}"
         print(line)
+
+    if args.dry_run:
+        n_done = sum(len(fin(rows)) for _t, rows in stages)
+        print(f"\n[dry-run] {n_done} finished run(s) found — these are what the full run "
+              f"would score. Drop --dry-run to build GT and score the ladder.")
+        return
+
+    print("\nBuilding val ground-truth events ...")
+    val_anns = load_annotations(list(cfg.VAL_DATASETS))
+    val_manifest = get_file_manifest(list(cfg.VAL_DATASETS))
+    val_fsd = {(r["dataset"], r["filename"]): r["start_dt"]
+               for _, r in val_manifest.iterrows()}
+    gt = build_gt_events(val_anns, val_fsd)
+
+    # ---- score every finished run + every stage ensemble, in parallel ----
+    # Each job tunes its own thresholds sequentially (workers=1 -> no nested
+    # fork); we run many at once instead. The stage ensembles ride along in the
+    # same pool, so they cost nothing extra.
+    global _GT
+    _GT = gt                                    # forked into workers; not pickled per task
+
+    all_fin = [r for _tag, rows in stages for r in fin(rows)]
+    ens_jobs = [(tag, fin(rows)) for tag, rows in stages if fin(rows)]
+    payloads = [("run", i, [r["members"]]) for i, r in enumerate(all_fin)]
+    payloads += [("ens", tag, [r["members"] for r in rfin]) for tag, rfin in ens_jobs]
+
+    n_cpu = os.cpu_count() or 1
+    jobs = args.jobs if (args.jobs and args.jobs > 0) else min(len(payloads), n_cpu)
+    print(f"\nScoring {len(all_fin)} runs + {len(ens_jobs)} ensembles "
+          f"= {len(payloads)} jobs across {jobs} workers ({n_cpu} cores) ...")
+
+    ens_score = {}
+    if jobs <= 1:
+        for kind, key, members in tqdm(payloads, desc="scoring", unit="job"):
+            f1, pc, thr = score(members, gt, args.val_workers)
+            if kind == "run":
+                all_fin[key]["f1"], all_fin[key]["pc"], all_fin[key]["thr"] = f1, pc, thr
+            else:
+                ens_score[key] = (f1, pc, thr)
+    else:
+        ctx = mp.get_context("fork")
+        with ProcessPoolExecutor(max_workers=jobs, mp_context=ctx) as pool:
+            futs = [pool.submit(_score_payload, p) for p in payloads]
+            for fut in tqdm(as_completed(futs), total=len(futs),
+                            desc="scoring", unit="job"):
+                kind, key, f1, pc, thr = fut.result()
+                if kind == "run":
+                    all_fin[key]["f1"], all_fin[key]["pc"], all_fin[key]["thr"] = f1, pc, thr
+                else:
+                    ens_score[key] = (f1, pc, thr)
 
     base_by_seed = {r["seed"]: r for r in fin(base)}
     mt_by = {(r["seed"], r["src"]): r for r in fin(mt)}
@@ -247,11 +330,7 @@ def main():
                   f"{pc['bmabz']['f1']:6.3f} {pc['d']['f1']:6.3f} {pc['bp']['f1']:6.3f} "
                   f"{db:>8} {dm:>8}")
 
-    # ---- ensembles per stage (finished runs only; progress + ETA) --
-    ens_score = {}
-    ens_jobs = [(tag, fin(rows)) for tag, rows in stages if fin(rows)]
-    for tag, rfin in tqdm(ens_jobs, desc="scoring ensembles", unit="stage"):
-        ens_score[tag] = score([r["members"] for r in rfin], gt, args.val_workers)
+    # (stage ensembles were already scored above, in the same parallel pool)
 
     print("\n" + "=" * 96)
     print("STAGE LADDER  (per-class columns = uniform-ENSEMBLE per-class F1, finished runs)")
