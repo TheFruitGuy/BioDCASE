@@ -211,6 +211,8 @@ def main():
         for d in sorted(rr.glob(glob_pat)):
             if not d.is_dir():
                 continue
+            if seed_of(d.name) is None:           # not a run dir (e.g. fmfb_logs)
+                continue
             if args.dry_run:                      # existence only: no npz load, no GT
                 out.append({"name": d.name, "seed": seed_of(d.name), "src": src_of(d.name),
                             "members": None, "finished": has_posteriors(d), "stage": stage_tag})
@@ -400,8 +402,8 @@ def main():
                                + [f"{t:.3f}" for t in r["thr"]])
             for tag, _rows in stages:
                 if tag in ens_score:
-                    mp, pc, thr = ens_score[tag]
-                    w.writerow([tag, f"{tag}_ENSEMBLE", "", "uniform", f"{mp:.4f}"]
+                    emf1, pc, thr = ens_score[tag]
+                    w.writerow([tag, f"{tag}_ENSEMBLE", "", "uniform", f"{emf1:.4f}"]
                                + [f"{pc[c]['f1']:.4f}" for c in C3]
                                + [f"{pc[c][k]:.4f}" for c in C3 for k in ("precision", "recall")]
                                + [f"{t:.3f}" for t in thr])
