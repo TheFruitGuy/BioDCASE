@@ -46,6 +46,7 @@ import statistics
 from pathlib import Path
 
 import numpy as np
+from tqdm import tqdm
 
 import config_final as cfg
 cfg.USE_3CLASS = True
@@ -194,11 +195,10 @@ def main():
     stages = [("base", base), ("HNM", hnm), ("MT", mt)] + \
              [(v, fm[v]) for v in FM_VARIANTS]
 
-    # ---- score finished runs only ----------------------------------
-    for _tag, rows in stages:
-        for r in fin(rows):
-            mp, pc, thr = score([r["members"]], gt, args.val_workers)
-            r["f1"], r["pc"], r["thr"] = mp, pc, thr
+    # ---- score finished runs only (progress + ETA) -----------------
+    all_fin = [r for _tag, rows in stages for r in fin(rows)]
+    for r in tqdm(all_fin, desc="scoring runs", unit="run"):
+        r["f1"], r["pc"], r["thr"] = score([r["members"]], gt, args.val_workers)
 
     # ---- run status (finished / in-progress / MISSING) -------------
     print("\n" + "=" * 96)
@@ -247,12 +247,11 @@ def main():
                   f"{pc['bmabz']['f1']:6.3f} {pc['d']['f1']:6.3f} {pc['bp']['f1']:6.3f} "
                   f"{db:>8} {dm:>8}")
 
-    # ---- ensembles per stage (finished runs only) ------------------
+    # ---- ensembles per stage (finished runs only; progress + ETA) --
     ens_score = {}
-    for tag, rows in stages:
-        rfin = fin(rows)
-        if rfin:
-            ens_score[tag] = score([r["members"] for r in rfin], gt, args.val_workers)
+    ens_jobs = [(tag, fin(rows)) for tag, rows in stages if fin(rows)]
+    for tag, rfin in tqdm(ens_jobs, desc="scoring ensembles", unit="stage"):
+        ens_score[tag] = score([r["members"] for r in rfin], gt, args.val_workers)
 
     print("\n" + "=" * 96)
     print("STAGE LADDER  (per-class columns = uniform-ENSEMBLE per-class F1, finished runs)")
