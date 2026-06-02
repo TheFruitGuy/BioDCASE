@@ -68,6 +68,18 @@ def add_arch_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
     p.add_argument("--dual-res", action="store_true",
                    help="Append a short-window magnitude channel (4-ch input); "
                         "sharpens the D-call downsweep. Off = the 3-ch baseline.")
+    p.add_argument("--ema", action="store_true",
+                   help="EMA weight averaging (DESED-standard stabiliser): the "
+                        "averaged weights are validated and checkpointed. Averages "
+                        "over the per-epoch negative-resampling noise.")
+    p.add_argument("--filteraug", action="store_true",
+                   help="FilterAugment + frequency warping (phase 13f): "
+                        "frequency-only augmentation on the magnitude channels; "
+                        "leaves phase and the time axis (call structure) untouched.")
+    p.add_argument("--fa-db", type=float, default=4.5,
+                   help="FilterAugment max per-band gain in dB (default +/-4.5).")
+    p.add_argument("--no-freq-warp", action="store_true",
+                   help="With --filteraug, disable the frequency-warp component.")
     return p
 
 
@@ -280,6 +292,17 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
     # model or ANY spectrogram extractor so the filterbank's in-channels and the
     # extractor's output channels stay consistent everywhere downstream.
     cfg.DUAL_RESOLUTION = bool(getattr(arch_kwargs, "dual_res", False))
+
+    # EMA + FilterAugment can be driven by the shared add_arch_args flags so any
+    # rung enables them without bespoke wiring; an explicitly-passed value wins.
+    use_ema = bool(use_ema or getattr(arch_kwargs, "ema", False))
+    ema_decay = float(getattr(arch_kwargs, "ema_decay", ema_decay))
+    if augment_fn is None and getattr(arch_kwargs, "filteraug", False):
+        from filter_augment import build_spec_augment
+        augment_fn = build_spec_augment(
+            db_range=getattr(arch_kwargs, "fa_db", 4.5),
+            freq_warp=not getattr(arch_kwargs, "no_freq_warp", False),
+        )
 
     seed = seed_everything(seed, deterministic=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
