@@ -342,30 +342,27 @@ def main():
     for tag, rows in stages:
         rfin = fin(rows)
         if not rfin:
-            print(f"{tag:12} {'0':>3}  (none finished)")
-            continue
+            continue                              # show only stages with finished runs
         f1v = [r["f1"] for r in rfin]
         emp, epc, _ = ens_score[tag]
         print(f"{tag:12} {len(rfin):>3} {pm(f1v):>18} {max(f1v):7.4f} "
               f"{emp:9.4f} {epc['bmabz']['f1']:7.3f} {epc['d']['f1']:7.3f} "
               f"{epc['bp']['f1']:7.3f}")
 
-    # ---- deltas ----------------------------------------------------
-    def edelta(a, b):
-        ea, eb = ens_score.get(a), ens_score.get(b)
-        return f"{ea[0]-eb[0]:+.4f}" if (ea and eb) else "  --"
-
+    # ---- deltas (only pairs where both stages have finished runs) ---
     print("\n" + "-" * 96)
-    print("DELTAS  (ensemble paper-F1; only pairs where both stages have finished runs)")
+    print("DELTAS  (ensemble paper-F1)")
     print("-" * 96)
-    print(f"  HNM − base          {edelta('HNM','base')}")
-    print(f"  MT  − base          {edelta('MT','base')}")
-    print(f"  MT  − HNM           {edelta('MT','HNM')}")
-    print(f"  FM-vanilla  − MT    {edelta('FM-vanilla','MT')}")
-    print(f"  FM-fixlabel − MT    {edelta('FM-fixlabel','MT')}   <- does Fix-label beat MT?")
-    print(f"  FM-stack    − MT    {edelta('FM-stack','MT')}   <- does the stack beat MT?")
-    print(f"  FM-fixlabel − FM-vanilla   {edelta('FM-fixlabel','FM-vanilla')}")
-    print(f"  FM-stack    − FM-fixlabel  {edelta('FM-stack','FM-fixlabel')}")
+    notes = {("FM-fixlabel", "MT"): "   <- does Fix-label beat MT?",
+             ("FM-stack", "MT"): "   <- does the stack beat MT?"}
+    pairs = [("HNM", "base"), ("MT", "base"), ("MT", "HNM"),
+             ("FM-vanilla", "MT"), ("FM-fixlabel", "MT"), ("FM-stack", "MT"),
+             ("FM-fixlabel", "FM-vanilla"), ("FM-stack", "FM-fixlabel")]
+    for a, b in pairs:
+        ea, eb = ens_score.get(a), ens_score.get(b)
+        if not (ea and eb):
+            continue
+        print(f"  {a + ' − ' + b:26} {ea[0] - eb[0]:+.4f}{notes.get((a, b), '')}")
 
     # per-class ensemble progression for the key stages that exist
     prog = [t for t in ("base", "HNM", "MT", "FM-fixlabel", "FM-stack") if t in ens_score]
