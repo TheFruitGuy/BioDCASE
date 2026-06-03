@@ -824,6 +824,30 @@ PHASE_REGISTRY: dict[str, dict] = {
         interventions=["filteraugment_freqwarp"],
     ),
 
+    "13g": dict(
+        parent="13d",
+        hypothesis=(
+            "EMA weight averaging on the FDY stem (single-axis split of 13f). "
+            "Isolates the EMA half: keep an EMA of the weights (decay ~0.999) and "
+            "evaluate/checkpoint the averaged model, smoothing the noisy per-epoch "
+            "negative-resampling val trajectory. Expected to hold FDY-alone's 0.43 or "
+            "lift the floor; the keep-or-drop control for EMA before stacking further."
+        ),
+        interventions=["ema_weights"],
+    ),
+    "13h": dict(
+        parent="13d",
+        hypothesis=(
+            "FilterAugment + frequency warping on the FDY stem (single-axis split of "
+            "13f) -- the suspected cause of 13f's regression. BMABZ are narrowband "
+            "tonals (~18-28 Hz); random per-band gains can attenuate the call's own "
+            "band. Tests FilterAugment in isolation; if it reproduces the BMABZ "
+            "precision collapse at equal recall it is mismatched to the narrowband "
+            "regime and dropped."
+        ),
+        interventions=["filteraugment_freqwarp"],
+    ),
+
 }
 
 
