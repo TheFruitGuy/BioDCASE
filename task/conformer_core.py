@@ -80,6 +80,10 @@ def add_arch_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
                    help="FilterAugment max per-band gain in dB (default +/-4.5).")
     p.add_argument("--no-freq-warp", action="store_true",
                    help="With --filteraug, disable the frequency-warp component.")
+    p.add_argument("--amp", action="store_true",
+                   help="bf16 autocast on the model forward (the STFT stays fp32). "
+                        "Halves activation memory so 60 s segments fit at batch 32, "
+                        "and speeds training; bf16 needs no GradScaler. Off = fp32.")
     return p
 
 
@@ -215,7 +219,7 @@ def build_optim_sched(model: nn.Module, opt_kwargs: dict,
 # ======================================================================
 
 def _train_epoch(model, spec_extractor, loader, criterion, optimizer,
-                 scheduler, device, ema=None, augment_fn=None):
+                 scheduler, device, ema=None, augment_fn=None, amp=False):
     from tqdm import tqdm
 
     model.train()
@@ -229,13 +233,14 @@ def _train_epoch(model, spec_extractor, loader, criterion, optimizer,
         if augment_fn is not None:
             spec = augment_fn(spec)
 
-        logits = model(spec, key_padding_mask=~mask.bool())
-        T = min(logits.size(1), targets.size(1))
-        logits, targets_t, mask_t = logits[:, :T], targets[:, :T], mask[:, :T]
+        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=amp):
+            logits = model(spec, key_padding_mask=~mask.bool())
+            T = min(logits.size(1), targets.size(1))
+            logits, targets_t, mask_t = logits[:, :T], targets[:, :T], mask[:, :T]
 
-        valid = mask_t.unsqueeze(-1).float()
-        per_frame = criterion(logits, targets_t) * valid
-        loss = per_frame.sum() / (valid.sum() * targets_t.size(-1)).clamp(min=1.0)
+            valid = mask_t.unsqueeze(-1).float()
+            per_frame = criterion(logits, targets_t) * valid
+            loss = per_frame.sum() / (valid.sum() * targets_t.size(-1)).clamp(min=1.0)
 
         optimizer.zero_grad()
         loss.backward()
@@ -303,11 +308,12 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
             db_range=getattr(arch_kwargs, "fa_db", 4.5),
             freq_warp=not getattr(arch_kwargs, "no_freq_warp", False),
         )
+    amp = bool(getattr(arch_kwargs, "amp", False))
 
     seed = seed_everything(seed, deterministic=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[phase {phase}] device={device}  head={cfg.n_classes()}-class  "
-          f"ema={use_ema}  opt={opt_kwargs}")
+          f"ema={use_ema}  amp={amp}  opt={opt_kwargs}")
 
     train_sites = list(cfg.TRAIN_DATASETS)
     val_sites = list(cfg.VAL_DATASETS)
@@ -385,7 +391,7 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
         if is_sf:
             optimizer.train()                 # gradient-evaluation point
         train_loss = _train_epoch(model, spec_extractor, train_loader, criterion,
-                                  optimizer, scheduler, device, ema, augment_fn)
+                                  optimizer, scheduler, device, ema, augment_fn, amp)
 
         # Switch to the weights we select/checkpoint on: the schedule-free
         # averaged iterate, or the EMA shadow (these are mutually exclusive).

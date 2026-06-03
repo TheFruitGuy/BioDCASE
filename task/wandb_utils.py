@@ -848,6 +848,29 @@ PHASE_REGISTRY: dict[str, dict] = {
         interventions=["filteraugment_freqwarp"],
     ),
 
+    "13i": dict(
+        parent="13d",
+        hypothesis=(
+            "Longer training segments on the FDY stem. 30 -> 60 s training windows "
+            "(eval window unchanged), giving the temporal model the context the call "
+            "grammar needs -- a blue-whale Z-call is ~20 s, so a full BMABZ unit "
+            "sequence barely fits in 30 s. WhaleVAD's 0.440 used long segments and "
+            "60 s eval tiles already beat 30 s here. bf16 AMP keeps batch at 32."
+        ),
+        interventions=["segment_len_60s"],
+    ),
+    "13j": dict(
+        parent="13d",
+        hypothesis=(
+            "Larger-batch recipe on the FDY stem (30 s). Batch 32 -> 96 with peak_lr "
+            "scaled by the sqrt rule (5e-5 -> 1e-4), since a larger batch at fixed LR "
+            "mostly just cuts updates per epoch. Matches WhaleVAD's 'very large batch' "
+            "and averages over more of the per-epoch resampling noise. bf16 AMP fits "
+            "batch 96 at 30 s."
+        ),
+        interventions=["large_batch_lr_scaled"],
+    ),
+
 }
 
 
