@@ -870,7 +870,18 @@ PHASE_REGISTRY: dict[str, dict] = {
         ),
         interventions=["large_batch_lr_scaled"],
     ),
-
+    "13k": dict(
+            parent="13d",
+            hypothesis=(
+                "Backbone test: FDY stem on the CNN-BiLSTM, not the Conformer. WhaleVAD "
+                "is a CRNN (nn.LSTM bidirectional; official ATBFL checkpoint loads "
+                "strict=True into it), reproduced at ~0.443 macro_paper, above the "
+                "FDY-Conformer's 0.429 on the same split; Conformers over-smooth in time "
+                "vs CRNNs. Keep 13d's FDY stem + recipe, swap only the sequence model, so "
+                "any movement (esp. D) is the backbone. Expect ~0.46, clearing 0.44."
+            ),
+            interventions=["crnn_backbone"],
+    ),
 }
 
 

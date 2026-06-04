@@ -184,9 +184,21 @@ def load_conformer(ckpt_path, device):
         conv_kernel=pick("conv_kernel", default=31),
         dropout=pick("dropout", default=0.1),
     )
+    # 13k FDY-CRNN checkpoints set backbone="crnn": rebuild the CNN-BiLSTM
+    # (WhaleVAD_FDY), NOT a Conformer. d_model read above (=2*LSTM_HIDDEN) and the
+    # `common` Conformer kwargs do not apply to the CRNN and are ignored here.
+    if a.get("backbone") == "crnn":
+        from model_crnn_fdy import WhaleVAD_FDY
+        model = WhaleVAD_FDY(
+            num_classes=num_classes,
+            feat_channels=cfg.n_feat_channels(),
+            fdy_targets=tuple(a.get("fdy_targets") or ("filterbank", "feat0")),
+            fdy_basis=pick("fdy_basis", default=4),
+            fdy_temp=pick("fdy_temp", default=1.0),
+        ).to(device)
     # FDY checkpoints (phase 13d) carry `fdy_targets` in arch_kwargs and have a
     # different stem; build the matching subclass so the state_dict loads.
-    if a.get("fdy_targets"):
+    elif a.get("fdy_targets"):
         from model_conformer_fdy import WhaleVAD_Conformer_FDY
         model = WhaleVAD_Conformer_FDY(
             fdy_targets=tuple(a["fdy_targets"]),
