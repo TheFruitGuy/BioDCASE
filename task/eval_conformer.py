@@ -219,6 +219,19 @@ def load_conformer(ckpt_path, device):
             tfwse_reduction=pick("tfwse_reduction", default=4),
             **common,
         ).to(device)
+    # 13n carries fdy_targets PLUS pcen_channel and feat_channels=4 (3 STFT + 1
+    # PCEN); rebuild the FDY-Conformer at that channel count (checked BEFORE the
+    # generic fdy branch, since a 13n ckpt has both) and swap in the PCEN
+    # extractor below.
+    elif a.get("pcen_channel"):
+        from model_conformer_fdy import WhaleVAD_Conformer_FDY
+        model = WhaleVAD_Conformer_FDY(
+            fdy_targets=tuple(a.get("fdy_targets") or ("filterbank", "feat0")),
+            fdy_basis=pick("fdy_basis", default=4),
+            fdy_temp=pick("fdy_temp", default=1.0),
+            feat_channels=pick("feat_channels", default=4),
+            **common,
+        ).to(device)
     # FDY checkpoints (phase 13d) carry `fdy_targets` in arch_kwargs and have a
     # different stem; build the matching subclass so the state_dict loads.
     elif a.get("fdy_targets"):
@@ -234,6 +247,9 @@ def load_conformer(ckpt_path, device):
     if a.get("leaf"):
         from model_leaf import LeafPassthrough
         spec = LeafPassthrough().to(device)
+    elif a.get("pcen_channel"):
+        from spectrogram_pcen import PCENChannelExtractor
+        spec = PCENChannelExtractor(smooth=pick("pcen_smooth", default=0.025)).to(device)
     else:
         spec = SpectrogramExtractor().to(device)
     with torch.no_grad():  # materialise the lazy projection before loading
