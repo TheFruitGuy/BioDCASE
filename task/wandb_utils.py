@@ -907,6 +907,17 @@ PHASE_REGISTRY: dict[str, dict] = {
         ),
         interventions=["leaf_frontend"],
     ),
+    "13n": dict(
+        parent="13d",
+        hypothesis=(
+            "PCEN as an EXTRA input channel (not the frontend). Keep 13d's phase-aware "
+            "STFT, append one fixed-PCEN channel on the raw magnitude. PCEN's per-bin "
+            "AGC normalises slow background so weak ~20-100 Hz D downsweeps stand out, "
+            "without throwing away the STFT (unlike LEAF / PCEN-as-frontend, which "
+            "flattened everything and killed D). Target is D recall vs 13d's 0.20 ceiling."
+        ),
+        interventions=["pcen_extra_channel"],
+    ),
 }
 
 
