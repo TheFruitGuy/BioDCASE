@@ -275,7 +275,16 @@ class LEAF(nn.Module):
 
 
 class LeafPassthrough(nn.Module):
-    """spec_extractor that returns the raw waveform (LEAF runs inside the model)."""
+    """spec_extractor that returns the raw waveform (LEAF runs inside the model).
+
+    Exposes ``hop_length`` because the eval/validate frame->time mapping reads
+    it: the LEAF model interpolates its output to the STFT frame count, so the
+    effective hop is cfg.HOP_LENGTH (identical frame->time mapping to the STFT).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.hop_length = cfg.HOP_LENGTH
 
     def forward(self, audio):
         return audio
