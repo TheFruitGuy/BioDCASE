@@ -196,6 +196,17 @@ def load_conformer(ckpt_path, device):
             fdy_basis=pick("fdy_basis", default=4),
             fdy_temp=pick("fdy_temp", default=1.0),
         ).to(device)
+    # 13l adds a tfwSE block after the FDY filterbank; its checkpoint carries
+    # tfwse=True AND fdy_targets, so check tfwse FIRST and build that subclass.
+    elif a.get("tfwse"):
+        from model_tfwse import WhaleVAD_Conformer_FDY_tfwSE
+        model = WhaleVAD_Conformer_FDY_tfwSE(
+            fdy_targets=tuple(a.get("fdy_targets") or ("filterbank", "feat0")),
+            fdy_basis=pick("fdy_basis", default=4),
+            fdy_temp=pick("fdy_temp", default=1.0),
+            tfwse_reduction=pick("tfwse_reduction", default=4),
+            **common,
+        ).to(device)
     # FDY checkpoints (phase 13d) carry `fdy_targets` in arch_kwargs and have a
     # different stem; build the matching subclass so the state_dict loads.
     elif a.get("fdy_targets"):

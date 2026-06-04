@@ -882,6 +882,19 @@ PHASE_REGISTRY: dict[str, dict] = {
             ),
             interventions=["crnn_backbone"],
     ),
+    "13l": dict(
+            parent="13d",
+            hypothesis=(
+                "tfwSE frequency lever for D. 13k showed the backbone is not the gap; "
+                "D stalls at ~0.20 everywhere, diagnosis is a frontend-sensitivity miss. "
+                "Add one time-frame frequency-wise SE (Nam DCASE2023) after the FDY "
+                "filterbank at F=41: squeeze channels, excite frequency, gate per frame "
+                "so the band tracks a D downsweep. +871 params, single axis on 13d. "
+                "Caveats: paper's best is SE+tfwSE (this is tfwSE alone) and it may be "
+                "redundant with FDY. Adopt only on a clear D gain."
+            ),
+            interventions=["tfwse_freq_attention"],
+    ),
 }
 
 
