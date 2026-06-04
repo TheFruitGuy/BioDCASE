@@ -184,10 +184,22 @@ def load_conformer(ckpt_path, device):
         conv_kernel=pick("conv_kernel", default=31),
         dropout=pick("dropout", default=0.1),
     )
+    # 13m LEAF checkpoints set leaf=True and carry NO backbone/tfwse/fdy_targets:
+    # rebuild the LEAF-Conformer (feat_channels forced to 1 inside the model) and
+    # swap the extractor for a raw-audio passthrough below.
+    if a.get("leaf"):
+        from model_leaf import WhaleVAD_Conformer_LEAF
+        model = WhaleVAD_Conformer_LEAF(
+            leaf_n_filters=pick("leaf_n_filters", default=128),
+            leaf_init=pick("leaf_init", default="mel"),
+            leaf_compression=pick("leaf_compression", default="pcen"),
+            leaf_min_freq=pick("leaf_min_freq", default=5.0),
+            **common,
+        ).to(device)
     # 13k FDY-CRNN checkpoints set backbone="crnn": rebuild the CNN-BiLSTM
     # (WhaleVAD_FDY), NOT a Conformer. d_model read above (=2*LSTM_HIDDEN) and the
     # `common` Conformer kwargs do not apply to the CRNN and are ignored here.
-    if a.get("backbone") == "crnn":
+    elif a.get("backbone") == "crnn":
         from model_crnn_fdy import WhaleVAD_FDY
         model = WhaleVAD_FDY(
             num_classes=num_classes,
@@ -219,7 +231,11 @@ def load_conformer(ckpt_path, device):
         ).to(device)
     else:
         model = WhaleVAD_Conformer(**common).to(device)
-    spec = SpectrogramExtractor().to(device)
+    if a.get("leaf"):
+        from model_leaf import LeafPassthrough
+        spec = LeafPassthrough().to(device)
+    else:
+        spec = SpectrogramExtractor().to(device)
     with torch.no_grad():  # materialise the lazy projection before loading
         model(spec(torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)))
     model.load_state_dict(sd)

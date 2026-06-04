@@ -895,6 +895,18 @@ PHASE_REGISTRY: dict[str, dict] = {
             ),
             interventions=["tfwse_freq_attention"],
     ),
+    "13m": dict(
+        parent="13d",
+        hypothesis=(
+            "LEAF (learnable Gabor filterbank + Gaussian lowpass + sPCEN) replaces "
+            "the fixed STFT frontend on the PLAIN Conformer (no FDY). Unlike FDY/"
+            "tfwSE/PCEN-as-frontend, which reweight a fixed STFT, LEAF changes what "
+            "is measured -- the BioDCASE winner's load-bearing frontend. A/B is vs "
+            "the plain Conformer (~0.404) and 13d (0.429/0.419/D 0.204). Gamble flag: "
+            "PCEN-as-frontend already failed (D~0.14) and PCEN's AGC flattens output."
+        ),
+        interventions=["leaf_frontend"],
+    ),
 }
 
 
