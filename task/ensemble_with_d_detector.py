@@ -84,6 +84,7 @@ Notes
 from __future__ import annotations
 
 import argparse
+import pickle
 from pathlib import Path
 from typing import Any
 
@@ -114,6 +115,33 @@ from hybrid_ensemble_predict import save_predictions_csv
 
 
 D_IDX = cfg.CALL_TYPES_3.index("d")  # 1
+
+
+# ----------------------------------------------------------------------
+# Per-checkpoint prob cache (keyed by checkpoint dir name + tile length)
+# ----------------------------------------------------------------------
+# The cache key includes the segment/overlap tile length, unlike
+# ensemble_predict_cached.py whose key is the dir name only. That bug
+# silently mixes 30s and 60s probs; this keeps them in separate files.
+
+def _cache_path(ckpt_path: str, cache_dir: Path, segment_s: float,
+                overlap_s: float, suffix: str) -> Path:
+    name = Path(ckpt_path).parent.name
+    tag = f"s{int(round(segment_s))}_o{int(round(overlap_s))}"
+    return cache_dir / f"{name}__{tag}__{suffix}.pkl"
+
+
+def _load_cache(path: Path) -> dict[tuple, np.ndarray]:
+    with open(path, "rb") as f:
+        d = pickle.load(f)
+    return {k: v.astype(np.float32) for k, v in d.items()}
+
+
+def _save_cache(probs: dict[tuple, np.ndarray], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    d = {k: v.astype(np.float16) for k, v in probs.items()}
+    with open(path, "wb") as f:
+        pickle.dump(d, f, protocol=pickle.HIGHEST_PROTOCOL)
 
 
 # ----------------------------------------------------------------------
@@ -255,13 +283,34 @@ def predict_3class(
     return probs
 
 
+def cached_3class(
+    ckpt_path: str,
+    spec_extractor: SpectrogramExtractor,
+    val_loader: DataLoader,
+    device: torch.device,
+    cache_dir: Path,
+    no_cache: bool,
+    segment_s: float,
+    overlap_s: float,
+) -> dict[tuple, np.ndarray]:
+    """predict_3class with a segment-aware on-disk cache."""
+    cp = _cache_path(ckpt_path, cache_dir, segment_s, overlap_s, "probs3")
+    if not no_cache and cp.exists():
+        print(f"      cache hit: {cp.name}")
+        return _load_cache(cp)
+    probs = predict_3class(ckpt_path, spec_extractor, val_loader, device)
+    if not no_cache:
+        _save_cache(probs, cp)
+    return probs
+
+
 # ----------------------------------------------------------------------
 # Combination
 # ----------------------------------------------------------------------
 
 def combine(
     bp_avg: dict[tuple, np.ndarray],
-    d_avg: dict[tuple, np.ndarray],
+    d_avg: dict[tuple, np.ndarray] | None,
     blend_avg: dict[tuple, np.ndarray] | None,
     d_blend_frac: float,
 ) -> dict[tuple, np.ndarray]:
@@ -269,10 +318,19 @@ def combine(
     Final per-class assembly:
       col 0 (bmabz) <- bp_avg[:, 0]
       col 2 (bp)    <- bp_avg[:, 2]
-      col 1 (d)     <- (1 - f) * d_avg[:, 0] + f * blend_avg[:, D_IDX]
+      col 1 (d)     <- one of:
+                         detector + blend : (1-f)*d_avg[:,0] + f*blend_avg[:,D_IDX]
+                         detector only    : d_avg[:,0]
+                         blend only       : blend_avg[:,D_IDX]
+    At least one of d_avg / blend_avg must be provided.
     Truncates to the shortest T per key across the sources used.
     """
-    keys = set(bp_avg) & set(d_avg)
+    if d_avg is None and blend_avg is None:
+        raise ValueError("combine needs a D source: detector and/or blend.")
+
+    keys = set(bp_avg)
+    if d_avg is not None:
+        keys &= set(d_avg)
     if blend_avg is not None:
         keys &= set(blend_avg)
     dropped = (len(bp_avg) - len(keys))
@@ -282,8 +340,9 @@ def combine(
     out: dict[tuple, np.ndarray] = {}
     for key in keys:
         bp = bp_avg[key]
-        d = d_avg[key]
-        Ts = [bp.shape[0], d.shape[0]]
+        Ts = [bp.shape[0]]
+        if d_avg is not None:
+            Ts.append(d_avg[key].shape[0])
         if blend_avg is not None:
             Ts.append(blend_avg[key].shape[0])
         T = min(Ts)
@@ -292,10 +351,13 @@ def combine(
         combined[:, 0] = bp[:T, 0]
         combined[:, 2] = bp[:T, 2]
 
-        d_col = d[:T, 0]
-        if blend_avg is not None and d_blend_frac > 0:
-            d_col = (1.0 - d_blend_frac) * d_col + d_blend_frac * blend_avg[key][:T, D_IDX]
-        combined[:, 1] = d_col
+        if d_avg is not None and blend_avg is not None:
+            combined[:, 1] = ((1.0 - d_blend_frac) * d_avg[key][:T, 0]
+                              + d_blend_frac * blend_avg[key][:T, D_IDX])
+        elif d_avg is not None:
+            combined[:, 1] = d_avg[key][:T, 0]
+        else:  # blend only
+            combined[:, 1] = blend_avg[key][:T, D_IDX]
         out[key] = combined
     return out
 
@@ -343,9 +405,11 @@ def parse_args() -> argparse.Namespace:
                    help="3-class checkpoints for BMABZ + BP (e.g. your hnm models).")
     p.add_argument("--bp-weights", nargs="+", type=float, default=None,
                    help="Optional weights for --bp-checkpoints. Default: equal.")
-    p.add_argument("--d-detector-checkpoints", nargs="+", required=True,
-                   help="One or more single-class D-detector checkpoints "
-                        "(train_d_detector.py / WhaleVADBPNV2). Averaged if >1.")
+    p.add_argument("--d-detector-checkpoints", nargs="+", default=None,
+                   help="Optional single-class D-detector checkpoint(s) "
+                        "(train_d_detector.py / WhaleVADBPNV2). Averaged if >1. "
+                        "If omitted, D comes from --d-blend-checkpoints alone "
+                        "(your no-detector baseline).")
     p.add_argument("--d-detector-weights", nargs="+", type=float, default=None,
                    help="Optional weights for the D detectors. Default: equal.")
     p.add_argument("--d-blend-checkpoints", nargs="+", default=None,
@@ -369,6 +433,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-csv", type=Path, default=None,
                    help="Write predictions CSV here.")
     p.add_argument("--batch-size", type=int, default=cfg.BATCH_SIZE)
+    p.add_argument("--cache-dir", type=Path, default=Path("runs/prob_cache"),
+                   help="Per-checkpoint prob cache dir (keyed by dir name + tile length).")
+    p.add_argument("--no-cache", action="store_true",
+                   help="Recompute all probs and skip reading/writing the cache.")
     p.add_argument("--per-model-eval", action="store_true",
                    help="Also report each D detector's standalone D-F1.")
     return p.parse_args()
@@ -379,8 +447,14 @@ def main() -> None:
 
     if not (0.0 <= args.d_blend_frac <= 1.0):
         raise SystemExit("--d-blend-frac must be in [0, 1].")
-    if args.d_blend_frac > 0 and not args.d_blend_checkpoints:
-        raise SystemExit("--d-blend-frac > 0 requires --d-blend-checkpoints.")
+    use_detector = bool(args.d_detector_checkpoints)
+    use_blend = bool(args.d_blend_checkpoints)
+    if not use_detector and not use_blend:
+        raise SystemExit("Need a D source: pass --d-detector-checkpoints "
+                         "and/or --d-blend-checkpoints.")
+    if use_detector and not use_blend and args.d_blend_frac > 0:
+        print("  NOTE: no --d-blend-checkpoints, so --d-blend-frac is ignored "
+              "(D from detector alone).")
 
     test_mode = args.test_datasets is not None
     if test_mode:
@@ -432,63 +506,80 @@ def main() -> None:
     bp_dicts = []
     for i, ckpt in enumerate(args.bp_checkpoints):
         print(f"  [{i+1}/{len(args.bp_checkpoints)}] {ckpt}")
-        bp_dicts.append(predict_3class(ckpt, spec_extractor, val_loader, device))
+        bp_dicts.append(cached_3class(
+            ckpt, spec_extractor, val_loader, device,
+            args.cache_dir, args.no_cache, args.segment_s, args.overlap_s))
     bp_w = _normalize(args.bp_weights, len(bp_dicts))
     bp_avg = bp_dicts[0] if len(bp_dicts) == 1 else average_prob_dicts(bp_dicts, weights=bp_w)
 
     # ------------------------------------------------------------------
-    # D source (dedicated detector(s))
+    # D source (optional dedicated detector(s))
     # ------------------------------------------------------------------
-    print(f"\nD source: {len(args.d_detector_checkpoints)} dedicated detector(s)")
-    d_dicts = []
-    for i, ckpt_path in enumerate(args.d_detector_checkpoints):
-        print(f"  [{i+1}/{len(args.d_detector_checkpoints)}] {ckpt_path}")
-        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-        model, kind = build_d_detector(ckpt, device)
-        highpass_hz = float(ckpt.get("highpass_hz", 0.0))
-        target_mode = ckpt.get("target_mode", "merged")
-        print(f"    kind={kind}  target_mode={target_mode}  "
-              f"highpass_hz={highpass_hz:.1f}  trained_segment_s={ckpt.get('segment_s')}")
-        if highpass_hz > 0:
-            print(f"    -> re-applying {highpass_hz:.1f} Hz high-pass to match training")
+    d_avg = None
+    if use_detector:
+        print(f"\nD source: {len(args.d_detector_checkpoints)} dedicated detector(s)")
+        d_dicts = []
+        for i, ckpt_path in enumerate(args.d_detector_checkpoints):
+            print(f"  [{i+1}/{len(args.d_detector_checkpoints)}] {ckpt_path}")
+            dp = _cache_path(ckpt_path, args.cache_dir,
+                             args.segment_s, args.overlap_s, "dstream")
+            if not args.no_cache and dp.exists():
+                print(f"      cache hit: {dp.name}")
+                d_stream = _load_cache(dp)
+            else:
+                ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+                model, kind = build_d_detector(ckpt, device)
+                highpass_hz = float(ckpt.get("highpass_hz", 0.0))
+                target_mode = ckpt.get("target_mode", "merged")
+                print(f"    kind={kind}  target_mode={target_mode}  "
+                      f"highpass_hz={highpass_hz:.1f}  "
+                      f"trained_segment_s={ckpt.get('segment_s')}")
+                if highpass_hz > 0:
+                    print(f"    -> re-applying {highpass_hz:.1f} Hz high-pass to match training")
 
-        with torch.no_grad():
-            dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
-            _ = model(spec_extractor(dummy))   # materialise lazy feat_proj
-        missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        if missing:
-            print(f"    WARNING: {len(missing)} missing keys (showing 3): {missing[:3]}")
-        if unexpected:
-            print(f"    WARNING: {len(unexpected)} unexpected keys (showing 3): {unexpected[:3]}")
+                with torch.no_grad():
+                    dummy = torch.randn(1, cfg.SAMPLE_RATE * 30, device=device)
+                    _ = model(spec_extractor(dummy))   # materialise lazy feat_proj
+                missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+                if missing:
+                    print(f"    WARNING: {len(missing)} missing keys (showing 3): {missing[:3]}")
+                if unexpected:
+                    print(f"    WARNING: {len(unexpected)} unexpected keys (showing 3): {unexpected[:3]}")
 
-        d_stream = predict_d_stream(
-            model, kind, spec_extractor, val_loader, device,
-            highpass_hz=highpass_hz, target_mode=target_mode,
-        )
-        d_dicts.append(d_stream)
+                d_stream = predict_d_stream(
+                    model, kind, spec_extractor, val_loader, device,
+                    highpass_hz=highpass_hz, target_mode=target_mode,
+                )
+                if not args.no_cache:
+                    _save_cache(d_stream, dp)
+                del model
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
-        if args.per_model_eval and not test_mode:
-            f1 = d_only_d_f1(d_stream, gt_events)
-            print(f"    standalone D-F1: {f1:.3f}")
+            d_dicts.append(d_stream)
+            if args.per_model_eval and not test_mode:
+                f1 = d_only_d_f1(d_stream, gt_events)
+                print(f"    standalone D-F1: {f1:.3f}")
 
-        del model
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    d_w = _normalize(args.d_detector_weights, len(d_dicts))
-    d_avg = d_dicts[0] if len(d_dicts) == 1 else average_prob_dicts(d_dicts, weights=d_w)
+        d_w = _normalize(args.d_detector_weights, len(d_dicts))
+        d_avg = d_dicts[0] if len(d_dicts) == 1 else average_prob_dicts(d_dicts, weights=d_w)
 
     # ------------------------------------------------------------------
-    # Optional D-blend source (3-class subset, e.g. mtfb)
+    # Optional D-blend source (3-class subset, e.g. mtfb).
+    # Loaded whenever --d-blend-checkpoints is given: it is the D source
+    # when no detector is present, and the blend partner when one is.
     # ------------------------------------------------------------------
     blend_avg = None
-    if args.d_blend_checkpoints and args.d_blend_frac > 0:
-        print(f"\nD-blend source: {len(args.d_blend_checkpoints)} checkpoint(s)  "
-              f"(frac={args.d_blend_frac})")
+    if use_blend:
+        tag = (f"(frac={args.d_blend_frac})" if use_detector
+               else "(sole D source — no detector)")
+        print(f"\nD-blend source: {len(args.d_blend_checkpoints)} checkpoint(s)  {tag}")
         blend_dicts = []
         for i, ckpt in enumerate(args.d_blend_checkpoints):
             print(f"  [{i+1}/{len(args.d_blend_checkpoints)}] {ckpt}")
-            blend_dicts.append(predict_3class(ckpt, spec_extractor, val_loader, device))
+            blend_dicts.append(cached_3class(
+                ckpt, spec_extractor, val_loader, device,
+                args.cache_dir, args.no_cache, args.segment_s, args.overlap_s))
         blend_w = _normalize(args.d_blend_weights, len(blend_dicts))
         blend_avg = (blend_dicts[0] if len(blend_dicts) == 1
                      else average_prob_dicts(blend_dicts, weights=blend_w))
@@ -499,11 +590,16 @@ def main() -> None:
     print("\n" + "=" * 64)
     print("HYBRID COMBINATION")
     print(f"  BMABZ + BP : weighted avg of {len(bp_dicts)} model(s)")
-    if blend_avg is not None:
+    if use_detector and use_blend:
         print(f"  D          : {1-args.d_blend_frac:.2f}*detector + "
               f"{args.d_blend_frac:.2f}*blend")
-    else:
+        d_label = "D from detector+blend"
+    elif use_detector:
         print(f"  D          : dedicated detector(s) only")
+        d_label = "D from dedicated detector"
+    else:
+        print(f"  D          : blend source only (NO detector — baseline)")
+        d_label = "D from blend only (no detector)"
     print("=" * 64)
     hybrid = combine(bp_avg, d_avg, blend_avg, args.d_blend_frac)
     print(f"  combined probs for {len(hybrid)} segments")
@@ -520,7 +616,7 @@ def main() -> None:
 
     if not test_mode:
         metrics = evaluate_with_thresholds(hybrid, gt_events, thresholds)
-        print_metrics(metrics, thresholds, "HYBRID RESULT (D from dedicated detector)")
+        print_metrics(metrics, thresholds, f"HYBRID RESULT ({d_label})")
 
     if args.output_csv is not None:
         print("\nWriting predictions CSV...")
