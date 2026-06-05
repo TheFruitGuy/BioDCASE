@@ -918,6 +918,54 @@ PHASE_REGISTRY: dict[str, dict] = {
         ),
         interventions=["pcen_extra_channel"],
     ),
+    "13o": dict(
+        parent="13n",
+        hypothesis=(
+            "Learnable per-band PCEN channel -- the ambitious 13n. 13n's fixed PCEN "
+            "channel (alpha .98 / delta 2 / power .5 / smooth .025) lifted tuned D "
+            "0.206 -> 0.336; here those four fields are trainable PER FREQUENCY BIN "
+            "(4x129 params) so the net tunes the AGC to exactly what surfaces the "
+            "weak, background-buried D downsweeps. The params live INSIDE the model "
+            "(the optimiser only steps model.parameters()), fed the raw |STFT| as the "
+            "last channel; channels 0..2 stay the untouched phase-aware STFT, so the "
+            "LEAF / PCEN-frontend flattening that killed D (11a/11b/13m) cannot recur "
+            "-- nothing replaced, only added. Every band inits at 13n's fixed values, "
+            "so step 0 == 13n; it can only learn away from a known-good config. Adopt "
+            "only on a clear tuned-D gain over 13n's 0.336."
+        ),
+        interventions=["learnable_perband_pcen_channel"],
+    ),
+    "13p": dict(
+        parent="13n",
+        hypothesis=(
+            "PCEN channel PLUS dual-resolution -- 5 input channels. 13n ran "
+            "DUAL_RESOLUTION=off, so its PCEN channel effectively REPLACED the "
+            "short-window-magnitude channel 13d carried (both 4-ch, 4th differs). "
+            "This rung keeps both: ch0..2 phase-aware STFT, ch3 short-window "
+            "magnitude (fine time resolution for sharp BMABZ/BP onsets), ch4 fixed "
+            "PCEN (transient AGC for D). Hypothesis: time-res and transient-AGC are "
+            "complementary, so all three classes lift; if redundant we learn that at "
+            "~zero cost. Caveat: multi-channel frontend fusion diluted before (10a "
+            "multi-res STFT collapsed BMABZ), so watch BMABZ as well as D. Adopt only "
+            "on a clear macro gain over 13n."
+        ),
+        interventions=["pcen_channel_dual_resolution_5ch"],
+    ),
+    "13q": dict(
+        parent="13n",
+        hypothesis=(
+            "Wide Conformer conv kernel for D's duration. 13n's depthwise conv kernel "
+            "k=31 spans only ~0.62 s of LOCAL context at hop=5/250 Hz, but a D "
+            "downsweep is 1-2 s -- only the global self-attention sees a whole D call, "
+            "the conv module cannot. Widen k 31 -> 65 (~1.30 s) so the local feature "
+            "extractor can track the full downsweep; depthwise, so the cost is "
+            "negligible (+34 taps x d_model). Targets D's temporal extent, not generic "
+            "capacity (capacity scaling washed in phase 2 / 13). eval reads conv_kernel "
+            "off the ckpt, so no eval change. Adopt only on a clear tuned-D gain over "
+            "13n's 0.336."
+        ),
+        interventions=["wide_conv_kernel_65"],
+    ),
 }
 
 
