@@ -76,7 +76,7 @@ CKPT_DIR_3C = {
 
 # rk10-specific: indices of RTX PRO 6000 Blackwell cards (sm_120) that crash the
 # bio cu118 build. Warned about if passed via --gpus. Harmless on other boxes.
-BLACKWELL_GPUS = {2, 7}
+# BLACKWELL_GPUS = {2, 7}
 
 # Default GPU pool: honour a CUDA_VISIBLE_DEVICES prepended at launch so the user
 # stays flexible (e.g. CUDA_VISIBLE_DEVICES=0,1,3,4,6); fall back to rk10's free
@@ -95,7 +95,7 @@ def enumerate_jobs(runs_root, hn_root, ckpt_name, seeds, sources, consistencies,
             hn_glob = str(Path(hn_root) / head / sub / "*.json")
             hn_files = sorted(glob.glob(hn_glob))
             for cons in consistencies:
-                name = f"mtfb_3class_s{seed}_{source}_{cons}"
+                name = f"mtfb_3class_s{seed}_{source}_{cons}" + ("" if pgi else "_nopgi")
                 jobs.append({
                     "seed": seed, "source": source, "cons": cons, "pgi": pgi,
                     "ckpt": base, "hn_glob": hn_glob, "hn_files": hn_files,
