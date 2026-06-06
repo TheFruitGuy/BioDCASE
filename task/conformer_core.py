@@ -72,6 +72,24 @@ def add_arch_args(p: argparse.ArgumentParser) -> argparse.ArgumentParser:
                    help="EMA weight averaging (DESED-standard stabiliser): the "
                         "averaged weights are validated and checkpointed. Averages "
                         "over the per-epoch negative-resampling noise.")
+    p.add_argument("--resample-every", type=int, default=1,
+                   help="Resample the epoch's negatives every N epochs instead of "
+                        "every epoch (default 1 = current behaviour). Larger N holds "
+                        "the negative set fixed for N epochs, reducing the per-epoch "
+                        "decision-boundary lurch that intermittently collapses D.")
+    p.add_argument("--eval-mode", choices=["fixed", "tuned"], default="fixed",
+                   help="Per-epoch validation. 'fixed' scores at cfg.THRESHOLD (0.3; "
+                        "default, unchanged for existing phases). 'tuned' runs "
+                        "per-class threshold tuning each epoch so logged metrics AND "
+                        "checkpoint selection use the tuned operating point.")
+    p.add_argument("--tune-workers", type=int, default=1,
+                   help="Parallel workers for --eval-mode tuned (per-class grid "
+                        "search; CPU-only fork pool). 1 = serial.")
+    p.add_argument("--select-by", choices=["macro_paper", "macro", "f1"],
+                   default="macro_paper",
+                   help="Validation metric the best checkpoint is selected on. "
+                        "Default macro_paper (unchanged). 'macro' = mean per-class "
+                        "F1 (the official BioDCASE metric).")
     p.add_argument("--filteraug", action="store_true",
                    help="FilterAugment + frequency warping (phase 13f): "
                         "frequency-only augmentation on the magnitude channels; "
@@ -302,6 +320,11 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
     # rung enables them without bespoke wiring; an explicitly-passed value wins.
     use_ema = bool(use_ema or getattr(arch_kwargs, "ema", False))
     ema_decay = float(getattr(arch_kwargs, "ema_decay", ema_decay))
+    # Stability + tuned-eval knobs (defaults reproduce existing-phase behaviour).
+    resample_every = max(1, int(getattr(arch_kwargs, "resample_every", 1)))
+    tune_per_epoch = (str(getattr(arch_kwargs, "eval_mode", "fixed")) == "tuned")
+    tune_workers = max(1, int(getattr(arch_kwargs, "tune_workers", 1)))
+    select_by = str(getattr(arch_kwargs, "select_by", "macro_paper"))
     if augment_fn is None and getattr(arch_kwargs, "filteraug", False):
         from filter_augment import build_spec_augment
         augment_fn = build_spec_augment(
@@ -375,18 +398,21 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
 
     # --- training loop ---
     history, best_f1 = [], 0.0
+    train_loader, last_thr = None, None
     for epoch in range(1, epochs + 1):
         t0 = time.time()
-        train_segments = resample_negatives_for_epoch(
-            pos_segs_extended=pos_segs, train_annotations=train_annotations,
-            train_manifest=train_manifest, n_neg=n_neg,
-            segment_s=cfg.TRAIN_SEGMENT_S, epoch=epoch, verbose=True,
-        )
-        train_loader = DataLoader(
-            WhaleDataset(train_segments), batch_size=cfg.BATCH_SIZE, shuffle=True,
-            num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
-            **seeded_dataloader_kwargs(seed),
-        )
+        if (train_loader is None or resample_every <= 1
+                or (epoch - 1) % resample_every == 0):
+            train_segments = resample_negatives_for_epoch(
+                pos_segs_extended=pos_segs, train_annotations=train_annotations,
+                train_manifest=train_manifest, n_neg=n_neg,
+                segment_s=cfg.TRAIN_SEGMENT_S, epoch=epoch, verbose=True,
+            )
+            train_loader = DataLoader(
+                WhaleDataset(train_segments), batch_size=cfg.BATCH_SIZE, shuffle=True,
+                num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
+                **seeded_dataloader_kwargs(seed),
+            )
 
         if is_sf:
             optimizer.train()                 # gradient-evaluation point
@@ -399,8 +425,22 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
             optimizer.eval()                  # materialise the averaged iterate
         if ema is not None:
             ema.store_and_copy(model)
-        val = validate(model, spec_extractor, val_loader, criterion, device,
-                       val_annotations, file_start_dts, threshold=cfg.THRESHOLD)
+        if tune_per_epoch:
+            from tuned_val import validate_tuned
+            try:
+                val = validate_tuned(
+                    model, spec_extractor, val_loader, criterion, device,
+                    val_annotations, file_start_dts,
+                    workers=tune_workers, start_thr=last_thr, use_fp16=amp)
+                last_thr = val.get("thresholds", last_thr)
+            except Exception as e:                       # never let tuning kill a run
+                print(f"  [tune] per-epoch tuning failed ({type(e).__name__}: {e}); "
+                      f"falling back to fixed-{cfg.THRESHOLD} this epoch")
+                val = validate(model, spec_extractor, val_loader, criterion, device,
+                               val_annotations, file_start_dts, threshold=cfg.THRESHOLD)
+        else:
+            val = validate(model, spec_extractor, val_loader, criterion, device,
+                           val_annotations, file_start_dts, threshold=cfg.THRESHOLD)
         eval_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         if ema is not None:
             ema.restore(model)
@@ -408,9 +448,11 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
         #  the gradient-evaluation weights.)
 
         macro = sum(val["per_class"][c]["f1"] for c in cfg.CALL_TYPES_3) / 3
-        improved = val["macro_paper"] > best_f1
+        sel_score = {"macro_paper": val["macro_paper"], "macro": macro,
+                     "f1": val["f1"]}.get(select_by, val["macro_paper"])
+        improved = sel_score > best_f1
         if improved:
-            best_f1 = val["macro_paper"]
+            best_f1 = sel_score
         cur_lr = optimizer.param_groups[0]["lr"]
 
         print(f"\n[{phase}] Epoch {epoch:2d}/{epochs} ({time.time()-t0:.0f}s)"
@@ -422,10 +464,14 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
                   f"F1={pc['f1']:.3f}")
         print(f"    OVERALL {val['f1']:.3f}  MACRO {macro:.3f}  "
               f"MACRO_PAPER {val['macro_paper']:.3f}")
+        if "thresholds" in val:
+            print(f"    THR     {[round(t, 3) for t in val['thresholds']]}"
+                  f"  (sel={select_by} -> {sel_score:.3f})")
 
         wbu.log_epoch_3class(epoch, train_loss, val)
         wandb.log({"val/f1_micro": val["f1"], "val/f1_macro_mean": macro,
-                   "val/f1_macro_paper": val["macro_paper"], "lr": cur_lr}, step=epoch)
+                   "val/f1_macro_paper": val["macro_paper"],
+                   "val/select_score": sel_score, "lr": cur_lr}, step=epoch)
 
         history.append({"epoch": epoch, "train_loss": train_loss,
                         "val_loss": val["loss"], "f1": val["f1"], "macro_f1": macro,
@@ -434,6 +480,8 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
 
         ckpt = {"epoch": epoch, "model_state_dict": eval_state,
                 "f1": val["f1"], "macro_paper_f1": val["macro_paper"],
+                "macro_f1": macro, "select_by": select_by, "select_score": sel_score,
+                "thresholds": val.get("thresholds"),
                 "ema": use_ema, "history": history,
                 "pos_weight": pos_weight.detach().cpu().tolist(),
                 "arch_kwargs": vars(arch_kwargs), "opt_kwargs": opt_kwargs}

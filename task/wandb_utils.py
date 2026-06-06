@@ -966,6 +966,31 @@ PHASE_REGISTRY: dict[str, dict] = {
         ),
         interventions=["wide_conv_kernel_65"],
     ),
+    "13r": dict(
+        parent="13q",
+        hypothesis=("Stability harness on the 13q wide-kernel winner. 13q's "
+                    "training is unstable (D collapses every 5-7 epochs, "
+                    "val-loss spikes ~0.24), so the best epoch is partly luck "
+                    "and multi-seed is high-variance. Exposes three additive "
+                    "stabilisers as independent flags (EMA, cosine LR anneal, "
+                    "periodic negative resampling) plus per-epoch tuned-"
+                    "threshold eval and macro selection so logged metrics and "
+                    "checkpoint choice use the tuned operating point, not "
+                    "misleading fixed-0.3."),
+        interventions=["ema", "cosine_lr", "resample_every", "tuned_eval"],
+    ),
+    "13s": dict(
+        parent="13q",
+        hypothesis=("Delta-channel front-end on the wide-kernel winner. Appends "
+                    "delta and delta-delta channels (param-less temporal "
+                    "derivatives of the PCEN channel) -> 6-channel input. A "
+                    "stationary noise floor has near-zero temporal derivative "
+                    "while a moving FM downsweep does not, so the delta channel "
+                    "is a high-pass-in-time that suppresses the background "
+                    "(71.5%% of D misses are background-sensitivity). Inherits "
+                    "13r's stability harness + tuned eval."),
+        interventions=["delta_channels", "ema", "cosine_lr", "tuned_eval"],
+    ),
 }
 
 
