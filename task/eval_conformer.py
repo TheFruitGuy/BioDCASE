@@ -219,6 +219,20 @@ def load_conformer(ckpt_path, device):
             tfwse_reduction=pick("tfwse_reduction", default=4),
             **common,
         ).to(device)
+    # 13o carries fdy_targets PLUS lpcen (learnable per-band PCEN as the last
+    # channel; NOT pcen_channel). Build the LPCEN subclass so the lpcen.* params
+    # load, and swap in the raw-magnitude extractor below. Checked BEFORE the
+    # pcen_channel / generic fdy branches (a 13o ckpt also carries fdy_targets).
+    elif a.get("lpcen"):
+        from model_lpcen import WhaleVAD_Conformer_FDY_LPCEN
+        model = WhaleVAD_Conformer_FDY_LPCEN(
+            fdy_targets=tuple(a.get("fdy_targets") or ("filterbank", "feat0")),
+            fdy_basis=pick("fdy_basis", default=4),
+            fdy_temp=pick("fdy_temp", default=1.0),
+            feat_channels=pick("feat_channels", default=4),
+            lpcen_global=bool(a.get("lpcen_global", False)),
+            **common,
+        ).to(device)
     # 13n carries fdy_targets PLUS pcen_channel and feat_channels=4 (3 STFT + 1
     # PCEN); rebuild the FDY-Conformer at that channel count (checked BEFORE the
     # generic fdy branch, since a 13n ckpt has both) and swap in the PCEN
@@ -247,6 +261,9 @@ def load_conformer(ckpt_path, device):
     if a.get("leaf"):
         from model_leaf import LeafPassthrough
         spec = LeafPassthrough().to(device)
+    elif a.get("lpcen"):
+        from spectrogram_lpcen import RawMagChannelExtractor
+        spec = RawMagChannelExtractor().to(device)
     elif a.get("pcen_channel"):
         from spectrogram_pcen import PCENChannelExtractor
         spec = PCENChannelExtractor(smooth=pick("pcen_smooth", default=0.025)).to(device)
