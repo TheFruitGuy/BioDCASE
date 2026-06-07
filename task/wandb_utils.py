@@ -991,6 +991,18 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "13r's stability harness + tuned eval."),
         interventions=["delta_channels", "ema", "cosine_lr", "tuned_eval"],
     ),
+    "13t": dict(
+        parent="13r",
+        hypothesis=("Multi-scale depthwise conv: several odd depthwise kernels "
+                    "run in parallel inside each Conformer conv module and "
+                    "summed (default 15 & 65 frames = ~0.30s & ~1.30s). Single "
+                    "k=65 (13q->13r) bought D (+0.054) but cost BP (-0.006) "
+                    "because 1.3s is too long for BP's short pulses; a short "
+                    "parallel branch should recover BP while the long branch "
+                    "keeps D. Intended: keep D, small BP gain. conv_kernels=None "
+                    "reproduces 13r's single-kernel module byte-for-byte."),
+        interventions=["multiscale_conv"],
+    ),
 }
 
 
