@@ -152,17 +152,41 @@ class ConvModule(nn.Module):
     Conformer convolution module:
     LayerNorm → pointwise(→2d) → GLU → depthwise(kernel) → BN → SiLU →
     pointwise(→d) → dropout. Operates on (B, T, d_model).
+
+    Multi-scale depthwise (optional): if ``conv_kernels`` is a list of odd
+    kernel sizes, the single depthwise conv is replaced by one parallel
+    depthwise conv per kernel, their outputs **summed** before BN. One module
+    then carries several temporal scales at once — short kernels for brief BP
+    pulses, long kernels for the D downsweep — so each class can be served by
+    its natural receptive field. The sum keeps the shape (B, D, T), so BN /
+    SiLU / pw2 are untouched, and the only added parameters are the extra
+    depthwise taps (k·d each, negligible). ``conv_kernels=None`` (the default)
+    reproduces the single-kernel module *exactly* — same submodule name
+    (``dw``) and state_dict, so existing checkpoints load unchanged.
     """
 
-    def __init__(self, d_model: int, kernel_size: int, dropout: float):
+    def __init__(self, d_model: int, kernel_size: int, dropout: float,
+                 conv_kernels: list[int] | None = None):
         super().__init__()
-        assert kernel_size % 2 == 1, "conv kernel must be odd for 'same' padding"
         self.norm = nn.LayerNorm(d_model)
         self.pw1 = nn.Conv1d(d_model, 2 * d_model, kernel_size=1)
-        self.dw = nn.Conv1d(
-            d_model, d_model, kernel_size,
-            padding=(kernel_size - 1) // 2, groups=d_model,
-        )
+        if conv_kernels is None:
+            assert kernel_size % 2 == 1, "conv kernel must be odd for 'same' padding"
+            self.dw = nn.Conv1d(
+                d_model, d_model, kernel_size,
+                padding=(kernel_size - 1) // 2, groups=d_model,
+            )
+            self.dws = None
+        else:
+            ks = [int(k) for k in conv_kernels]
+            assert ks and all(k % 2 == 1 for k in ks), \
+                "every multi-scale conv kernel must be odd for 'same' padding"
+            self.dw = None
+            self.dws = nn.ModuleList([
+                nn.Conv1d(d_model, d_model, k,
+                          padding=(k - 1) // 2, groups=d_model)
+                for k in ks
+            ])
         self.bn = nn.BatchNorm1d(d_model)
         self.act = nn.SiLU()
         self.pw2 = nn.Conv1d(d_model, d_model, kernel_size=1)
@@ -172,7 +196,7 @@ class ConvModule(nn.Module):
         x = self.norm(x).transpose(1, 2)                   # (B, D, T)
         x = self.pw1(x)
         x = F.glu(x, dim=1)                                # (B, D, T)
-        x = self.dw(x)
+        x = self.dw(x) if self.dws is None else sum(dw(x) for dw in self.dws)
         x = self.bn(x)
         x = self.act(x)
         x = self.pw2(x)
@@ -183,13 +207,15 @@ class ConvModule(nn.Module):
 class ConformerBlock(nn.Module):
     """A single Conformer block (macaron-FFN / MHSA / conv / macaron-FFN)."""
 
-    def __init__(self, d_model, nhead, ffn_mult, conv_kernel, dropout):
+    def __init__(self, d_model, nhead, ffn_mult, conv_kernel, dropout,
+                 conv_kernels=None):
         super().__init__()
         self.ffn1 = FeedForward(d_model, ffn_mult, dropout)
         self.attn_norm = nn.LayerNorm(d_model)
         self.attn = RoPESelfAttention(d_model, nhead, dropout)
         self.attn_drop = nn.Dropout(dropout)
-        self.conv = ConvModule(d_model, conv_kernel, dropout)
+        self.conv = ConvModule(d_model, conv_kernel, dropout,
+                               conv_kernels=conv_kernels)
         self.ffn2 = FeedForward(d_model, ffn_mult, dropout)
         self.final_norm = nn.LayerNorm(d_model)
 
@@ -230,6 +256,7 @@ class WhaleVAD_Conformer(nn.Module):
         num_layers: int = 4,
         ffn_mult: int = 4,
         conv_kernel: int = 31,
+        conv_kernels: list[int] | None = None,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -249,7 +276,8 @@ class WhaleVAD_Conformer(nn.Module):
         self.input_drop = nn.Dropout(dropout)
 
         self.blocks = nn.ModuleList([
-            ConformerBlock(d_model, nhead, ffn_mult, conv_kernel, dropout)
+            ConformerBlock(d_model, nhead, ffn_mult, conv_kernel, dropout,
+                           conv_kernels=conv_kernels)
             for _ in range(num_layers)
         ])
         self.classifier = nn.Linear(d_model, num_classes)
