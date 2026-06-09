@@ -182,6 +182,10 @@ def load_conformer(ckpt_path, device):
         num_layers=pick("layers", "num_layers", default=4),
         ffn_mult=pick("ffn_mult", default=4),
         conv_kernel=pick("conv_kernel", default=31),
+        conv_kernels=pick("conv_kernels", default=None),
+        ms_fuse=pick("ms_fuse", default="sum"),
+        decoder=pick("decoder", default=None),
+        decoder_layers=pick("decoder_layers", default=1),
         dropout=pick("dropout", default=0.1),
     )
     # 13m LEAF checkpoints set leaf=True and carry NO backbone/tfwse/fdy_targets:

@@ -155,21 +155,35 @@ class ConvModule(nn.Module):
 
     Multi-scale depthwise (optional): if ``conv_kernels`` is a list of odd
     kernel sizes, the single depthwise conv is replaced by one parallel
-    depthwise conv per kernel, their outputs **summed** before BN. One module
-    then carries several temporal scales at once — short kernels for brief BP
-    pulses, long kernels for the D downsweep — so each class can be served by
-    its natural receptive field. The sum keeps the shape (B, D, T), so BN /
-    SiLU / pw2 are untouched, and the only added parameters are the extra
-    depthwise taps (k·d each, negligible). ``conv_kernels=None`` (the default)
-    reproduces the single-kernel module *exactly* — same submodule name
-    (``dw``) and state_dict, so existing checkpoints load unchanged.
+    depthwise conv per kernel. ``ms_fuse`` controls how the per-kernel outputs
+    are combined:
+
+    * ``"sum"`` (13t)    — element-wise sum. Cheapest, but the per-channel add
+                           *entangles* the scales (one channel must serve every
+                           kernel), which is why 13t-sum lost to a single wide
+                           kernel.
+    * ``"concat"`` (13u) — concatenate on the channel axis → a 1×1 pointwise
+                           conv projects ``len(ks)·d_model → d_model``. The
+                           scales stay **separable** and the network *learns*
+                           the mixing instead of being forced to add. This is
+                           the natural home for recovering BP (short kernel)
+                           without giving up D / BMABZ (long kernel).
+
+    Either fusion keeps the output shape (B, D, T), so BN / SiLU / pw2 are
+    untouched. ``conv_kernels=None`` (the default) reproduces the single-kernel
+    module *exactly* — same submodule name (``dw``) and state_dict. A "sum"
+    multi-scale checkpoint carries only ``dws.*`` (no ``ms_proj``), so 13t
+    checkpoints still load when ``ms_fuse`` defaults to "sum"; only "concat"
+    adds the ``ms_proj`` key.
     """
 
     def __init__(self, d_model: int, kernel_size: int, dropout: float,
-                 conv_kernels: list[int] | None = None):
+                 conv_kernels: list[int] | None = None, ms_fuse: str = "sum"):
         super().__init__()
         self.norm = nn.LayerNorm(d_model)
         self.pw1 = nn.Conv1d(d_model, 2 * d_model, kernel_size=1)
+        self.ms_fuse = ms_fuse
+        self.ms_proj = None
         if conv_kernels is None:
             assert kernel_size % 2 == 1, "conv kernel must be odd for 'same' padding"
             self.dw = nn.Conv1d(
@@ -187,6 +201,12 @@ class ConvModule(nn.Module):
                           padding=(k - 1) // 2, groups=d_model)
                 for k in ks
             ])
+            if ms_fuse == "concat":
+                self.ms_proj = nn.Conv1d(len(ks) * d_model, d_model,
+                                         kernel_size=1)
+            elif ms_fuse != "sum":
+                raise ValueError(
+                    f"ms_fuse must be 'sum' or 'concat', got {ms_fuse!r}")
         self.bn = nn.BatchNorm1d(d_model)
         self.act = nn.SiLU()
         self.pw2 = nn.Conv1d(d_model, d_model, kernel_size=1)
@@ -196,7 +216,12 @@ class ConvModule(nn.Module):
         x = self.norm(x).transpose(1, 2)                   # (B, D, T)
         x = self.pw1(x)
         x = F.glu(x, dim=1)                                # (B, D, T)
-        x = self.dw(x) if self.dws is None else sum(dw(x) for dw in self.dws)
+        if self.dws is None:                               # single kernel
+            x = self.dw(x)
+        elif self.ms_proj is not None:                     # concat-then-project
+            x = self.ms_proj(torch.cat([dw(x) for dw in self.dws], dim=1))
+        else:                                              # element-wise sum
+            x = sum(dw(x) for dw in self.dws)
         x = self.bn(x)
         x = self.act(x)
         x = self.pw2(x)
@@ -208,14 +233,14 @@ class ConformerBlock(nn.Module):
     """A single Conformer block (macaron-FFN / MHSA / conv / macaron-FFN)."""
 
     def __init__(self, d_model, nhead, ffn_mult, conv_kernel, dropout,
-                 conv_kernels=None):
+                 conv_kernels=None, ms_fuse="sum"):
         super().__init__()
         self.ffn1 = FeedForward(d_model, ffn_mult, dropout)
         self.attn_norm = nn.LayerNorm(d_model)
         self.attn = RoPESelfAttention(d_model, nhead, dropout)
         self.attn_drop = nn.Dropout(dropout)
         self.conv = ConvModule(d_model, conv_kernel, dropout,
-                               conv_kernels=conv_kernels)
+                               conv_kernels=conv_kernels, ms_fuse=ms_fuse)
         self.ffn2 = FeedForward(d_model, ffn_mult, dropout)
         self.final_norm = nn.LayerNorm(d_model)
 
@@ -225,6 +250,67 @@ class ConformerBlock(nn.Module):
         x = x + self.conv(x)
         x = x + 0.5 * self.ffn2(x)
         return self.final_norm(x)
+
+
+# ======================================================================
+# Temporal decoder head (optional)
+# ======================================================================
+
+class TemporalDecoderHead(nn.Module):
+    """Thin temporal decoder over the frame features (B, T, d_model), applied
+    after the Conformer blocks and *before* the classifier.
+
+    Rationale: event-level scoring (IoU ≥ 0.3) penalises fragmented / dropped
+    events, the dominant D-class failure mode under background. A light
+    smoothing decoder targets event-level temporal coherence directly. It is a
+    *head*, not the BiLSTM *backbone* that was removed — one recurrent / conv
+    layer (or a few), wrapped residual + LayerNorm so it *refines* rather than
+    replaces the Conformer representation (``decoder=None`` leaves the model
+    byte-identical, and a freshly-initialised head starts near the identity).
+
+    kind:
+      "gru" — ``layers``-deep bidirectional GRU (hidden d_model//2 → out d_model).
+              Sees both past and future frames (offline SED), good for closing
+              gaps in a fragmented event.
+      "tcn" — ``layers`` dilated depthwise-separable Conv1d blocks (k=3,
+              dilation 1,2,4,…), each residual. A fixed-length temporal smoother
+              whose receptive field grows geometrically with depth; closest in
+              spirit to (and a learnable replacement for) the post-hoc
+              min-duration / merge-gap smoothing.
+    """
+
+    def __init__(self, d_model: int, kind: str = "gru", layers: int = 1,
+                 dropout: float = 0.1):
+        super().__init__()
+        self.kind = kind
+        self.norm = nn.LayerNorm(d_model)
+        if kind == "gru":
+            assert d_model % 2 == 0, "d_model must be even for a bidirectional GRU head"
+            self.gru = nn.GRU(d_model, d_model // 2, num_layers=layers,
+                              batch_first=True, bidirectional=True,
+                              dropout=dropout if layers > 1 else 0.0)
+        elif kind == "tcn":
+            self.convs = nn.ModuleList([
+                nn.Sequential(
+                    nn.Conv1d(d_model, d_model, 3, padding=2 ** i,
+                              dilation=2 ** i, groups=d_model),   # depthwise dilated
+                    nn.Conv1d(d_model, d_model, kernel_size=1),   # pointwise mix
+                    nn.SiLU(),
+                    nn.Dropout(dropout),
+                )
+                for i in range(layers)
+            ])
+        else:
+            raise ValueError(f"decoder kind must be 'gru' or 'tcn', got {kind!r}")
+
+    def forward(self, x):                                  # (B, T, d_model)
+        if self.kind == "gru":
+            out, _ = self.gru(x)                           # (B, T, d_model)
+            return self.norm(x + out)
+        h = x.transpose(1, 2)                              # (B, d_model, T)
+        for conv in self.convs:
+            h = h + conv(h)                                # residual per dilated block
+        return self.norm(x + h.transpose(1, 2))
 
 
 # ======================================================================
@@ -258,6 +344,9 @@ class WhaleVAD_Conformer(nn.Module):
         conv_kernel: int = 31,
         conv_kernels: list[int] | None = None,
         dropout: float = 0.1,
+        ms_fuse: str = "sum",
+        decoder: str | None = None,
+        decoder_layers: int = 1,
     ):
         super().__init__()
 
@@ -277,9 +366,14 @@ class WhaleVAD_Conformer(nn.Module):
 
         self.blocks = nn.ModuleList([
             ConformerBlock(d_model, nhead, ffn_mult, conv_kernel, dropout,
-                           conv_kernels=conv_kernels)
+                           conv_kernels=conv_kernels, ms_fuse=ms_fuse)
             for _ in range(num_layers)
         ])
+        self.decoder = (
+            TemporalDecoderHead(d_model, kind=decoder, layers=decoder_layers,
+                                dropout=dropout)
+            if decoder else None
+        )
         self.classifier = nn.Linear(d_model, num_classes)
 
     # ------------------------------------------------------------------
@@ -320,6 +414,9 @@ class WhaleVAD_Conformer(nn.Module):
 
         for blk in self.blocks:
             x = blk(x, key_padding_mask)
+
+        if self.decoder is not None:
+            x = self.decoder(x)                            # (B, T, d_model)
 
         return self.classifier(x)                          # (B, T, num_classes)
 

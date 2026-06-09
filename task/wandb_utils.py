@@ -1003,6 +1003,24 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "reproduces 13r's single-kernel module byte-for-byte."),
         interventions=["multiscale_conv"],
     ),
+    "13u": dict(
+        parent="13t",
+        hypothesis=("13t multi-scale-by-sum lost to single k=129 because summing "
+                    "parallel depthwise convs entangles scales per channel. "
+                    "Concat-then-project (cat on channels -> 1x1 -> d_model) keeps "
+                    "scales separable with learned mixing; recovers BP (short "
+                    "kernel) without giving up D/BMABZ (long kernel)."),
+        interventions=["multiscale_depthwise", "concat_project_fusion"],
+    ),
+    "13v": dict(
+        parent="13r",
+        hypothesis=("D's dominant failure under background is fragmented/dropped "
+                    "events at event-level IoU. A thin temporal decoder head "
+                    "(1-layer BiGRU or 2-3 layer dilated TCN) over d_model frame "
+                    "features, before the classifier, targets event coherence "
+                    "directly; orthogonal to front-end/kernel/depth/optimisation."),
+        interventions=["temporal_decoder_head"],
+    ),
 }
 
 
