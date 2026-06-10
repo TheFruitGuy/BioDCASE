@@ -236,6 +236,109 @@ def build_optim_sched(model: nn.Module, opt_kwargs: dict,
 # Mask-aware training step (shared by all ladder rungs)
 # ======================================================================
 
+# ======================================================================
+# Loss functions (13w) — selectable training loss.
+# All share one contract: forward(logits, targets, valid) -> scalar, where
+# `valid` is the (B,T) frame mask. MaskedBCELoss reproduces the pre-13w masked
+# weighted BCE byte-for-byte, so --loss bce is identical to every prior phase.
+# ======================================================================
+
+class MaskedBCELoss(nn.Module):
+    """Original masked, segment-count-weighted BCE. Default; byte-identical to
+    the pre-13w objective (`per_frame = BCE(none)·valid`, then sum / (valid·C))."""
+
+    def __init__(self, pos_weight=None):
+        super().__init__()
+        self.bce = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight)
+
+    def forward(self, logits, targets, valid):             # valid (B,T)
+        v = valid.unsqueeze(-1).float()
+        per = self.bce(logits, targets) * v
+        return per.sum() / (v.sum() * targets.size(-1)).clamp(min=1.0)
+
+
+class MaskedASLoss(nn.Module):
+    """Asymmetric Loss (Ridnik & Ben-Baruch, ICCV 2021), masked, multi-label
+    per-frame. Decouples positive/negative focusing: `gamma_neg` down-weights
+    the flood of easy negatives and `clip` hard-shifts them, so the rare D-call
+    positive frames keep gradient mass. This attacks D's positive/negative
+    imbalance directly and is *not* a per-class focal γ — do NOT also apply the
+    BCE pos_weight (the asymmetry replaces it). Recommended: gamma_pos=0,
+    gamma_neg=4, clip=0.05. Train from scratch (not as a fine-tune)."""
+
+    def __init__(self, gamma_neg=4.0, gamma_pos=0.0, clip=0.05, eps=1e-8):
+        super().__init__()
+        self.gamma_neg, self.gamma_pos = gamma_neg, gamma_pos
+        self.clip, self.eps = clip, eps
+
+    def forward(self, logits, targets, valid):
+        xs_pos = torch.sigmoid(logits)
+        xs_neg = 1.0 - xs_pos
+        if self.clip and self.clip > 0:                    # probability shifting on negatives
+            xs_neg = (xs_neg + self.clip).clamp(max=1.0)
+        los = (targets * torch.log(xs_pos.clamp(min=self.eps))
+               + (1.0 - targets) * torch.log(xs_neg.clamp(min=self.eps)))
+        if self.gamma_neg > 0 or self.gamma_pos > 0:
+            with torch.no_grad():                          # detached focusing weight (Ridnik default)
+                pt = xs_pos * targets + xs_neg * (1.0 - targets)
+                gamma = self.gamma_pos * targets + self.gamma_neg * (1.0 - targets)
+                w = (1.0 - pt) ** gamma
+            los = los * w
+        v = valid.unsqueeze(-1).float()
+        los = -los * v
+        return los.sum() / (v.sum() * targets.size(-1)).clamp(min=1.0)
+
+
+class MaskedFocalTverskyLoss(nn.Module):
+    """Focal-Tversky loss (Abraham & Khan, 2018), aggregated at the **batch**
+    level per class over the valid frames. The Tversky index TI =
+    TP/(TP+α·FP+β·FN) generalises Dice; **β > α up-weights false negatives →
+    recall on the rare class (D)**, and `gamma` > 1 focuses hard (poorly-
+    overlapping) classes. Batch-level (not per-segment) aggregation is used
+    deliberately: D is absent from most 30 s segments, and per-segment Tversky
+    is degenerate on empty segments (tiny residual FP collapses TI), whereas the
+    batch usually contains some D positives so TI stays well-defined. `smooth`
+    (Laplace term, default 1.0) makes a genuinely empty class give loss ≈ 0.
+    Recall-tilted defaults: alpha=0.3, beta=0.7, gamma=4/3."""
+
+    def __init__(self, alpha=0.3, beta=0.7, gamma=1.3333, smooth=1.0):
+        super().__init__()
+        self.alpha, self.beta, self.gamma, self.smooth = alpha, beta, gamma, smooth
+
+    def forward(self, logits, targets, valid):
+        v = valid.unsqueeze(-1).float()
+        p = torch.sigmoid(logits) * v                      # zero padded frames
+        t = targets * v
+        dims = (0, 1)                                       # batch-level, per class
+        tp = (p * t).sum(dim=dims)                          # (C,)
+        fp = (p * (1.0 - t)).sum(dim=dims)                  # padded: p=0 → 0
+        fn = ((1.0 - p) * t).sum(dim=dims)                  # padded: t=0 → 0
+        ti = (tp + self.smooth) / (
+            tp + self.alpha * fp + self.beta * fn + self.smooth)
+        return ((1.0 - ti) ** self.gamma).mean()           # mean over classes
+
+
+def make_train_criterion(arch_kwargs, pos_weight, device):
+    """Select the training loss from arch_kwargs (`--loss`, default 'bce').
+    Phases without the flag fall back to bce → unchanged behaviour."""
+    name = getattr(arch_kwargs, "loss", "bce")
+    if name == "bce":
+        crit = MaskedBCELoss(pos_weight=pos_weight)
+    elif name == "asl":
+        crit = MaskedASLoss(
+            gamma_neg=getattr(arch_kwargs, "asl_gamma_neg", 4.0),
+            gamma_pos=getattr(arch_kwargs, "asl_gamma_pos", 0.0),
+            clip=getattr(arch_kwargs, "asl_clip", 0.05))
+    elif name == "tversky":
+        crit = MaskedFocalTverskyLoss(
+            alpha=getattr(arch_kwargs, "tversky_alpha", 0.3),
+            beta=getattr(arch_kwargs, "tversky_beta", 0.7),
+            gamma=getattr(arch_kwargs, "tversky_gamma", 1.3333))
+    else:
+        raise ValueError(f"unknown --loss {name!r} (choose bce|asl|tversky)")
+    return crit.to(device)
+
+
 def _train_epoch(model, spec_extractor, loader, criterion, optimizer,
                  scheduler, device, ema=None, augment_fn=None, amp=False):
     from tqdm import tqdm
@@ -256,9 +359,7 @@ def _train_epoch(model, spec_extractor, loader, criterion, optimizer,
             T = min(logits.size(1), targets.size(1))
             logits, targets_t, mask_t = logits[:, :T], targets[:, :T], mask[:, :T]
 
-            valid = mask_t.unsqueeze(-1).float()
-            per_frame = criterion(logits, targets_t) * valid
-            loss = per_frame.sum() / (valid.sum() * targets_t.size(-1)).clamp(min=1.0)
+            loss = criterion(logits, targets_t, mask_t)    # masking + reduction live in the loss
 
         optimizer.zero_grad()
         loss.backward()
@@ -386,7 +487,10 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
     print(f"[phase {phase}] parameters: {n_params:,}")
     run.config.update({"n_params": n_params}, allow_val_change=True)
 
-    criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight).to(device)
+    train_criterion = make_train_criterion(arch_kwargs, pos_weight, device)
+    val_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight).to(device)
+    print(f"[phase {phase}] train loss: {getattr(arch_kwargs, 'loss', 'bce')}  "
+          f"(val loss reported as BCE for comparability)")
 
     steps_per_epoch = max(1, (len(pos_segs) + n_neg) // cfg.BATCH_SIZE)
     optimizer, scheduler, is_sf = build_optim_sched(model, opt_kwargs, steps_per_epoch, epochs)
@@ -416,7 +520,7 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
 
         if is_sf:
             optimizer.train()                 # gradient-evaluation point
-        train_loss = _train_epoch(model, spec_extractor, train_loader, criterion,
+        train_loss = _train_epoch(model, spec_extractor, train_loader, train_criterion,
                                   optimizer, scheduler, device, ema, augment_fn, amp)
 
         # Switch to the weights we select/checkpoint on: the schedule-free
@@ -429,17 +533,17 @@ def run_training(phase: str, *, build_model, arch_kwargs, opt_kwargs,
             from tuned_val import validate_tuned
             try:
                 val = validate_tuned(
-                    model, spec_extractor, val_loader, criterion, device,
+                    model, spec_extractor, val_loader, val_criterion, device,
                     val_annotations, file_start_dts,
                     workers=tune_workers, start_thr=last_thr, use_fp16=amp)
                 last_thr = val.get("thresholds", last_thr)
             except Exception as e:                       # never let tuning kill a run
                 print(f"  [tune] per-epoch tuning failed ({type(e).__name__}: {e}); "
                       f"falling back to fixed-{cfg.THRESHOLD} this epoch")
-                val = validate(model, spec_extractor, val_loader, criterion, device,
+                val = validate(model, spec_extractor, val_loader, val_criterion, device,
                                val_annotations, file_start_dts, threshold=cfg.THRESHOLD)
         else:
-            val = validate(model, spec_extractor, val_loader, criterion, device,
+            val = validate(model, spec_extractor, val_loader, val_criterion, device,
                            val_annotations, file_start_dts, threshold=cfg.THRESHOLD)
         eval_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
         if ema is not None:

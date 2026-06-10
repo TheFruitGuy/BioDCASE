@@ -1021,6 +1021,15 @@ PHASE_REGISTRY: dict[str, dict] = {
                     "directly; orthogonal to front-end/kernel/depth/optimisation."),
         interventions=["temporal_decoder_head"],
     ),
+
+    "13w": dict(
+        parent="13r",
+        hypothesis=("D is sensitivity-bound: rare positive frames drowned by the "
+                    "negative flood under masked BCE. Swap the loss (arch/data/optim "
+                    "fixed) for a recall-oriented objective — Asymmetric Loss or "
+                    "Focal-Tversky (beta>alpha) — to lift D recall. From scratch."),
+        interventions=["loss_swap", "asymmetric_loss", "focal_tversky"],
+    ),
 }
 
 
