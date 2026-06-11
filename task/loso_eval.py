@@ -164,13 +164,19 @@ def run_loso(ens, gt, sites, tune_fn, eval_fn, perclass_fn, paperf1_fn, workers)
 
 
 def run_allval(ens, gt, sites, tune_fn, eval_fn, perclass_fn, paperf1_fn, workers):
-    """Tune + score on all sites — the selection-optimistic number (your ~0.504)."""
+    """Tune + score on all sites — the selection-optimistic number (your ~0.504).
+    Also scores each site separately at those same (deployed) thresholds."""
     cfg.USE_3CLASS = True
     probs, g = subset_sites(ens, gt, sites)
     thr = tune_fn(probs, g, workers)
     metrics = eval_fn(probs, g, thr)
+    per_site = {}
+    for s in sites:
+        sp, sg = subset_sites(ens, gt, [s])
+        sm = eval_fn(sp, sg, thr)
+        per_site[s] = dict(macro=float(paperf1_fn(sm)), pc=perclass_fn(sm))
     return (float(paperf1_fn(metrics)), perclass_fn(metrics),
-            [float(t) for t in np.asarray(thr)])
+            [float(t) for t in np.asarray(thr)], per_site)
 
 
 # =============================================================================
@@ -178,7 +184,7 @@ def run_allval(ens, gt, sites, tune_fn, eval_fn, perclass_fn, paperf1_fn, worker
 # =============================================================================
 def report(loso_folds, allval, posterior_name, n_members):
     loso_macro, loso_pc = aggregate([f["pc"] for f in loso_folds])
-    av_macro, av_pc, av_thr = allval
+    av_macro, av_pc, av_thr, per_site = allval
     bar = "=" * 80
 
     print(f"\n{bar}\nENSEMBLE LOSO EVALUATION  (your deployed threshold-only pipeline)\n{bar}")
@@ -198,6 +204,29 @@ def report(loso_folds, allval, posterior_name, n_members):
     for lab in CLASSES:
         p, r, fct = loso_pc[lab]
         print(f"    {lab:6} {p:7.3f} {r:7.3f} {fct:7.3f}")
+
+    # ---- per-site, the honest view: each site as the held-out fold -----------
+    fold_by_site = {f["held"]: f for f in loso_folds}
+    print(f"\n  PER-SITE — held-out (LOSO: thresholds tuned on the other 2 sites) [honest]")
+    print(f"    {'site':16} {'bmabz':>7} {'d':>7} {'bp':>7} {'macro':>8}")
+    for s in cfg.VAL_DATASETS:
+        f = fold_by_site.get(s)
+        if not f:
+            continue
+        pc = f["pc"]
+        print(f"    {s:16} {pc['bmabz']['f1']:7.3f} {pc['d']['f1']:7.3f} {pc['bp']['f1']:7.3f}"
+              f" {f['test_f1']:8.3f}")
+
+    # ---- per-site at the deployed thresholds (tuned once on all 3) -----------
+    print(f"\n  PER-SITE — deployed thresholds (tuned once on all 3 val sites)")
+    for s in cfg.VAL_DATASETS:
+        ps = per_site.get(s)
+        if not ps:
+            continue
+        print(f"    {s}  (macro {ps['macro']:.3f})")
+        for lab in CLASSES:
+            v = ps["pc"][lab]
+            print(f"      {lab:6} P {v['precision']:.3f}  R {v['recall']:.3f}  F1 {v['f1']:.3f}")
 
     print(f"\n  {'-'*76}")
     print(f"  PAPER-MACRO   LOSO (honest)         : {loso_macro:.4f}")
@@ -284,6 +313,12 @@ def selftest():
     # honest LOSO macro: mean P over folds = mean(0.5,0.4,0.6)=0.5, same R=0.4 -> F1(0.5,0.4)
     assert abs(macro - f1_of(0.5, 0.4)) < 1e-9, macro
     print(f"  loso smoke macro={macro:.3f}  (expected {f1_of(0.5,0.4):.3f})")
+
+    # run_allval returns per-site at the deployed thresholds; each site's mock P/R
+    av = run_allval(ens2, gt2, sites, tune_fn, eval_fn, perclass_fn, paperf1_fn, 1)
+    assert len(av) == 4 and set(av[3]) == set(sites)
+    assert abs(av[3]["kerguelen2014"]["pc"]["d"]["precision"] - 0.4) < 1e-9   # site-only eval
+    report(folds, av, "best_posteriors.npz", 6)   # exercises both per-site print paths
     print("[selftest] OK")
 
 
@@ -348,6 +383,7 @@ def main():
         loso_paper_f1=loso_macro, allval_paper_f1=allval[0],
         selection_bias_gap=loso_macro - allval[0],
         loso_per_class={k: dict(precision=v[0], recall=v[1], f1=v[2]) for k, v in loso_pc.items()},
+        per_site_deployed=allval[3],
         loso_folds=loso_folds, posterior_name=pname), indent=2, default=str))
     print(f"\nwrote {args.out}")
 
