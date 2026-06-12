@@ -32,6 +32,8 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 import nave_config as cfg
+import config_final as _cf
+_cf.USE_3CLASS = True
 from nave_model import NAVE
 from nave_features import NAVEFeatureExtractor
 
