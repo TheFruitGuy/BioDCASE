@@ -132,7 +132,7 @@ IOU_THRESHOLD = 0.3             # event-matching IoU for metrics
 # ----------------------------------------------------------------------
 # Experiment tracking (fresh project for the NAVE line)
 # ----------------------------------------------------------------------
-WANDB_ENTITY = "the_fruit_guy"
+WANDB_ENTITY = "bio-dcase"
 WANDB_PROJECT = "nave-whale-sed"
 WANDB_MODE = "online"
 
