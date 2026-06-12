@@ -40,7 +40,7 @@ from dataset_final import (
     load_annotations, get_file_manifest, build_positive_segments,
     build_val_segments, extend_all_segments, WhaleDataset, collate_fn,
 )
-from validation_core import (
+from train_final import (
     seed_everything, seeded_dataloader_kwargs, compute_pos_weight,
     resample_negatives_for_epoch, validate,
 )
