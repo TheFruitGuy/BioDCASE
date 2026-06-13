@@ -96,7 +96,7 @@ def get_or_compute(ckpt, loader_factory, device, cache_dir, seg, no_cache, use_f
         print("    cache hit")
         return load_cached_probs(cp)
     print("    cache miss, loading architecture + running inference...")
-    model, spec = load_conformer(ckpt, device)        # rebuilds the right variant
+    model, spec, _ = load_conformer(ckpt, device)     # rebuilds the right variant
     model = model.to(device).eval()
     spec = spec.to(device)
     probs = predict_probs(model, spec, loader_factory(), device, use_fp16)
