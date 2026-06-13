@@ -5,7 +5,8 @@ Loads each checkpoint with the right builder -- native NAVE checkpoints via the 
 loader, any legacy phase variant (plain Conformer / FDY / FDY+PCEN / wide-kernel /
 CRNN / LEAF / tfwSE / LPCEN / delta / dual-res) via eval_conformer.load_conformer --
 evaluates it at the requested tile length (default 60 s), and reports the official
-BioDCASE metric B = F1(mean-P, mean-R) per checkpoint, one row each.
+BioDCASE metric B = F1(mean-P, mean-R) per checkpoint, with per-class precision,
+recall and F1.
 
     CUDA_VISIBLE_DEVICES=0 python evaluate_phase13.py --segment-s 60 --use_fp16 --val-workers 20 \
         --checkpoints \
@@ -81,6 +82,17 @@ def load_model_spec(ckpt, device):
         return build_nave_from_ckpt(ckpt, device), NAVEFeatureExtractor().to(device)
     model, spec, _ = load_conformer(ckpt, device)
     return model.to(device).eval(), spec.to(device)
+
+
+def print_per_class(metrics, indent="    "):
+    """Per-class precision / recall / F1 (+ tp/fp/fn) table."""
+    print(f"{indent}{'class':6} {'P':>6} {'R':>6} {'F1':>6}   "
+          f"{'tp':>5} {'fp':>5} {'fn':>5}")
+    for c in CLASS_NAMES:
+        m = metrics.get(c, {})
+        print(f"{indent}{c.upper():6} {m.get('precision',0):6.3f} {m.get('recall',0):6.3f} "
+              f"{m.get('f1',0):6.3f}   {int(m.get('tp',0)):5d} {int(m.get('fp',0)):5d} "
+              f"{int(m.get('fn',0)):5d}")
 
 
 @torch.no_grad()
@@ -168,11 +180,9 @@ def main():
             thr, _ = tune_for_official(probs, gt, start=thr)
         metrics = evaluate_with_thresholds(probs, gt, thr)
         B, A = macro_f1_paper(metrics), macro_f1(metrics)
-        per = {c: metrics.get(c, {}).get("f1", 0.0) for c in CLASS_NAMES}
-        rows.append((name, B, A, per, thr))
-        print(f"  OFFICIAL B={B:.4f}  (A={A:.4f})  "
-              f"{' '.join(f'{c.upper()}={per[c]:.3f}' for c in CLASS_NAMES)}  "
-              f"thr={[round(float(t),2) for t in thr]}")
+        rows.append((name, B, A, metrics, thr))
+        print(f"  OFFICIAL B={B:.4f}  A={A:.4f}  thr={[round(float(t),2) for t in thr]}")
+        print_per_class(metrics)
 
         if args.official_scorer:
             try:
@@ -188,20 +198,26 @@ def main():
                 Bo, P, R = official_B_from_confmatrix(conf)
                 print(f"    official-scorer B={Bo:.4f} (meanP={P:.3f}, meanR={R:.3f})")
 
-    # ---- summary (input order) ----
-    print(f"\n{'='*78}\nPER-CHECKPOINT (official B, {args.segment_s:.0f}s tiles, tune={args.tune_metric})\n{'='*78}")
-    hdr = f"{'checkpoint':38} {'B':>7} {'A':>7} " + " ".join(f"{c.upper():>6}" for c in CLASS_NAMES)
-    print(hdr); print("-" * len(hdr))
+    # ---- summary: per-class P / R / F1, grouped ----
+    print(f"\n{'='*100}\nPER-CHECKPOINT (official B, {args.segment_s:.0f}s tiles, tune={args.tune_metric})\n{'='*100}")
+    grp = "  ".join(f"{c.upper():^20}" for c in CLASS_NAMES)
+    sub = "  ".join(f"{'P':>6}{'R':>7}{'F1':>7}" for _ in CLASS_NAMES)
+    print(f"{'checkpoint':34} {'B':>6} {'A':>6}   {grp}")
+    print(f"{'':34} {'':>6} {'':>6}   {sub}")
+    print("-" * 100)
     Bs = []
-    for name, B, A, per, thr in rows:
+    for name, B, A, metrics, thr in rows:
         Bs.append(B)
-        print(f"{name[:38]:38} {B:7.4f} {A:7.4f} "
-              + " ".join(f"{per[c]:6.3f}" for c in CLASS_NAMES))
+        cells = []
+        for c in CLASS_NAMES:
+            m = metrics.get(c, {})
+            cells.append(f"{m.get('precision',0):6.3f}{m.get('recall',0):7.3f}{m.get('f1',0):7.3f}")
+        print(f"{name[:34]:34} {B:6.4f} {A:6.4f}   " + "  ".join(cells))
     if n > 1:
         Bs = np.array(Bs)
-        print("-" * len(hdr))
-        print(f"{'mean +/- std over checkpoints':38} {Bs.mean():7.4f} {Bs.std():7.4f}")
-        print(f"{'best (reference only)':38} {Bs.max():7.4f}")
+        print("-" * 100)
+        print(f"{'mean +/- std over checkpoints (B)':34} {Bs.mean():6.4f} +/- {Bs.std():.4f}"
+              f"   (best, ref only: {Bs.max():.4f})")
 
 
 if __name__ == "__main__":

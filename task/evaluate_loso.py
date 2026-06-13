@@ -3,27 +3,23 @@ evaluate_loso.py -- leave-one-site-out generalization for the conformer line.
 =============================================================================
 Threshold-LOSO: the model is trained once; for each held-out dev site we tune the
 per-class thresholds on the OTHER sites and score the held-out site with them.
-Measures how well the operating point generalizes across sites (the honest number
-for the baselines comparison) without retraining. Metric = official B = F1(mean-P,
-mean-R).
+Measures how well the operating point generalizes across sites. Metric = official
+B = F1(mean-P, mean-R). Now also prints a PER-SITE breakdown (per-class precision /
+recall / F1 for each held-out site).
 
-Multiple checkpoints are reported TWO honest ways (no cherry-picking the best):
+Multiple checkpoints are reported two honest ways (no cherry-picking the best):
   - PER-SEED mean +/- std : each seed's LOSO scored independently, then averaged.
-    This is "what a single NAVE model typically achieves" -- report this instead
-    of the best seed.
-  - ENSEMBLE              : the seeds' probabilities are averaged into one model,
-    then LOSO'd. A different, legitimate system (usually higher) -- the ensemble
-    row of the ladder, not a single-model number.
+  - ENSEMBLE              : the seeds' probabilities are averaged into one model.
 
-    # several seeds: per-seed mean+/-std AND the ensemble
     CUDA_VISIBLE_DEVICES=0 python evaluate_loso.py --segment-s 60 --use_fp16 --val-workers 20 \
-        --checkpoints runs/phase13r_3c_s42_*/phase13r_best.pt \
-                      runs/phase13r_3c_s666_*/phase13r_best.pt \
-                      runs/nave_s7_*/nave_best.pt
+        --checkpoints runs/phase13r_3c_s666_*/phase13r_best.pt \
+                      runs/phase13r_3c_s1337_*/phase13r_best.pt \
+                      runs/phase13r_3c_s42_*/phase13r_best.pt
 
-Each fold aggregates B two ways: mean-of-folds and POOLED (sum tp/fp/fn over
-held-out folds, one F1). Pooled is the headline LOSO number. Probabilities cache
-per (run, segment_s), shared with nave_eval / evaluate_phase13.
+Each fold aggregates B two ways: mean-of-folds and POOLED (sum tp/fp/fn over folds,
+one F1). Pooled is the headline LOSO number. Per-site detail is printed for the
+ensemble (multi-seed) or the single model; add --per-site-seeds for every seed.
+Probabilities cache per (run, segment_s), shared with nave_eval / evaluate_phase13.
 """
 
 from __future__ import annotations
@@ -65,6 +61,8 @@ def parse_args():
     p.add_argument("--tune-metric", choices=["f1", "official"], default="f1")
     p.add_argument("--no-ensemble", action="store_true",
                    help="Skip the ensemble; only per-seed mean +/- std.")
+    p.add_argument("--per-site-seeds", action="store_true",
+                   help="Print the per-site breakdown for every seed (not just the ensemble).")
     p.add_argument("--cache_dir", type=str, default="runs/nave_prob_cache")
     p.add_argument("--no_cache", action="store_true")
     p.add_argument("--use_fp16", action="store_true")
@@ -77,7 +75,7 @@ def parse_args():
 
 
 def load_model_spec(ckpt, device):
-    """Native NAVE -> NAVE+NAVEFeatureExtractor; any legacy phase variant -> load_conformer."""
+    """Native NAVE -> NAVE + NAVEFeatureExtractor; any legacy phase variant -> load_conformer."""
     obj = torch.load(ckpt, map_location="cpu", weights_only=False)
     sd = obj.get("model_state_dict", obj) if isinstance(obj, dict) else obj
     native = (isinstance(obj, dict) and obj.get("model") == "NAVE") \
@@ -117,35 +115,54 @@ def _filter(probs, gt, keep_sites):
     return p, g
 
 
-def run_loso(probs, gt, sites, workers, tune_metric, verbose=False):
-    """One model's LOSO: per-fold B + pooled B + in-sample B."""
+def run_loso(probs, gt, sites, workers, tune_metric):
+    """One model's LOSO. Returns per-fold metrics, pooled B, mean-of-folds, in-sample."""
     folds, pooled = [], {c: {"tp": 0, "fp": 0, "fn": 0} for c in CLASS_NAMES}
     for held in sites:
         p_tr, g_tr = _filter(probs, gt, [s for s in sites if s != held])
         thr = _tune(p_tr, g_tr, workers, tune_metric)
         p_h, g_h = _filter(probs, gt, [held])
         m = evaluate_with_thresholds(p_h, g_h, thr)
-        folds.append((held, macro_f1_paper(m), m, thr))
+        folds.append({"site": held, "B": macro_f1_paper(m), "metrics": m, "thr": thr})
         for c in CLASS_NAMES:
             for k in ("tp", "fp", "fn"):
                 pooled[c][k] += int(m.get(c, {}).get(k, 0))
-        if verbose:
-            print(f"    held-out {held}: B={macro_f1_paper(m):.4f}  "
-                  f"thr={[round(float(t),2) for t in thr]}")
-            for c in CLASS_NAMES:
-                mc = m.get(c, {})
-                print(f"      {c.upper():6} P={mc.get('precision',0):.3f} "
-                      f"R={mc.get('recall',0):.3f} F1={mc.get('f1',0):.3f}")
-    fold_Bs = np.array([B for _, B, _, _ in folds])
+    fold_Bs = np.array([f["B"] for f in folds])
     pP = [pooled[c]["tp"] / (pooled[c]["tp"] + pooled[c]["fp"] + 1e-8) for c in CLASS_NAMES]
     pR = [pooled[c]["tp"] / (pooled[c]["tp"] + pooled[c]["fn"] + 1e-8) for c in CLASS_NAMES]
     mP, mR = float(np.mean(pP)), float(np.mean(pR))
     pooled_B = 2 * mP * mR / (mP + mR + 1e-8)
     thr_all = _tune(probs, gt, workers, tune_metric)
     insample_B = macro_f1_paper(evaluate_with_thresholds(probs, gt, thr_all))
-    return dict(pooled_B=pooled_B, mean_fold=float(fold_Bs.mean()),
-                std_fold=float(fold_Bs.std()), insample_B=insample_B,
-                fold_Bs=fold_Bs.tolist())
+    return dict(folds=folds, pooled=pooled, pooled_B=pooled_B, pooled_P=mP, pooled_R=mR,
+                mean_fold=float(fold_Bs.mean()), std_fold=float(fold_Bs.std()),
+                insample_B=insample_B)
+
+
+def print_per_site(res, label):
+    """Per held-out site: per-class P / R / F1 (+ counts) and the fold B."""
+    print(f"\n  PER-SITE LOSO breakdown -- {label}")
+    print("  (thresholds tuned on the OTHER sites, then applied to the held-out site)")
+    for f in res["folds"]:
+        print(f"    held-out {f['site']:16} fold B={f['B']:.4f}  "
+              f"thr={[round(float(t),2) for t in f['thr']]}")
+        print(f"      {'class':6} {'P':>6} {'R':>6} {'F1':>6}   "
+              f"{'tp':>5} {'fp':>5} {'fn':>5}")
+        for c in CLASS_NAMES:
+            m = f["metrics"].get(c, {})
+            print(f"      {c.upper():6} {m.get('precision',0):6.3f} {m.get('recall',0):6.3f} "
+                  f"{m.get('f1',0):6.3f}   {int(m.get('tp',0)):5d} {int(m.get('fp',0)):5d} "
+                  f"{int(m.get('fn',0)):5d}")
+    # pooled-over-sites per-class
+    print(f"    POOLED over sites: meanP={res['pooled_P']:.3f} meanR={res['pooled_R']:.3f} "
+          f"-> B={res['pooled_B']:.4f}")
+    print(f"      {'class':6} {'P':>6} {'R':>6}   {'tp':>5} {'fp':>5} {'fn':>5}")
+    for c in CLASS_NAMES:
+        pc = res["pooled"][c]
+        P = pc["tp"] / (pc["tp"] + pc["fp"] + 1e-8)
+        R = pc["tp"] / (pc["tp"] + pc["fn"] + 1e-8)
+        print(f"      {c.upper():6} {P:6.3f} {R:6.3f}   "
+              f"{pc['tp']:5d} {pc['fp']:5d} {pc['fn']:5d}")
 
 
 def main():
@@ -199,19 +216,21 @@ def main():
     # ---- per-seed LOSO ----
     per_seed = []
     for name, probs in zip(names, prob_dicts):
+        res = run_loso(probs, gt, sites, args.val_workers, args.tune_metric)
+        per_seed.append((name, res))
         print(f"\n--- seed: {name} ---")
-        r = run_loso(probs, gt, sites, args.val_workers, args.tune_metric, verbose=(n == 1))
-        per_seed.append((name, r))
-        print(f"  pooled LOSO B={r['pooled_B']:.4f} | mean-of-folds={r['mean_fold']:.4f}"
-              f"+/-{r['std_fold']:.4f} | in-sample={r['insample_B']:.4f} | "
-              f"gap={r['insample_B']-r['pooled_B']:+.4f}")
+        print(f"  pooled LOSO B={res['pooled_B']:.4f} | mean-of-folds={res['mean_fold']:.4f}"
+              f"+/-{res['std_fold']:.4f} | in-sample={res['insample_B']:.4f} | "
+              f"gap={res['insample_B']-res['pooled_B']:+.4f}")
+        if n == 1 or args.per_site_seeds:
+            print_per_site(res, f"seed {name}")
 
     print(f"\n{'='*68}\nSUMMARY (official B, {args.segment_s:.0f}s, tune={args.tune_metric})\n{'='*68}")
     print(f"{'seed':32} {'pooledLOSO':>11} {'in-sample':>10} {'gap':>7}")
     print("-" * 62)
-    for name, r in per_seed:
-        print(f"{name[:32]:32} {r['pooled_B']:11.4f} {r['insample_B']:10.4f} "
-              f"{r['insample_B']-r['pooled_B']:+7.4f}")
+    for name, res in per_seed:
+        print(f"{name[:32]:32} {res['pooled_B']:11.4f} {res['insample_B']:10.4f} "
+              f"{res['insample_B']-res['pooled_B']:+7.4f}")
 
     if n > 1:
         pooled = np.array([r["pooled_B"] for _, r in per_seed])
@@ -228,6 +247,7 @@ def main():
             re = run_loso(ens, gt, sites, args.val_workers, args.tune_metric)
             print(f"    pooled LOSO B = {re['pooled_B']:.4f} | in-sample B = {re['insample_B']:.4f}"
                   f" | gap = {re['insample_B']-re['pooled_B']:+.4f}")
+            print_per_site(re, f"ENSEMBLE of {n} seeds")
 
 
 if __name__ == "__main__":
