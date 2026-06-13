@@ -1,14 +1,12 @@
 """
-evaluate_phase13.py -- rescore the paper-ladder checkpoints in the OFFICIAL metric.
-==================================================================================
-The ladder rungs are DIFFERENT architectures (plain Conformer, FDY, FDY+PCEN,
-wide-kernel, and the ablation variants CRNN / LEAF / tfwSE / LPCEN / delta /
-dual-res). This script loads each checkpoint with `eval_conformer.load_conformer`
-(which rebuilds the right architecture + front end from the stored arch_kwargs),
-evaluates it at 60 s tiles, and reports the **official BioDCASE metric**
-(B = F1 of mean-precision / mean-recall) per checkpoint -- one row per rung.
+evaluate_phase13.py -- rescore checkpoints in the OFFICIAL metric at any tile length.
+=====================================================================================
+Loads each checkpoint with the right builder -- native NAVE checkpoints via the NAVE
+loader, any legacy phase variant (plain Conformer / FDY / FDY+PCEN / wide-kernel /
+CRNN / LEAF / tfwSE / LPCEN / delta / dual-res) via eval_conformer.load_conformer --
+evaluates it at the requested tile length (default 60 s), and reports the official
+BioDCASE metric B = F1(mean-P, mean-R) per checkpoint, one row each.
 
-    # the positive-ladder rungs (each a different architecture)
     CUDA_VISIBLE_DEVICES=0 python evaluate_phase13.py --segment-s 60 --use_fp16 --val-workers 20 \
         --checkpoints \
           runs/phase13b_*/phase13b_best.pt \
@@ -17,13 +15,12 @@ evaluates it at 60 s tiles, and reports the **official BioDCASE metric**
           runs/phase13q_*/phase13q_best.pt \
           runs/phase13r_3c_s666_20260612_132012/phase13r_best.pt
 
-Per checkpoint it is evaluated INDEPENDENTLY (different architectures are not
-ensembled). Probabilities are cached per (run, segment_s) and shared with
-`nave_eval` / `nave_seglen_sweep`, so anything already scored at 60 s is reused.
+Each checkpoint is evaluated INDEPENDENTLY (different architectures / seeds are not
+ensembled here -- use evaluate_loso.py for the multi-seed ensemble). Probabilities
+cache per (run, segment_s), shared with nave_eval / nave_seglen_sweep / evaluate_loso.
 
-Thresholds: per-class F1 coordinate descent (validated, default), or
-`--tune-metric official` to refine for B. `--official-scorer` cross-checks the
-chosen row with the bundled `evaluation_submissions.run`.
+Thresholds: per-class F1 coordinate descent (default), or --tune-metric official to
+refine for B. --official-scorer cross-checks the chosen row with evaluation_submissions.run.
 """
 
 from __future__ import annotations
@@ -38,6 +35,7 @@ import torch
 from torch.utils.data import DataLoader
 
 import nave_config as cfg
+from nave_features import NAVEFeatureExtractor
 from dataset_final import (
     WhaleDataset, build_val_segments, collate_fn, get_file_manifest, load_annotations,
 )
@@ -46,8 +44,9 @@ from eval_conformer import (
     load_conformer, tune_thresholds_per_class, evaluate_with_thresholds,
     macro_f1, macro_f1_paper, CLASS_NAMES,
 )
-# generic cache helpers + official-scorer helpers (reused, no duplication)
-from nave_eval import cache_path_for, load_cached_probs, save_probs_to_cache
+from nave_eval import (
+    cache_path_for, load_cached_probs, save_probs_to_cache, build_nave_from_ckpt,
+)
 from nave_eval_official import (
     tune_for_official, write_submission_csvs, write_gt_csvs, official_B_from_confmatrix,
 )
@@ -57,7 +56,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoints", nargs="+", required=True,
-                   help="Phase13 checkpoints (heterogeneous architectures OK).")
+                   help="Native NAVE or any legacy phase checkpoint (mixable).")
     p.add_argument("--segment-s", type=float, default=60.0)
     p.add_argument("--overlap-s", type=float, default=cfg.EVAL_OVERLAP_S)
     p.add_argument("--tune-metric", choices=["f1", "official"], default="f1")
@@ -70,6 +69,18 @@ def parse_args():
     p.add_argument("--val-workers", type=int, default=min((os.cpu_count() or 1), 13))
     p.add_argument("--batch_size", type=int, default=cfg.BATCH_SIZE)
     return p.parse_args()
+
+
+def load_model_spec(ckpt, device):
+    """Native NAVE -> NAVE + NAVEFeatureExtractor; any legacy phase variant -> load_conformer."""
+    obj = torch.load(ckpt, map_location="cpu", weights_only=False)
+    sd = obj.get("model_state_dict", obj) if isinstance(obj, dict) else obj
+    native = (isinstance(obj, dict) and obj.get("model") == "NAVE") \
+        or any(k.startswith("stem.") for k in sd)
+    if native:
+        return build_nave_from_ckpt(ckpt, device), NAVEFeatureExtractor().to(device)
+    model, spec, _ = load_conformer(ckpt, device)
+    return model.to(device).eval(), spec.to(device)
 
 
 @torch.no_grad()
@@ -96,9 +107,7 @@ def get_or_compute(ckpt, loader_factory, device, cache_dir, seg, no_cache, use_f
         print("    cache hit")
         return load_cached_probs(cp)
     print("    cache miss, loading architecture + running inference...")
-    model, spec, _ = load_conformer(ckpt, device)     # rebuilds the right variant
-    model = model.to(device).eval()
-    spec = spec.to(device)
+    model, spec = load_model_spec(ckpt, device)
     probs = predict_probs(model, spec, loader_factory(), device, use_fp16)
     if not no_cache:
         save_probs_to_cache(probs, cp)
@@ -150,7 +159,7 @@ def main():
     for i, ckpt in enumerate(args.checkpoints):
         name = Path(ckpt).parent.name
         print(f"\n[{i+1}/{n}] {name}")
-        _cf.USE_3CLASS = True                          # load_conformer may flip it per-ckpt
+        _cf.USE_3CLASS = True
         probs = get_or_compute(ckpt, loader_factory, device, cache_dir,
                                args.segment_s, args.no_cache, args.use_fp16)
 
@@ -179,13 +188,20 @@ def main():
                 Bo, P, R = official_B_from_confmatrix(conf)
                 print(f"    official-scorer B={Bo:.4f} (meanP={P:.3f}, meanR={R:.3f})")
 
-    # ---- ladder summary (input order = ladder order) ----
-    print(f"\n{'='*78}\nLADDER (official B, 60 s tiles, tune={args.tune_metric})\n{'='*78}")
+    # ---- summary (input order) ----
+    print(f"\n{'='*78}\nPER-CHECKPOINT (official B, {args.segment_s:.0f}s tiles, tune={args.tune_metric})\n{'='*78}")
     hdr = f"{'checkpoint':38} {'B':>7} {'A':>7} " + " ".join(f"{c.upper():>6}" for c in CLASS_NAMES)
     print(hdr); print("-" * len(hdr))
+    Bs = []
     for name, B, A, per, thr in rows:
+        Bs.append(B)
         print(f"{name[:38]:38} {B:7.4f} {A:7.4f} "
               + " ".join(f"{per[c]:6.3f}" for c in CLASS_NAMES))
+    if n > 1:
+        Bs = np.array(Bs)
+        print("-" * len(hdr))
+        print(f"{'mean +/- std over checkpoints':38} {Bs.mean():7.4f} {Bs.std():7.4f}")
+        print(f"{'best (reference only)':38} {Bs.max():7.4f}")
 
 
 if __name__ == "__main__":
