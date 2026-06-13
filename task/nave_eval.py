@@ -54,7 +54,7 @@ from dataset_final import (
     WhaleDataset, build_val_segments, collate_fn, get_file_manifest,
     load_annotations,
 )
-from postprocess_final import collapse_probs_to_3class
+from postprocess_final import Detection, collapse_probs_to_3class
 from eval_conformer import (
     tune_thresholds_per_class, evaluate_with_thresholds,
     macro_f1, macro_f1_paper, CLASS_NAMES,
@@ -210,9 +210,10 @@ def main():
         fsd = file_start_dts.get((row["dataset"], row["filename"]))
         if fsd is None:
             continue
-        gt.append((row["dataset"], row["filename"], row["label_3class"],
-                   (row["start_datetime"] - fsd).total_seconds(),
-                   (row["end_datetime"] - fsd).total_seconds()))
+        gt.append(Detection(
+            dataset=row["dataset"], filename=row["filename"], label=row["label_3class"],
+            start_s=(row["start_datetime"] - fsd).total_seconds(),
+            end_s=(row["end_datetime"] - fsd).total_seconds()))
     print(f"  {len(gt)} ground-truth events")
 
     spec = NAVEFeatureExtractor().to(device)
