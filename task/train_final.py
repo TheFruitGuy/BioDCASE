@@ -32,11 +32,16 @@ Usage
     python train_final.py                 # train, no W&B
     python train_final.py --wandb         # train and log to W&B
     python train_final.py --wandb --wandb-mode offline
+
+    # all-11 retrain: train on every site minus the held-out files, validate
+    # on those files (in-distribution monitor for epoch selection only).
+    python train_final.py --holdout val_holdout.json --wandb
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import random
 import time
@@ -105,6 +110,7 @@ def seeded_dataloader_kwargs(seed: int) -> dict:
 
 def compute_pos_weight(
     sites: list[str], device: torch.device, verbose: bool = True,
+    annotations=None,
 ) -> tuple[torch.Tensor, dict]:
     """
     Per-class ``pos_weight`` for the active classification head.
@@ -123,8 +129,14 @@ def compute_pos_weight(
         Weights in the active class order, moved to ``device``.
     info : dict
         Diagnostics (raw counts, weight values, max/min ratio).
+
+    Notes
+    -----
+    Pass ``annotations`` to count over a pre-loaded (e.g. post-holdout-split)
+    annotation table; when ``None`` the table is loaded from ``sites``.
     """
-    annotations = load_annotations(sites)
+    if annotations is None:
+        annotations = load_annotations(sites)
 
     class_labels = cfg.class_names()
     label_col = "label_3class" if cfg.USE_3CLASS else "annotation"
@@ -354,7 +366,85 @@ def parse_args() -> argparse.Namespace:
                    help="Train as 3-class (coarse) or 7-class (fine, default). "
                         "3-class trains directly on collapsed labels; 7-class "
                         "trains on fine call types and collapses at eval.")
+    p.add_argument("--holdout", default=None, metavar="PATH",
+                   help="Path to a val_holdout.json from make_val_holdout.py. "
+                        "When set, train on ALL 11 labelled sites minus the "
+                        "held-out files and validate on those files (an "
+                        "in-distribution monitor for epoch selection — NOT a "
+                        "generalisation estimate). Default: canonical 8/3 split.")
     return p.parse_args()
+
+
+# ======================================================================
+# Train/val split resolution
+# ======================================================================
+
+def load_split(args):
+    """Resolve the train/val data split into four DataFrames.
+
+    Default (no ``--holdout``): the canonical 8-site train / 3-site val split
+    from ``config_final``.
+
+    With ``--holdout PATH``: train on ALL 11 labelled sites *minus* the files
+    named in the JSON, and validate on exactly those held-out files (the
+    in-distribution monitor written by ``make_val_holdout.py``). Every site is
+    then represented in training, so the held-out files give a
+    checkpoint-selection / collapse signal but are NOT a generalisation
+    estimate — keep the LOSO number for that.
+
+    The split is performed in memory after loading the all-11 manifest/
+    annotations; nothing is re-cached. Negatives and positives are built only
+    from the training files, so no held-out audio leaks into training.
+
+    Returns
+    -------
+    (train_manifest, train_annotations, val_manifest, val_annotations,
+     train_sites, val_sites, holdout_meta)
+        ``holdout_meta`` is ``None`` for the canonical split, else a dict with
+        ``path``, ``n_files`` and ``sites``.
+    """
+    if not args.holdout:
+        train_sites = list(cfg.TRAIN_DATASETS)
+        val_sites = list(cfg.VAL_DATASETS)
+        train_manifest = get_file_manifest(train_sites)
+        train_annotations = load_annotations(train_sites, manifest=train_manifest)
+        val_manifest = get_file_manifest(val_sites)
+        val_annotations = load_annotations(val_sites, manifest=val_manifest)
+        return (train_manifest, train_annotations, val_manifest, val_annotations,
+                train_sites, val_sites, None)
+
+    holdout = json.loads(Path(args.holdout).read_text())["holdout"]
+    hold = {(ds, fn) for ds, fns in holdout.items() for fn in fns}
+    all_sites = list(cfg.TRAIN_DATASETS) + list(cfg.VAL_DATASETS)
+    print(f"\nHoldout split from {args.holdout}: "
+          f"{len(hold)} files held out of {len(all_sites)} sites")
+
+    manifest = get_file_manifest(all_sites)
+    annotations = load_annotations(all_sites, manifest=manifest)
+
+    m_is_val = manifest.apply(
+        lambda r: (r["dataset"], r["filename"]) in hold, axis=1)
+    a_is_val = annotations.apply(
+        lambda r: (r["dataset"], r["filename"]) in hold, axis=1)
+
+    # Fail loudly if the JSON names files the manifest does not contain
+    # (usually a stale .cache/ after the data changed).
+    found = set(zip(manifest["dataset"], manifest["filename"]))
+    missing = hold - found
+    if missing:
+        raise SystemExit(
+            f"--holdout names {len(missing)} file(s) absent from the manifest "
+            f"(clear .cache/ if the data changed): {sorted(missing)[:5]}")
+
+    train_manifest = manifest[~m_is_val].reset_index(drop=True)
+    train_annotations = annotations[~a_is_val].reset_index(drop=True)
+    val_manifest = manifest[m_is_val].reset_index(drop=True)
+    val_annotations = annotations[a_is_val].reset_index(drop=True)
+
+    holdout_meta = {"path": str(args.holdout), "n_files": len(hold),
+                    "sites": sorted({ds for ds, _ in hold})}
+    return (train_manifest, train_annotations, val_manifest, val_annotations,
+            all_sites, holdout_meta["sites"], holdout_meta)
 
 
 # ======================================================================
@@ -376,13 +466,17 @@ def main():
 
     seed = seed_everything(args.seed, deterministic=False)
 
-    train_sites = list(cfg.TRAIN_DATASETS)
-    val_sites = list(cfg.VAL_DATASETS)
+    # --- resolve the train/val split (canonical sites, or --holdout files) ---
+    (train_manifest, train_annotations, val_manifest, val_annotations,
+     train_sites, val_sites, holdout_meta) = load_split(args)
 
-    # --- pos_weight from annotations, before any dataloader exists ---
+    # --- pos_weight from the post-split TRAINING annotations ---
+    # In holdout mode the held-out files are already excluded here, so their
+    # calls never enter the class-weight counts.
     print(f"\nComputing {cfg.n_classes()}-class pos_weight over "
-          f"{len(train_sites)} sites...")
-    pos_weight, weight_info = compute_pos_weight(train_sites, device, verbose=True)
+          f"{len(train_annotations):,} training annotations...")
+    pos_weight, weight_info = compute_pos_weight(
+        train_sites, device, verbose=True, annotations=train_annotations)
 
     # --- optional W&B run ---
     run = None
@@ -402,6 +496,7 @@ def main():
             "epochs": args.epochs,
             "train_sites": train_sites,
             "val_sites": val_sites,
+            "holdout": holdout_meta,
             "lstm_hidden": cfg.LSTM_HIDDEN,
             "lstm_layers": cfg.LSTM_LAYERS,
             "pos_weight": weight_info["pos_weight"],
@@ -410,7 +505,7 @@ def main():
         }, mode=args.wandb_mode)
 
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    tag = f"{cfg.n_classes()}c_s{seed}"
+    tag = f"{cfg.n_classes()}c_s{seed}" + ("_holdout" if holdout_meta else "")
     run_dir = Path(cfg.OUTPUT_DIR) / f"final_{tag}_{timestamp}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"Run dir: {run_dir}")
@@ -418,17 +513,20 @@ def main():
     print("\nConfiguration:")
     print(f"  Training sites:   {train_sites}  ({len(train_sites)})")
     print(f"  Validation sites: {val_sites}")
+    if holdout_meta:
+        print(f"  Holdout:          {holdout_meta['n_files']} files from "
+              f"{len(holdout_meta['sites'])} sites — in-distribution MONITOR, "
+              f"not a generalisation metric")
     print(f"  Output:           7-class training, collapsed to 3-class at eval")
     print(f"  Loss:             weighted BCE (segment-count normalised)")
     print(f"  Negatives:        resampled at the start of every epoch")
     print(f"  LSTM:             hidden={cfg.LSTM_HIDDEN}, layers={cfg.LSTM_LAYERS}")
     print(f"  LR={cfg.LR}, batch={cfg.BATCH_SIZE}, epochs={args.epochs}")
 
-    # --- fixed positives + static validation set ---
-    print(f"\nLoading training data...")
-    train_manifest = get_file_manifest(train_sites)
-    train_annotations = load_annotations(train_sites, manifest=train_manifest)
-    print(f"  {len(train_manifest)} files, {len(train_annotations)} annotations")
+    # --- fixed positives + static validation set (frames resolved by load_split) ---
+    print(f"\nBuilding segments...")
+    print(f"  Train: {len(train_manifest)} files, "
+          f"{len(train_annotations)} annotations")
 
     pos_segs = build_positive_segments(train_annotations, train_manifest)
     pos_segs = extend_all_segments(pos_segs, train_manifest, cfg.TRAIN_SEGMENT_S)
@@ -436,8 +534,6 @@ def main():
     print(f"  Positive segments (fixed): {len(pos_segs)}")
     print(f"  Negative segments per epoch: {n_neg}")
 
-    val_manifest = get_file_manifest(val_sites)
-    val_annotations = load_annotations(val_sites, manifest=val_manifest)
     val_segments = build_val_segments(val_manifest, val_annotations)
     val_loader = DataLoader(
         WhaleDataset(val_segments), batch_size=cfg.BATCH_SIZE, shuffle=False,
@@ -499,11 +595,13 @@ def main():
         )
         epoch_time = time.time() - t0
 
-        # Checkpoint selection on paper-convention macro-F1 (the headline
-        # metric from the experiment plan, Section 1.2).
-        improved = val["macro_paper"] > best_f1
+        # Checkpoint selection on the OFFICIAL metric: true macro-F1 = mean of
+        # the three per-class F1s. A collapsed class costs a full 1/3, so this
+        # will not pick a dead-D epoch the way micro or paper-macro can.
+        macro = sum(val["per_class"][n]["f1"] for n in cfg.CALL_TYPES_3) / 3
+        improved = macro > best_f1
         if improved:
-            best_f1 = val["macro_paper"]
+            best_f1 = macro
         marker = " *** new best" if improved else ""
 
         print(f"\nEpoch {epoch:2d}/{args.epochs}  ({epoch_time:.0f}s){marker}")
@@ -513,7 +611,6 @@ def main():
             print(f"    {name.upper():6} TP={pc['tp']:5} FP={pc['fp']:6} "
                   f"FN={pc['fn']:5}  P={pc['precision']:.3f} "
                   f"R={pc['recall']:.3f} F1={pc['f1']:.3f}")
-        macro = sum(val["per_class"][n]["f1"] for n in cfg.CALL_TYPES_3) / 3
         print(f"    OVERALL F1={val['f1']:.3f}  MACRO F1={macro:.3f}  "
               f"MACRO_PAPER F1={val['macro_paper']:.3f}")
 
@@ -532,7 +629,8 @@ def main():
 
         ckpt = {
             "epoch": epoch, "model_state_dict": model.state_dict(),
-            "f1": val["f1"], "macro_paper_f1": val["macro_paper"],
+            "f1": val["f1"], "macro_f1": macro,
+            "macro_paper_f1": val["macro_paper"],
             "history": history,
             "pos_weight": pos_weight.detach().cpu().tolist(),
         }
@@ -552,24 +650,25 @@ def main():
     print(f"Macro F1 by epoch:       {[f'{m:.3f}' for m in macros]}")
     print(f"Macro_paper F1 by epoch: {[f'{m:.3f}' for m in macro_papers]}")
     print(f"\nBest micro F1:       {max(f1s):.3f}  (epoch {f1s.index(max(f1s)) + 1})")
-    print(f"Best macro F1:       {max(macros):.3f}")
+    print(f"Best macro F1:       {max(macros):.3f}  "
+          f"(epoch {macros.index(max(macros)) + 1})  <-- selection metric")
     print(f"Best macro_paper F1: {max(macro_papers):.3f}  "
           f"(epoch {macro_papers.index(max(macro_papers)) + 1})")
     for name in cfg.CALL_TYPES_3:
         best = max(h["per_class"][name]["f1"] for h in history)
         print(f"  best {name}: {best:.3f}")
 
-    # Second-half stability tracked on the selection metric (paper-macro).
-    second_half = macro_papers[len(macro_papers) // 2:]
+    # Second-half stability tracked on the selection metric (true macro).
+    second_half = macros[len(macros) // 2:]
     swings = [abs(second_half[i] - second_half[i - 1])
               for i in range(1, len(second_half))]
     mean_swing = sum(swings) / max(len(swings), 1)
     max_swing = max(swings) if swings else 0.0
-    print(f"\nSecond-half stability (macro_paper): mean swing {mean_swing:.3f}, "
+    print(f"\nSecond-half stability (macro): mean swing {mean_swing:.3f}, "
           f"max swing {max_swing:.3f}")
 
-    verdict = (f"Best macro_paper F1 {max(macro_papers):.3f} "
-               f"(micro {max(f1s):.3f}, macro {max(macros):.3f}); "
+    verdict = (f"Best macro F1 {max(macros):.3f} "
+               f"(micro {max(f1s):.3f}, macro_paper {max(macro_papers):.3f}); "
                f"second-half mean swing {mean_swing:.3f}.")
     if run is not None:
         wbu.finalize_phase(history, verdict=verdict,
