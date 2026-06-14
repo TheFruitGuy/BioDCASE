@@ -100,6 +100,10 @@ EXCLUDE_DENSE_FRAC = 0.02
 #: Never hold more than this fraction of any class's total events out of
 #: training. The hard training-retention guard.
 RETAIN_FRAC = 0.08
+#: Drop this densest fraction of EACH site's files from candidacy, so the
+#: monitor gets a representative file rather than that site's densest chorus.
+#: This is the per-site relative guard the global fraction above misses.
+SITE_DENSE_QUANTILE = 0.25
 
 #: Eval-domain (Kerguelen) sites: scarce + the eval domain.
 EVAL_DOMAIN_SITES = ["kerguelen2005", "kerguelen2014", "kerguelen2015"]
@@ -148,7 +152,8 @@ def ordered_files_per_site(manifest) -> dict[str, list[str]]:
 def select_holdout(counts, ordered, floors, files_per_site, max_per_site,
                    min_gap, prefer_order, eval_domain_sites=frozenset(),
                    eval_domain_max_per_site=1, min_eval_domain_d=0,
-                   exclude_dense_frac=0.02, retain_frac=0.08, seed=0):
+                   exclude_dense_frac=0.02, retain_frac=0.08,
+                   site_dense_quantile=0.25, seed=0):
     """Sample a spread of representative files. Returns
     (selected, achieved, exhausted, eval_info)."""
     rng = random.Random(seed)
@@ -169,7 +174,25 @@ def select_holdout(counts, ordered, floors, files_per_site, max_per_site,
                    for cl in CLASSES)
 
     candidate = {k for k in counts if has_events(k) and not is_outlier(k)}
-    n_outliers = sum(1 for k in counts if has_events(k) and is_outlier(k))
+    n_global_outliers = sum(1 for k in counts if has_events(k) and is_outlier(k))
+
+    # Per-site dense exclusion: drop the densest `site_dense_quantile` of each
+    # site's candidate files (by total events). The global fraction above
+    # misses these when class totals are large -- a 200-event D file can be
+    # <2% of all D yet still be a site's densest chorus, which is exactly the
+    # file you want to TRAIN on, not hold out. This keeps each site's choruses
+    # in training and leaves the base pass a representative file to pick.
+    site_dense: set = set()
+    for ds, fns in ordered.items():
+        site_cands = [(ds, fn) for fn in fns if (ds, fn) in candidate]
+        if not site_cands:
+            continue
+        site_cands.sort(key=lambda k: (sum(counts[k].values()), k[1]),
+                        reverse=True)
+        n_drop = int(site_dense_quantile * len(site_cands))  # floor
+        site_dense.update(site_cands[:n_drop])
+    candidate -= site_dense
+    n_site_dense = len(site_dense)
 
     selected = {ds: [] for ds in ordered}
     sel_idx = {ds: [] for ds in ordered}
@@ -263,7 +286,9 @@ def select_holdout(counts, ordered, floors, files_per_site, max_per_site,
         "held_frac": {c: (achieved[c] / totals[c] if totals[c] else 0.0)
                       for c in CLASSES},
         "n_candidates": len(candidate),
-        "n_outliers_excluded": n_outliers,
+        "n_global_outliers": n_global_outliers,
+        "n_site_dense_excluded": n_site_dense,
+        "site_dense_quantile": site_dense_quantile,
         "retain_frac": retain_frac,
         "exclude_dense_frac": exclude_dense_frac,
     }
@@ -287,9 +312,11 @@ def report(selected, achieved, exhausted, eval_info, floors, counts,
           f"generalisation metric)\n{bar}")
     print(f"  files: {n_files}   across {len(selected)} site(s)   "
           f"~{tot_h:.1f} h held out")
-    print(f"  candidates after dense-file exclusion: {eval_info['n_candidates']} "
-          f"({eval_info['n_outliers_excluded']} dense files kept in training, "
-          f">{eval_info['exclude_dense_frac']:.0%} of a class)")
+    print(f"  candidates: {eval_info['n_candidates']}  (kept in training: "
+          f"{eval_info['n_global_outliers']} global-dense "
+          f">{eval_info['exclude_dense_frac']:.0%}-of-class, "
+          f"{eval_info['n_site_dense_excluded']} per-site densest "
+          f"{eval_info['site_dense_quantile']:.0%})")
 
     print(f"\n  per-class held-out events (floor -> held, % of class total):")
     for c in CLASSES:
@@ -335,7 +362,8 @@ def write_outputs(selected, achieved, exhausted, eval_info, floors, params,
                 held_frac=eval_info["held_frac"],
                 class_totals=eval_info["totals"],
                 n_candidates=eval_info["n_candidates"],
-                n_outliers_excluded=eval_info["n_outliers_excluded"],
+                n_global_outliers=eval_info["n_global_outliers"],
+                n_site_dense_excluded=eval_info["n_site_dense_excluded"],
                 eval_domain_d=eval_info["eval_domain_d"],
                 eval_domain_short=eval_info["eval_domain_short"],
                 params=params,
@@ -377,8 +405,12 @@ def selftest():
     for s in sites:
         for i in range(25):
             counts[(s, f"f{i}")] = {"bmabz": 4, "d": 2, "bp": 4}
-    # one dense chorus file -> must be excluded and kept in training
+    # one dense chorus file -> global outlier, kept in training
     counts[("site0", "f12")] = {"bmabz": 40, "d": 40, "bp": 40}
+    # per-site densest file that is NOT a global outlier (d=4 < 2% of total):
+    # must still be excluded by the per-site quantile guard, not held out.
+    for s in sites:
+        counts[(s, "f7")] = {"bmabz": 4, "d": 4, "bp": 4}
     floors = {"bmabz": 10, "d": 10, "bp": 10}
 
     sel, ach, exh, info = select_holdout(
@@ -386,9 +418,13 @@ def selftest():
         prefer_order=["d", "bp", "bmabz"], exclude_dense_frac=0.02,
         retain_frac=0.08, seed=0)
 
-    # dense chorus never held out
-    assert ("site0", "f12") not in {(ds, fn) for ds, fns in sel.items()
-                                    for fn in fns}, "dense file was held out!"
+    held = {(ds, fn) for ds, fns in sel.items() for fn in fns}
+    # global-outlier chorus never held out
+    assert ("site0", "f12") not in held, "global-dense file was held out!"
+    # per-site densest files (not global outliers) also kept in training
+    assert all((s, "f7") not in held for s in sites), \
+        "per-site densest file was held out!"
+    assert info["n_site_dense_excluded"] > 0 and info["n_global_outliers"] >= 1, info
     # spread: every site represented
     assert set(sel) == set(sites), ("missing sites", sel.keys())
     # floors met
@@ -441,7 +477,8 @@ def selftest():
 
     print(f"  base: {sum(len(v) for v in sel.values())} files across "
           f"{len(sel)} sites; held_frac={ {k: round(v,3) for k,v in info['held_frac'].items()} }")
-    print(f"  dense files excluded: {info['n_outliers_excluded']}; "
+    print(f"  dense files excluded: {info['n_global_outliers']} global + "
+          f"{info['n_site_dense_excluded']} per-site; "
           f"eval floor meetable={not info_e['eval_domain_short']}; "
           f"retain-cap binds on forced floor={'d' in exh_r}")
     print("[selftest] OK")
@@ -471,6 +508,12 @@ def parse_args():
     p.add_argument("--retain-frac", type=float, default=RETAIN_FRAC,
                    help="Max fraction of any class's events that may leave "
                         f"training (default {RETAIN_FRAC}).")
+    p.add_argument("--site-dense-quantile", type=float,
+                   default=SITE_DENSE_QUANTILE,
+                   help="Drop this densest fraction of each site's files from "
+                        "candidacy (keeps per-site choruses in training; the "
+                        f"main spread/representativeness guard, default "
+                        f"{SITE_DENSE_QUANTILE}).")
     p.add_argument("--eval-domain-sites", nargs="+", default=EVAL_DOMAIN_SITES,
                    metavar="SITE")
     p.add_argument("--eval-domain-max-per-site", type=int,
@@ -511,7 +554,8 @@ def main():
         eval_domain_max_per_site=args.eval_domain_max_per_site,
         min_eval_domain_d=args.min_eval_domain_d,
         exclude_dense_frac=args.exclude_dense_frac,
-        retain_frac=args.retain_frac, seed=args.seed)
+        retain_frac=args.retain_frac,
+        site_dense_quantile=args.site_dense_quantile, seed=args.seed)
 
     report(selected, achieved, exhausted, eval_info, floors, counts,
            manifest, args.eval_domain_sites)
@@ -519,7 +563,8 @@ def main():
     params = dict(files_per_site=args.files_per_site,
                   max_per_site=args.max_per_site, min_gap=args.min_gap,
                   exclude_dense_frac=args.exclude_dense_frac,
-                  retain_frac=args.retain_frac, seed=args.seed,
+                  retain_frac=args.retain_frac,
+                  site_dense_quantile=args.site_dense_quantile, seed=args.seed,
                   eval_domain_sites=args.eval_domain_sites,
                   eval_domain_max_per_site=args.eval_domain_max_per_site,
                   min_eval_domain_d=args.min_eval_domain_d)
