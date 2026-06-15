@@ -14,19 +14,22 @@ The annotation column carries the model's coarse label {bmabz, d, bp} as-is --
 the challenge scorer relabels d -> fm internally, so we must submit 'd', not 'fm'.
 Matching is by ISO8601 datetime within a +/-2 min window.
 
+Per-checkpoint EVAL probabilities are cached under --eval-cache-dir (separate from
+the dev cache), so an ensemble run is resumable: a seed already inferred is reused
+instantly on a re-run, and a crash mid-ensemble does not throw away finished seeds.
+
     # single best seed
     CUDA_VISIBLE_DEVICES=0 python nave_make_submission.py \
         --checkpoints runs/phase13r_3c_s666_20260612_132012/phase13r_best.pt \
         --eval-root /home/matthias-nagl/BioDCASE/task/2026_BioDCASE_evaluation_set \
+        --audio-subdir evaluation/audio \
         --segment-s 60 --use_fp16 --val-workers 20 --out-dir runs/submission_s666
 
-    # ensemble of seeds (probabilities averaged)
+    # ensemble (probabilities averaged; each seed cached on first pass)
     CUDA_VISIBLE_DEVICES=0 python nave_make_submission.py \
-        --checkpoints runs/phase13r_3c_s666_*/phase13r_best.pt \
-                      runs/phase13r_3c_s1337_*/phase13r_best.pt \
-                      runs/phase13r_3c_s42_20260607_194714/phase13r_best.pt \
-        --eval-root .../2026_BioDCASE_evaluation_set --segment-s 60 --use_fp16 \
-        --out-dir runs/submission_ens3
+        --checkpoints <ckpt1> <ckpt2> ... <ckptN> \
+        --eval-root .../2026_BioDCASE_evaluation_set --audio-subdir evaluation/audio \
+        --segment-s 60 --use_fp16 --out-dir runs/submission_ens
 
 ASSUMPTIONS (verify against your actual eval release):
   * eval audio laid out as  <eval-root>/<audio-subdir>/<site>/*.wav
@@ -49,6 +52,7 @@ import pandas as pd
 import soundfile as sf
 import torch
 from torch.utils.data import DataLoader
+from tqdm import tqdm
 
 import nave_config as cfg
 from dataset_final import (
@@ -72,7 +76,7 @@ def parse_args():
     p.add_argument("--eval-root", required=True,
                    help="Root of the evaluation set (contains the audio subdir).")
     p.add_argument("--audio-subdir", default="audio",
-                   help="Subdir under --eval-root holding the audio (default 'audio').")
+                   help="Subdir under --eval-root holding the audio (e.g. 'evaluation/audio').")
     p.add_argument("--flat", action="store_true",
                    help="WAVs sit directly under the audio dir (one dataset).")
     p.add_argument("--dataset-name", default=None,
@@ -83,7 +87,10 @@ def parse_args():
                    help="Per-checkpoint ensemble weights (default uniform).")
     p.add_argument("--tune-metric", choices=["f1", "official"], default="f1")
     p.add_argument("--out-dir", default="runs/submission")
-    p.add_argument("--cache_dir", default="runs/nave_prob_cache")
+    p.add_argument("--cache_dir", default="runs/nave_prob_cache",
+                   help="DEV prob cache (reused from earlier dev evals).")
+    p.add_argument("--eval-cache-dir", default="runs/nave_eval_prob_cache",
+                   help="EVAL prob cache (separate from dev; keeps ensemble runs resumable).")
     p.add_argument("--no_cache", action="store_true")
     p.add_argument("--use_fp16", action="store_true")
     p.add_argument("--val-workers", type=int, default=min((os.cpu_count() or 1), 13))
@@ -177,7 +184,7 @@ def main():
     dev_B = macro_f1_paper(evaluate_with_thresholds(dev_probs, gt, thr))
     print(f"  dev B={dev_B:.4f}  thresholds={[round(float(t),3) for t in thr]}")
 
-    # ---------- 2. inference on the EVALUATION audio ----------
+    # ---------- 2. inference on the EVALUATION audio (cached per checkpoint) ----------
     eval_manifest = build_eval_manifest(args.eval_root, args.audio_subdir,
                                         args.flat, args.dataset_name)
     eval_start_dts = {(r["dataset"], r["filename"]): r["start_dt"]
@@ -190,14 +197,16 @@ def main():
                              shuffle=False, num_workers=cfg.NUM_WORKERS,
                              collate_fn=collate_fn, pin_memory=True)
 
+    def eval_loader_factory():
+        # fresh tqdm wrapper each call so the progress bar restarts per uncached seed
+        return tqdm(eval_loader, total=len(eval_loader), desc="    eval", ncols=80)
+
     eval_dicts = []
     for i, ckpt in enumerate(args.checkpoints):
-        print(f"    [{i+1}/{n}] inference: {Path(ckpt).parent.name}")
-        model, spec = load_model_spec(ckpt, device)
-        eval_dicts.append(predict_probs(model, spec, eval_loader, device, args.use_fp16))
-        del model
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+        print(f"    [{i+1}/{n}] {Path(ckpt).parent.name}")
+        eval_dicts.append(get_or_compute(ckpt, eval_loader_factory, device,
+                                         Path(args.eval_cache_dir), args.segment_s,
+                                         args.no_cache, args.use_fp16))
     eval_probs = combine_probs(eval_dicts, args.weights)
 
     # ---------- 3. detections -> submission rows ----------
@@ -228,6 +237,9 @@ def main():
     print("  detections per class:")
     for lbl, c in sub["annotation"].value_counts().items():
         print(f"    {lbl:6} {c}")
+    print("  detections per dataset:")
+    for ds, c in sub["dataset"].value_counts().items():
+        print(f"    {ds:16} {c}")
     print("\n  Sanity-check the first rows before submitting:")
     print(sub.head(6).to_string(index=False))
 
