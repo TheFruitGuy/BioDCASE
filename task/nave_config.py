@@ -129,14 +129,6 @@ POST_MIN_DUR_S = 0.5
 POST_MAX_DUR_S = 30.0
 IOU_THRESHOLD = 0.3             # event-matching IoU for metrics
 
-# ----------------------------------------------------------------------
-# Experiment tracking (fresh project for the NAVE line)
-# ----------------------------------------------------------------------
-WANDB_ENTITY = "bio-dcase"
-WANDB_PROJECT = "nave-whale-sed"
-WANDB_MODE = "online"
-
-
 def n_classes() -> int:
     return N_CLASSES
 

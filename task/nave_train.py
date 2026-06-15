@@ -2,8 +2,8 @@
 NAVE training entry point (self-contained).
 ===========================================
 Trains a single NAVE model (the locked recipe) and checkpoints the EMA weights
-selected by tuned macro F1. Builds the clean ``NAVE`` model and logs to a fresh
-Weights & Biases project (``cfg.WANDB_PROJECT``).
+selected by tuned macro F1. Builds the clean ``NAVE`` model and logs progress to
+stdout (no external experiment tracker).
 
     CUDA_VISIBLE_DEVICES=0 python nave_train.py --seed 42
     CUDA_VISIBLE_DEVICES=1 python nave_train.py --seed 2024 --tune-workers 20
@@ -1303,7 +1303,6 @@ def parse_args():
                    help="Run seed (vary it to build the ensemble).")
     p.add_argument("--tune-workers", type=int, default=8,
                    help="Parallel workers for the per-epoch threshold tuner.")
-    p.add_argument("--no-wandb", action="store_true", help="Disable W&B logging.")
     return p.parse_args()
 
 
@@ -1315,25 +1314,7 @@ def main():
     print(f"[NAVE] device={device}  seed={seed}  epochs={epochs}  k={cfg.CONV_KERNEL}")
 
     train_sites, val_sites = list(cfg.TRAIN_DATASETS), list(cfg.VAL_DATASETS)
-    pos_weight, weight_info = compute_pos_weight(train_sites, device, verbose=True)
-
-    # --- W&B (fresh NAVE project) ---
-    run = None
-    if not args.no_wandb:
-        import wandb
-        run = wandb.init(
-            entity=cfg.WANDB_ENTITY, project=cfg.WANDB_PROJECT, mode=cfg.WANDB_MODE,
-            name=f"nave_s{seed}", group="nave_final",
-            tags=["nave", "conformer", "fdy", "pcen", f"k{cfg.CONV_KERNEL}"],
-            config={
-                "model": "NAVE", "seed": seed, "epochs": epochs,
-                "d_model": cfg.D_MODEL, "nhead": cfg.NHEAD, "layers": cfg.NUM_LAYERS,
-                "ffn_mult": cfg.FFN_MULT, "conv_kernel": cfg.CONV_KERNEL,
-                "dropout": cfg.DROPOUT, "fdy_basis": cfg.FDY_BASIS,
-                "optimizer": cfg.OPTIMIZER, "lr": cfg.LR, "weight_decay": cfg.WEIGHT_DECAY,
-                "ema_decay": cfg.EMA_DECAY, "batch_size": cfg.BATCH_SIZE,
-                "neg_ratio": cfg.NEG_RATIO, "pos_weight": weight_info["pos_weight"],
-            })
+    pos_weight, _ = compute_pos_weight(train_sites, device, verbose=True)
 
     run_dir = Path(cfg.OUTPUT_DIR) / f"nave_s{seed}_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -1414,14 +1395,6 @@ def main():
             pc = val["per_class"][name]
             print(f"    {name.upper():6} P={pc['precision']:.3f} R={pc['recall']:.3f} F1={pc['f1']:.3f}")
 
-        if run is not None:
-            import wandb
-            wandb.log({"train/loss": train_loss, "val/loss": val["loss"],
-                       "val/macro_f1": macro, "val/f1_micro": val["f1"],
-                       "val/macro_paper": val["macro_paper"],
-                       **{f"val/f1_{c}": val["per_class"][c]["f1"] for c in cfg.CALL_TYPES_3}},
-                      step=epoch)
-
         ckpt = {"model_state_dict": eval_state, "epoch": epoch, "seed": seed,
                 "macro_f1": macro, "thresholds": val.get("thresholds"),
                 "model": "NAVE", "ema_decay": cfg.EMA_DECAY}
@@ -1430,9 +1403,6 @@ def main():
             torch.save(ckpt, run_dir / "nave_best.pt")
 
     print(f"\n[NAVE] best tuned macro F1 = {best_macro:.3f}   ->  {run_dir/'nave_best.pt'}")
-    if run is not None:
-        run.summary["best_macro_f1"] = best_macro
-        run.finish()
 
 
 if __name__ == "__main__":

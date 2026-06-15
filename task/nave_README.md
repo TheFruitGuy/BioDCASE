@@ -31,7 +31,6 @@ Python ≥ 3.10 and:
 
 ```bash
 pip install torch numpy pandas scipy soundfile tqdm
-pip install wandb        # optional; or always pass --no-wandb
 ```
 
 `tqdm` is optional (a no-op fallback is used if missing). Parquet caching of the
@@ -66,9 +65,6 @@ Post: 500 ms median smooth -> tuned per-class thresholds -> 0.5 s merge gap ->
 ```bash
 # train one seed (vary --seed to build an ensemble of checkpoints)
 CUDA_VISIBLE_DEVICES=0 python nave_train.py --seed 42 --tune-workers 20
-
-# without Weights & Biases
-CUDA_VISIBLE_DEVICES=0 python nave_train.py --seed 42 --no-wandb
 ```
 
 Each run writes `runs/nave_s<seed>_<timestamp>/nave_best.pt` (best tuned macro)
@@ -107,8 +103,8 @@ m, meta = NAVE.from_legacy_checkpoint("runs/phase13r_3c_s42_<ts>/phase13r_best.p
 print("loaded NAVE", sum(p.numel() for p in m.parameters()), meta)
 ```
 
-## Experiment tracking
+## Logging
 
-`nave_train.py` logs to the W&B project `cfg.WANDB_ENTITY/cfg.WANDB_PROJECT`
-(`bio-dcase/nave-whale-sed`, group `nave_final`). Set these in `nave_config.py`
-or disable logging entirely with `--no-wandb`.
+Training progress -- per-epoch train/val loss, per-class P/R/F1, the tuned
+per-class thresholds and the running best macro F1 -- is printed to stdout.
+There is no external experiment tracker.
