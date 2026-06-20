@@ -2,35 +2,55 @@
 NAVE single-checkpoint evaluation.
 ==================================
 Loads a NAVE checkpoint (native, or legacy ``train_phase13r``), runs one
-inference pass over the validation sites, tunes per-class thresholds and reports
-per-class P/R/F1 + macro F1 (the official metric) and macro_paper.
+inference pass over the validation sites, tunes per-class thresholds and
+reports per-class P/R/F1 + macro F1 (the official metric) and macro_paper.
 
     CUDA_VISIBLE_DEVICES=0 python nave_evaluate.py runs/nave_s42_*/nave_best.pt --workers 13
     CUDA_VISIBLE_DEVICES=0 python nave_evaluate.py runs/phase13r_3c_s42_*/phase13r_best.pt
 
-Reuses the verified probability collector + tuner from ``eval_conformer`` (it
-takes any (model, spec) pair, so NAVE plugs straight in).
+Self-contained
+--------------
+Depends only on the other NAVE files (``nave_config`` / ``nave_features`` /
+``nave_model`` / ``nave_train``). The val-set loader, post-processing, metrics
+and per-class threshold tuner are imported from ``nave_train`` (where they are
+inlined). Anything not in those four files is third-party (``torch``, ``numpy``).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+from contextlib import nullcontext
 from pathlib import Path
 
+import numpy as np
 import torch
+from torch.utils.data import DataLoader
 
 import nave_config as cfg
 from nave_model import NAVE
 from nave_features import NAVEFeatureExtractor
-from eval_conformer import (
-    collect_val_probs, tune_thresholds_per_class, evaluate_with_thresholds,
-    macro_f1, macro_f1_paper, CLASS_NAMES,
+from nave_train import (
+    CLASS_NAMES,
+    Detection,
+    WhaleDataset,
+    build_val_segments,
+    collapse_probs_to_3class,
+    collate_fn,
+    compute_metrics,
+    get_file_manifest,
+    load_annotations,
+    postprocess_predictions,
+    tune_thresholds_per_class,
 )
 
 
+# ----------------------------------------------------------------------
+# Checkpoint loader (native or legacy phase13r, auto-detected)
+# ----------------------------------------------------------------------
+
 def build_nave_from_ckpt(path, device):
-    """Auto-detect legacy vs native NAVE checkpoint and return (model, stored_thr)."""
+    """Auto-detect legacy vs native NAVE checkpoint; return (model, stored_thr)."""
     ckpt = torch.load(path, map_location="cpu", weights_only=False)
     sd = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
     is_legacy = any(k.startswith("_inner.") for k in sd)
@@ -44,13 +64,92 @@ def build_nave_from_ckpt(path, device):
     return model.to(device).eval(), stored_thr
 
 
+# ----------------------------------------------------------------------
+# Validation-set inference (one forward pass over the val sites)
+# ----------------------------------------------------------------------
+
+@torch.no_grad()
+def collect_val_probs(model, spec_extractor, device, use_fp16: bool = False):
+    """Reproduce the val-set probability collection from training. Returns
+    ``(probs3, gt_events)`` where ``probs3`` is a dict keyed by
+    ``(dataset, filename, start_sample)`` with ``(n_frames, 3)`` float arrays
+    and ``gt_events`` is a list of :class:`Detection` ground truths."""
+    val_sites = list(cfg.VAL_DATASETS)
+    val_manifest = get_file_manifest(val_sites)
+    val_annotations = load_annotations(val_sites, manifest=val_manifest)
+    val_segments = build_val_segments(val_manifest, val_annotations)
+    loader = DataLoader(
+        WhaleDataset(val_segments), batch_size=cfg.BATCH_SIZE, shuffle=False,
+        num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
+    )
+    file_start_dts = {(r["dataset"], r["filename"]): r["start_dt"]
+                      for _, r in val_manifest.iterrows()}
+
+    autocast = (torch.autocast("cuda", dtype=torch.float16)
+                if (use_fp16 and device.type == "cuda") else nullcontext())
+    hop = spec_extractor.hop_length
+    raw: dict = {}
+    for audio, _t, _m, metas in loader:
+        audio = audio.to(device)
+        with autocast:
+            logits = model(spec_extractor(audio))
+        probs = torch.sigmoid(logits).float().cpu().numpy()
+        for j, meta in enumerate(metas):
+            key = (meta["dataset"], meta["filename"], meta["start_sample"])
+            n_samp = meta["end_sample"] - meta["start_sample"]
+            n_frames = min(n_samp // hop, probs[j].shape[0])
+            raw[key] = probs[j, :n_frames, :]
+
+    probs3 = collapse_probs_to_3class(raw)             # no-op for the 3-class NAVE head
+
+    gt_events: list[Detection] = []
+    for _, row in val_annotations.iterrows():
+        fsd = file_start_dts.get((row["dataset"], row["filename"]))
+        if fsd is None:
+            continue
+        gt_events.append(Detection(
+            dataset=row["dataset"], filename=row["filename"],
+            label=row["label_3class"],
+            start_s=(row["start_datetime"] - fsd).total_seconds(),
+            end_s=(row["end_datetime"] - fsd).total_seconds(),
+        ))
+    return probs3, gt_events
+
+
+# ----------------------------------------------------------------------
+# Threshold application + macro F1 reductions
+# ----------------------------------------------------------------------
+
+def evaluate_with_thresholds(probs, gt_events, thresholds):
+    """Apply per-class thresholds and compute the event-level metrics dict."""
+    preds = postprocess_predictions(probs, np.asarray(thresholds, dtype=np.float64))
+    return compute_metrics(preds, gt_events, iou_threshold=cfg.IOU_THRESHOLD)
+
+
+def macro_f1(metrics) -> float:
+    """Mean of the three per-class F1s (the official challenge metric)."""
+    return float(np.mean([metrics.get(c, {}).get("f1", 0.0) for c in CLASS_NAMES]))
+
+
+def macro_f1_paper(metrics) -> float:
+    """Paper-convention macro F1: F1 of mean P and mean R across the 3 classes."""
+    p = float(np.mean([metrics.get(c, {}).get("precision", 0.0) for c in CLASS_NAMES]))
+    r = float(np.mean([metrics.get(c, {}).get("recall", 0.0) for c in CLASS_NAMES]))
+    return 2.0 * p * r / (p + r + 1e-8)
+
+
+# ----------------------------------------------------------------------
+# CLI
+# ----------------------------------------------------------------------
+
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("ckpt", type=Path, help="NAVE checkpoint (native or legacy).")
     p.add_argument("--workers", type=int, default=8, help="Threshold-tuner workers.")
     p.add_argument("--fp16", action="store_true", help="fp16 inference.")
-    p.add_argument("--out", type=Path, default=None, help="Write tuned thresholds JSON here.")
+    p.add_argument("--out", type=Path, default=None,
+                   help="Write tuned thresholds JSON here.")
     return p.parse_args()
 
 
@@ -60,7 +159,8 @@ def main():
 
     model, _stored = build_nave_from_ckpt(args.ckpt, device)
     spec = NAVEFeatureExtractor().to(device)
-    print(f"[NAVE eval] {args.ckpt}  ({sum(p.numel() for p in model.parameters()):,} params)")
+    print(f"[NAVE eval] {args.ckpt}  "
+          f"({sum(p.numel() for p in model.parameters()):,} params)")
 
     probs, gt = collect_val_probs(model, spec, device, args.fp16)
     thr = tune_thresholds_per_class(probs, gt, workers=args.workers)
@@ -69,8 +169,8 @@ def main():
     print(f"\n  thresholds: {[round(float(t), 3) for t in thr]}")
     for name in CLASS_NAMES:
         m = metrics.get(name, {})
-        print(f"    {name.upper():6} P={m.get('precision',0):.3f} "
-              f"R={m.get('recall',0):.3f} F1={m.get('f1',0):.3f}")
+        print(f"    {name.upper():6} P={m.get('precision', 0):.3f} "
+              f"R={m.get('recall', 0):.3f} F1={m.get('f1', 0):.3f}")
     print(f"\n  MACRO F1 (official) = {macro_f1(metrics):.4f}")
     print(f"  macro_paper         = {macro_f1_paper(metrics):.4f}")
 
