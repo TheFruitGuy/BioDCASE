@@ -129,17 +129,21 @@ POST_MIN_DUR_S = 0.5
 POST_MAX_DUR_S = 30.0
 IOU_THRESHOLD = 0.3             # event-matching IoU for metrics
 
-# ----------------------------------------------------------------------
-# Experiment tracking (fresh project for the NAVE line)
-# ----------------------------------------------------------------------
-WANDB_ENTITY = "bio-dcase"
-WANDB_PROJECT = "nave-whale-sed"
-WANDB_MODE = "online"
-
-
 def n_classes() -> int:
     return N_CLASSES
 
 
 def n_feat_channels() -> int:
     return FEAT_CHANNELS
+
+
+def class_names() -> list[str]:
+    """Ordered class labels currently in use. NAVE is locked to the 3 coarse
+    classes (``USE_3CLASS`` is always True); the 7-class branch is kept only so
+    the shared post-processing helpers stay general."""
+    return list(CALL_TYPES_3) if USE_3CLASS else list(CALL_TYPES_7)
+
+
+def class_to_idx() -> dict[str, int]:
+    """Mapping from class name to zero-based output index."""
+    return {c: i for i, c in enumerate(class_names())}
