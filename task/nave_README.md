@@ -84,9 +84,9 @@ tuned per-class `thresholds`, `macro_f1`, `epoch` and `seed`.
 
 `nave_evaluate.py` runs one forward pass over `cfg.VAL_DATASETS`, tunes per-class
 thresholds with the same coordinate-descent grid the training loop uses, and
-prints per-class P/R/F1, macro F1 (the official metric) and macro_paper. Pass
-`--fp16` for autocast inference and `--out path.json` to dump the tuned
-thresholds.
+prints the tuned thresholds plus the macro F1 (the official challenge metric,
+labelled simply `F1` in the output). Pass `--fp16` for autocast inference and
+`--out path.json` to dump the tuned thresholds.
 
 Load a trained checkpoint anywhere:
 
