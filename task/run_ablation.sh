@@ -24,9 +24,21 @@ PY="${PY:-/home/matthias-nagl/.conda/envs/bio/bin/python}"
 WORKERS="${WORKERS:-20}"
 EVAL_SEG="${EVAL_SEG:-60}"
 
+# W&B logging on by default; disable with WANDB=0. nave_train only logs if a
+# user is configured in the env (WANDB_API_KEY or WANDB_ENTITY).
+WANDB_FLAG=""
+if [[ "${WANDB:-1}" == "1" ]]; then
+  WANDB_FLAG="--wandb"
+  if [[ -z "${WANDB_API_KEY:-}" && -z "${WANDB_ENTITY:-}" ]]; then
+    echo "!! WANDB requested but no WANDB_API_KEY/WANDB_ENTITY in env --"
+    echo "   logging will be skipped. export WANDB_ENTITY=the_fruit_guy first"
+    echo "   (and WANDB_PROJECT to override the default 'nave-whale-sed')."
+  fi
+fi
+
 echo "=== NAVE ablation ladder | seed=$SEED | CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset} ==="
 echo "    python : $PY"
-echo "    workers: $WORKERS    eval segment: ${EVAL_SEG}s"
+echo "    workers: $WORKERS    eval segment: ${EVAL_SEG}s    wandb: ${WANDB_FLAG:-off}"
 
 # rung label | train flags | run-dir tag (must equal cfg.ablation_tag())
 names=( base                            +fdy                       +pcen               +k65                full_k129 )
@@ -41,7 +53,7 @@ for i in "${!names[@]}"; do
   echo " [$((i + 1))/${#names[@]}] TRAIN ${name}  (seed ${SEED}; flags: ${flag:-<full NAVE>})"
   echo "===================================================================="
   # shellcheck disable=SC2086  -- intentional word-split of the flag string
-  $PY nave_train.py --seed "$SEED" $flag --tune-workers "$WORKERS" \
+  $PY nave_train.py --seed "$SEED" $flag --tune-workers "$WORKERS" $WANDB_FLAG \
     || { echo "!! train ${name} failed; skipping to next rung"; continue; }
 
   rundir=$(ls -dt runs/nave_s${SEED}_${tag}_*/ 2>/dev/null | head -1)
