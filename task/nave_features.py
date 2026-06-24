@@ -77,6 +77,10 @@ class NAVEFeatureExtractor(nn.Module):
         angle = demeaned.angle()
         base = torch.stack([demeaned.abs(), torch.cos(angle), torch.sin(angle)], dim=1)
 
+        # ablation: drop the PCEN channel -> 3-ch base front end
+        if not cfg.USE_PCEN:
+            return base                                     # (B, 3, F, T)
+
         # channel 3: fixed PCEN on the RAW (non-demeaned) magnitude
         pcen = self._pcen(stft.abs()).unsqueeze(1)          # (B, 1, F, T)
         return torch.cat([base, pcen], dim=1)               # (B, 4, F, T)

@@ -49,9 +49,20 @@ from nave_train import (
 # ----------------------------------------------------------------------
 
 def build_nave_from_ckpt(path, device):
-    """Load a NAVE checkpoint; return (model, stored_thr)."""
+    """Load a NAVE checkpoint, restoring its ablation config FIRST so the
+    rebuilt architecture matches (strict load). Old checkpoints without a
+    stored config default to the full NAVE recipe. Returns (model, stored_thr)."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    conf = ckpt.get("config", {}) if isinstance(ckpt, dict) else {}
+    cfg.apply_ablation(
+        use_pcen=conf.get("use_pcen", True),
+        use_fdy=conf.get("use_fdy", True),
+        conv_kernel=conf.get("conv_kernel", cfg.CONV_KERNEL),
+    )
     model = NAVE()
-    ckpt = model.load_checkpoint(path, map_location=device)
+    sd = (ckpt["model_state_dict"]
+          if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt)
+    model.load_state_dict(sd, strict=True)
     stored_thr = ckpt.get("thresholds") if isinstance(ckpt, dict) else None
     return model.to(device).eval(), stored_thr
 
@@ -61,7 +72,8 @@ def build_nave_from_ckpt(path, device):
 # ----------------------------------------------------------------------
 
 @torch.no_grad()
-def collect_val_probs(model, spec_extractor, device, use_fp16: bool = False):
+def collect_val_probs(model, spec_extractor, device, use_fp16: bool = False,
+                      segment_s: float = cfg.EVAL_SEGMENT_S):
     """Reproduce the val-set probability collection from training. Returns
     ``(probs3, gt_events)`` where ``probs3`` is a dict keyed by
     ``(dataset, filename, start_sample)`` with ``(n_frames, 3)`` float arrays
@@ -69,7 +81,7 @@ def collect_val_probs(model, spec_extractor, device, use_fp16: bool = False):
     val_sites = list(cfg.VAL_DATASETS)
     val_manifest = get_file_manifest(val_sites)
     val_annotations = load_annotations(val_sites, manifest=val_manifest)
-    val_segments = build_val_segments(val_manifest, val_annotations)
+    val_segments = build_val_segments(val_manifest, val_annotations, segment_s=segment_s)
     loader = DataLoader(
         WhaleDataset(val_segments), batch_size=cfg.BATCH_SIZE, shuffle=False,
         num_workers=cfg.NUM_WORKERS, collate_fn=collate_fn, pin_memory=True,
@@ -133,6 +145,8 @@ def parse_args():
     p.add_argument("ckpt", type=Path, help="NAVE checkpoint.")
     p.add_argument("--workers", type=int, default=8, help="Threshold-tuner workers.")
     p.add_argument("--fp16", action="store_true", help="fp16 inference.")
+    p.add_argument("--segment-s", type=float, default=cfg.EVAL_SEGMENT_S,
+                   help="Eval tile length in seconds (use 60 to match the paper).")
     p.add_argument("--out", type=Path, default=None,
                    help="Write tuned thresholds JSON here.")
     return p.parse_args()
@@ -146,13 +160,28 @@ def main():
     spec = NAVEFeatureExtractor().to(device)
     print(f"[NAVE eval] {args.ckpt}  "
           f"({sum(p.numel() for p in model.parameters()):,} params)")
+    print(f"  ablation: {cfg.ablation_tag()}  PCEN={cfg.USE_PCEN}  FDY={cfg.USE_FDY}"
+          f"  | segment={args.segment_s:.0f}s")
 
-    probs, gt = collect_val_probs(model, spec, device, args.fp16)
+    probs, gt = collect_val_probs(model, spec, device, args.fp16,
+                                  segment_s=args.segment_s)
     thr = tune_thresholds_per_class(probs, gt, workers=args.workers)
     metrics = evaluate_with_thresholds(probs, gt, thr)
 
+    names = CLASS_NAMES
+    macro_a = float(np.mean([metrics.get(c, {}).get("f1", 0.0) for c in names]))
+    p_bar = float(np.mean([metrics.get(c, {}).get("precision", 0.0) for c in names]))
+    r_bar = float(np.mean([metrics.get(c, {}).get("recall", 0.0) for c in names]))
+    macro_b = 2 * p_bar * r_bar / (p_bar + r_bar + 1e-8)
+
     print(f"\n  thresholds: {[round(float(t), 3) for t in thr]}")
-    print(f"  F1 = {f1(metrics):.4f}")
+    print(f"  {'class':6} {'P':>7} {'R':>7} {'F1':>7}")
+    for c in names:
+        m = metrics.get(c, {})
+        print(f"  {c.upper():6} {m.get('precision', 0.0):7.3f} "
+              f"{m.get('recall', 0.0):7.3f} {m.get('f1', 0.0):7.3f}")
+    print(f"  macro F1 (mean per-class, A) = {macro_a:.4f}")
+    print(f"  official B (F1 of mean P, R) = {macro_b:.4f}")
 
     if args.out:
         args.out.write_text(json.dumps(

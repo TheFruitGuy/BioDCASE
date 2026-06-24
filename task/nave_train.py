@@ -1300,20 +1300,81 @@ def parse_args():
                    help="Run seed (vary it to build the ensemble).")
     p.add_argument("--tune-workers", type=int, default=8,
                    help="Parallel workers for the per-epoch threshold tuner.")
+    # --- ablation toggles (full NAVE is the default; flags turn parts off) ---
+    p.add_argument("--no-pcen", dest="use_pcen", action="store_false",
+                   help="Drop the PCEN channel (3-ch base front end).")
+    p.add_argument("--no-fdy", dest="use_fdy", action="store_false",
+                   help="Plain Conv2d stem instead of frequency-dynamic (FDY).")
+    p.add_argument("--conv-kernel", type=int, default=cfg.CONV_KERNEL,
+                   help="Conformer depthwise kernel (129 full; try 65, 31).")
+    # --- optional W&B logging (no wandb_utils; off unless explicitly enabled) ---
+    p.add_argument("--wandb", action="store_true",
+                   help="Log to W&B (only if a user is configured in the env).")
+    p.add_argument("--wandb-project",
+                   default=os.environ.get("WANDB_PROJECT", "nave-whale-sed"),
+                   help="W&B project (default $WANDB_PROJECT or 'nave-whale-sed').")
+    p.add_argument("--wandb-entity", default=None,
+                   help="W&B entity (default $WANDB_ENTITY).")
+    p.set_defaults(use_pcen=True, use_fdy=True)
     return p.parse_args()
+
+
+def maybe_init_wandb(args, run_dir, n_params: int):
+    """Initialise W&B only when ``--wandb`` is set AND a user is configured in
+    the environment (``WANDB_API_KEY`` or ``WANDB_ENTITY``). Standalone -- no
+    ``wandb_utils`` import. Any problem degrades to ``None`` so a run never
+    depends on logging being available. Returns the ``wandb`` module or ``None``."""
+    if not getattr(args, "wandb", False):
+        return None
+    try:
+        import wandb
+    except Exception:
+        print("[wandb] requested but not installed; continuing without logging.")
+        return None
+    entity = args.wandb_entity or os.environ.get("WANDB_ENTITY")
+    if not (entity or os.environ.get("WANDB_API_KEY") or os.environ.get("WANDB_USERNAME")):
+        print("[wandb] no user in env (set WANDB_API_KEY or WANDB_ENTITY); "
+              "logging disabled.")
+        return None
+    try:
+        wandb.init(
+            project=args.wandb_project,
+            entity=entity,
+            name=run_dir.name,
+            dir=str(run_dir),
+            config=dict(
+                seed=args.seed, epochs=cfg.EPOCHS, batch_size=cfg.BATCH_SIZE,
+                lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY, ema_decay=cfg.EMA_DECAY,
+                optimizer=cfg.OPTIMIZER, conv_kernel=cfg.CONV_KERNEL,
+                use_pcen=cfg.USE_PCEN, use_fdy=cfg.USE_FDY,
+                feat_channels=cfg.FEAT_CHANNELS, neg_ratio=cfg.NEG_RATIO,
+                train_segment_s=cfg.TRAIN_SEGMENT_S, eval_segment_s=cfg.EVAL_SEGMENT_S,
+                ablation_tag=cfg.ablation_tag(), n_params=n_params,
+            ),
+        )
+        print(f"[wandb] logging to '{args.wandb_project}' as run '{run_dir.name}'"
+              f"{f' (entity {entity})' if entity else ''}")
+        return wandb
+    except Exception as e:
+        print(f"[wandb] init failed ({type(e).__name__}: {e}); continuing without logging.")
+        return None
 
 
 def main():
     args = parse_args()
+    cfg.apply_ablation(use_pcen=args.use_pcen, use_fdy=args.use_fdy,
+                       conv_kernel=args.conv_kernel)
     seed = seed_everything(args.seed, deterministic=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     epochs = cfg.EPOCHS
     print(f"[NAVE] device={device}  seed={seed}  epochs={epochs}  k={cfg.CONV_KERNEL}")
+    print(f"[NAVE] ablation: PCEN={cfg.USE_PCEN}  FDY={cfg.USE_FDY}  "
+          f"k={cfg.CONV_KERNEL}  feat_ch={cfg.FEAT_CHANNELS}  ({cfg.ablation_tag()})")
 
     train_sites, val_sites = list(cfg.TRAIN_DATASETS), list(cfg.VAL_DATASETS)
     pos_weight, _ = compute_pos_weight(train_sites, device, verbose=True)
 
-    run_dir = Path(cfg.OUTPUT_DIR) / f"nave_s{seed}_{time.strftime('%Y%m%d_%H%M%S')}"
+    run_dir = Path(cfg.OUTPUT_DIR) / f"nave_s{seed}_{cfg.ablation_tag()}_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[NAVE] run dir: {run_dir}")
 
@@ -1336,7 +1397,9 @@ def main():
     # --- model / loss / optim ---
     model = NAVE().to(device)
     spec_extractor = NAVEFeatureExtractor().to(device)
-    print(f"[NAVE] parameters: {sum(p.numel() for p in model.parameters()):,}")
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"[NAVE] parameters: {n_params:,}")
+    wb = maybe_init_wandb(args, run_dir, n_params)
 
     train_criterion = MaskedBCELoss(pos_weight=pos_weight).to(device)
     val_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight).to(device)
@@ -1392,14 +1455,28 @@ def main():
             pc = val["per_class"][name]
             print(f"    {name.upper():6} P={pc['precision']:.3f} R={pc['recall']:.3f} F1={pc['f1']:.3f}")
 
+        if wb is not None:
+            log = {"epoch": epoch, "train_loss": train_loss, "val_loss": val["loss"],
+                   "macro_A": macro, "macro_B": val.get("macro_paper", 0.0),
+                   "best_macro_A": best_macro}
+            for name in cfg.CALL_TYPES_3:
+                pc = val["per_class"][name]
+                log[f"{name}_F1"] = pc["f1"]
+                log[f"{name}_P"] = pc["precision"]
+                log[f"{name}_R"] = pc["recall"]
+            wb.log(log, step=epoch)
+
         ckpt = {"model_state_dict": eval_state, "epoch": epoch, "seed": seed,
                 "macro_f1": macro, "thresholds": val.get("thresholds"),
-                "model": "NAVE", "ema_decay": cfg.EMA_DECAY}
+                "model": "NAVE", "ema_decay": cfg.EMA_DECAY,
+                "config": cfg.ablation_config()}
         torch.save(ckpt, run_dir / f"nave_epoch_{epoch:02d}.pt")
         if improved:
             torch.save(ckpt, run_dir / "nave_best.pt")
 
     print(f"\n[NAVE] best tuned macro F1 = {best_macro:.3f}   ->  {run_dir/'nave_best.pt'}")
+    if wb is not None:
+        wb.finish()
 
 
 if __name__ == "__main__":

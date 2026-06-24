@@ -98,6 +98,14 @@ CONV_KERNEL = 129                       # wide depthwise kernel
 DROPOUT = 0.1
 
 # ----------------------------------------------------------------------
+# Ablation switches (full NAVE = all on). nave_train sets these from the CLI
+# before the model is built; nave_evaluate restores them from the checkpoint's
+# stored config so an ablated model rebuilds with the matching architecture.
+# ----------------------------------------------------------------------
+USE_PCEN = True                 # 4th PCEN channel; off -> 3-ch base front end
+USE_FDY = True                  # frequency-dynamic stem convs; off -> plain Conv2d
+
+# ----------------------------------------------------------------------
 # Training
 # ----------------------------------------------------------------------
 OPTIMIZER = "radam"             # plain RAdam, constant LR, no warmup
@@ -143,3 +151,27 @@ def class_names() -> list[str]:
 def class_to_idx() -> dict[str, int]:
     """Mapping from class name to zero-based output index."""
     return {c: i for i, c in enumerate(class_names())}
+
+
+def apply_ablation(use_pcen: bool = True, use_fdy: bool = True,
+                   conv_kernel: "int | None" = None) -> None:
+    """Set the ablation switches consistently. MUST run before building
+    ``NAVE()`` / ``NAVEFeatureExtractor()``. Keeps ``FEAT_CHANNELS`` in sync with
+    ``USE_PCEN`` so the stem input width and the feature extractor agree."""
+    global USE_PCEN, USE_FDY, FEAT_CHANNELS, CONV_KERNEL
+    USE_PCEN = bool(use_pcen)
+    USE_FDY = bool(use_fdy)
+    FEAT_CHANNELS = 4 if USE_PCEN else 3
+    if conv_kernel is not None:
+        CONV_KERNEL = int(conv_kernel)
+
+
+def ablation_config() -> dict:
+    """Current ablation switches, for stamping into a checkpoint."""
+    return {"use_pcen": USE_PCEN, "use_fdy": USE_FDY,
+            "conv_kernel": CONV_KERNEL, "feat_channels": FEAT_CHANNELS}
+
+
+def ablation_tag() -> str:
+    """Compact identifier for the active ablation config (run-dir naming)."""
+    return f"pcen{int(USE_PCEN)}_fdy{int(USE_FDY)}_k{CONV_KERNEL}"

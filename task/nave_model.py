@@ -113,6 +113,16 @@ class FDYConv2d(nn.Module):
 # CNN stem (WhaleVAD feature extractor, FDY on the two early convs)
 # ======================================================================
 
+def _maybe_fdy(conv: nn.Conv2d) -> nn.Module:
+    """Frequency-dynamic wrapper when ``cfg.USE_FDY``; otherwise the plain conv.
+    FDY preserves kernel/stride/padding, so downstream shapes are identical
+    either way -- only the stem's two early convs change type."""
+    if cfg.USE_FDY:
+        return FDYConv2d.from_conv(conv, n_basis=cfg.FDY_BASIS,
+                                   temperature=cfg.FDY_TEMP)
+    return conv
+
+
 class ResidualBlock(nn.Module):
     """Sum-connected residual container: x -> x + block_1(x) -> ... ."""
 
@@ -138,16 +148,14 @@ class NAVEStem(nn.Module):
         fe_ch = cfg.FEAT_EXTRACTOR_CH
         bn_ch = cfg.BOTTLENECK_CH
 
-        # 1. Filterbank: (7,1) over frequency, stride 3 (freq 129 -> 41). FDY.
-        self.filterbank = FDYConv2d.from_conv(
-            nn.Conv2d(ch_in, fb_ch, kernel_size=(7, 1), stride=(3, 1), padding=0),
-            n_basis=cfg.FDY_BASIS, temperature=cfg.FDY_TEMP)
+        # 1. Filterbank: (7,1) over frequency, stride 3 (freq 129 -> 41). FDY (toggle).
+        self.filterbank = _maybe_fdy(
+            nn.Conv2d(ch_in, fb_ch, kernel_size=(7, 1), stride=(3, 1), padding=0))
 
         # 2. Feature extractor: first conv (5,5)/s(3,1) is FDY (freq 41 -> 14).
         self.feat_extractor = nn.Sequential(
-            FDYConv2d.from_conv(
-                nn.Conv2d(fb_ch, fe_ch, kernel_size=(5, 5), stride=(3, 1), padding=(2, 2)),
-                n_basis=cfg.FDY_BASIS, temperature=cfg.FDY_TEMP),
+            _maybe_fdy(
+                nn.Conv2d(fb_ch, fe_ch, kernel_size=(5, 5), stride=(3, 1), padding=(2, 2))),
             nn.BatchNorm2d(fe_ch),
             nn.GELU(),
             nn.MaxPool2d(kernel_size=(5, 1), stride=1, padding=0),
