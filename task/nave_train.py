@@ -1307,6 +1307,9 @@ def parse_args():
                    help="Plain Conv2d stem instead of frequency-dynamic (FDY).")
     p.add_argument("--conv-kernel", type=int, default=cfg.CONV_KERNEL,
                    help="Conformer depthwise kernel (129 full; try 65, 31).")
+    p.add_argument("--resume", default=None,
+                   help="Resume from a nave_last.pt; continues in the SAME run dir "
+                        "from the next epoch (architecture/seed restored from it).")
     # --- optional W&B logging (no wandb_utils; off unless explicitly enabled) ---
     p.add_argument("--wandb", action="store_true",
                    help="Log to W&B (only if a user is configured in the env).")
@@ -1319,7 +1322,7 @@ def parse_args():
     return p.parse_args()
 
 
-def maybe_init_wandb(args, run_dir, n_params: int):
+def maybe_init_wandb(args, run_dir, n_params: int, resume_id=None):
     """Initialise W&B only when ``--wandb`` is set AND a user is configured in
     the environment (``WANDB_API_KEY`` or ``WANDB_ENTITY``). Standalone -- no
     ``wandb_utils`` import. Any problem degrades to ``None`` so a run never
@@ -1337,7 +1340,7 @@ def maybe_init_wandb(args, run_dir, n_params: int):
               "logging disabled.")
         return None
     try:
-        wandb.init(
+        init_kwargs = dict(
             project=args.wandb_project,
             entity=entity,
             name=run_dir.name,
@@ -1352,6 +1355,9 @@ def maybe_init_wandb(args, run_dir, n_params: int):
                 ablation_tag=cfg.ablation_tag(), n_params=n_params,
             ),
         )
+        if resume_id:
+            init_kwargs.update(id=resume_id, resume="allow")
+        wandb.init(**init_kwargs)
         print(f"[wandb] logging to '{args.wandb_project}' as run '{run_dir.name}'"
               f"{f' (entity {entity})' if entity else ''}")
         return wandb
@@ -1360,11 +1366,64 @@ def maybe_init_wandb(args, run_dir, n_params: int):
         return None
 
 
+def save_resume_state(path, model, ema, optimizer, scheduler,
+                      epoch, best_macro, seed, wandb_id=None):
+    """Full training state for clean preemption recovery: student weights, EMA
+    shadow, optimiser + scheduler, RNG, and the epoch/score reached."""
+    torch.save({
+        "kind": "resume",
+        "model_student": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+        "ema_shadow": {k: v.detach().cpu().clone() for k, v in ema.shadow.items()},
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "epoch": epoch,                 # last COMPLETED epoch
+        "best_macro": best_macro,
+        "seed": seed,
+        "config": cfg.ablation_config(),
+        "wandb_id": wandb_id,
+        "rng": {
+            "torch": torch.get_rng_state(),
+            "cuda": (torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None),
+            "numpy": np.random.get_state(),
+            "python": random.getstate(),
+        },
+    }, path)
+
+
+def _restore_rng(rng):
+    if not rng:
+        return
+    try:
+        torch.set_rng_state(rng["torch"])
+        if rng.get("cuda") is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng["cuda"])
+        np.random.set_state(rng["numpy"])
+        random.setstate(rng["python"])
+    except Exception as e:
+        print(f"[NAVE] RNG restore skipped ({type(e).__name__}: {e})")
+
+
+def _optim_state_to(optimizer, device):
+    for st in optimizer.state.values():
+        for k, v in st.items():
+            if isinstance(v, torch.Tensor):
+                st[k] = v.to(device)
+
+
 def main():
     args = parse_args()
-    cfg.apply_ablation(use_pcen=args.use_pcen, use_fdy=args.use_fdy,
-                       conv_kernel=args.conv_kernel)
-    seed = seed_everything(args.seed, deterministic=False)
+    resume = (torch.load(args.resume, map_location="cpu", weights_only=False)
+              if args.resume else None)
+    if resume is not None:
+        rc = resume.get("config", {})
+        cfg.apply_ablation(use_pcen=rc.get("use_pcen", True),
+                           use_fdy=rc.get("use_fdy", True),
+                           conv_kernel=rc.get("conv_kernel", cfg.CONV_KERNEL))
+    else:
+        cfg.apply_ablation(use_pcen=args.use_pcen, use_fdy=args.use_fdy,
+                           conv_kernel=args.conv_kernel)
+    seed = seed_everything(resume["seed"] if resume is not None else args.seed,
+                           deterministic=False)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     epochs = cfg.EPOCHS
     print(f"[NAVE] device={device}  seed={seed}  epochs={epochs}  k={cfg.CONV_KERNEL}")
@@ -1374,7 +1433,11 @@ def main():
     train_sites, val_sites = list(cfg.TRAIN_DATASETS), list(cfg.VAL_DATASETS)
     pos_weight, _ = compute_pos_weight(train_sites, device, verbose=True)
 
-    run_dir = Path(cfg.OUTPUT_DIR) / f"nave_s{seed}_{cfg.ablation_tag()}_{time.strftime('%Y%m%d_%H%M%S')}"
+    if resume is not None:
+        run_dir = Path(args.resume).resolve().parent
+        print(f"[NAVE] RESUMING in {run_dir} (last completed epoch {resume['epoch']})")
+    else:
+        run_dir = Path(cfg.OUTPUT_DIR) / f"nave_s{seed}_{cfg.ablation_tag()}_{time.strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"[NAVE] run dir: {run_dir}")
 
@@ -1396,10 +1459,14 @@ def main():
 
     # --- model / loss / optim ---
     model = NAVE().to(device)
+    if resume is not None:
+        model.load_state_dict(resume["model_student"], strict=True)
     spec_extractor = NAVEFeatureExtractor().to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"[NAVE] parameters: {n_params:,}")
-    wb = maybe_init_wandb(args, run_dir, n_params)
+    wb = maybe_init_wandb(args, run_dir, n_params,
+                          resume_id=(resume.get("wandb_id") if resume else None))
+    wandb_id = wb.run.id if wb is not None else None
 
     train_criterion = MaskedBCELoss(pos_weight=pos_weight).to(device)
     val_criterion = nn.BCEWithLogitsLoss(reduction="none", pos_weight=pos_weight).to(device)
@@ -1412,8 +1479,22 @@ def main():
 
     # --- loop ---
     best_macro, last_thr = 0.0, None
+    start_epoch = 1
+    if resume is not None:
+        optimizer.load_state_dict(resume["optimizer"])
+        _optim_state_to(optimizer, device)
+        if scheduler is not None and resume.get("scheduler") is not None:
+            scheduler.load_state_dict(resume["scheduler"])
+        ema.shadow = {k: v.to(device) for k, v in resume["ema_shadow"].items()}
+        best_macro = resume.get("best_macro", 0.0)
+        start_epoch = int(resume["epoch"]) + 1
+        _restore_rng(resume.get("rng"))
+        print(f"[NAVE] restored optimiser+EMA+RNG | best_macro={best_macro:.3f} "
+              f"| resuming at epoch {start_epoch}/{epochs}")
+        if start_epoch > epochs:
+            print("[NAVE] nothing to do -- run already reached the final epoch.")
     train_loader = None
-    for epoch in range(1, epochs + 1):
+    for epoch in range(start_epoch, epochs + 1):
         t0 = time.time()
         if train_loader is None or (epoch - 1) % cfg.RESAMPLE_EVERY == 0:
             train_segments = resample_negatives_for_epoch(
@@ -1473,6 +1554,9 @@ def main():
         torch.save(ckpt, run_dir / f"nave_epoch_{epoch:02d}.pt")
         if improved:
             torch.save(ckpt, run_dir / "nave_best.pt")
+        # resume point (full training state); overwritten each epoch
+        save_resume_state(run_dir / "nave_last.pt", model, ema, optimizer,
+                          scheduler, epoch, best_macro, seed, wandb_id)
 
     print(f"\n[NAVE] best tuned macro F1 = {best_macro:.3f}   ->  {run_dir/'nave_best.pt'}")
     if wb is not None:
