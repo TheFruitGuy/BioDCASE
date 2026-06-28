@@ -163,8 +163,10 @@ def parse_args():
 
 
 def _ms(a):
+    """mean (sample std) over seeds; sample std (ddof=1) for n>1, else 0."""
     a = np.asarray(a, dtype=float)
-    return f"{a.mean():.3f}+/-{a.std(ddof=0):.3f}"
+    sd = a.std(ddof=1) if a.size > 1 else 0.0
+    return f"{a.mean():.3f} ({sd:.3f})"
 
 
 def main():
@@ -218,19 +220,19 @@ def main():
     print("=" * 110)
     print(f"ABLATION SUMMARY -- LOSO F1 (mean +/- std over seeds)   [total {time.time() - t_start:.0f}s]")
     print("=" * 110)
-    cls_hdr = "  ".join(f"{c.upper()+' F1':>14}" for c in CLASS_NAMES)
-    print(f"{'rung':8} {'n':>2}  {'macro F1':>14}  {cls_hdr}  {'in-sample':>14}")
+    cls_hdr = "  ".join(f"{c.upper()+' F1':>15}" for c in CLASS_NAMES)
+    print(f"{'rung':8} {'n':>2}  {'macro F1':>15}  {cls_hdr}  {'in-sample':>15}")
     print("-" * 110)
     for label, tag in order:
         rows = agg[label]
         macro = [r[1] for r in rows]
         insamp = [r[2] for r in rows]
         cls = {c: [r[3][c] for r in rows] for c in CLASS_NAMES}
-        cls_cells = "  ".join(f"{_ms(cls[c]):>14}" for c in CLASS_NAMES)
-        print(f"{label:8} {len(rows):>2}  {_ms(macro):>14}  {cls_cells}  {_ms(insamp):>14}")
+        cls_cells = "  ".join(f"{_ms(cls[c]):>15}" for c in CLASS_NAMES)
+        print(f"{label:8} {len(rows):>2}  {_ms(macro):>15}  {cls_cells}  {_ms(insamp):>15}")
     print("-" * 110)
-    print("macro F1 = official metric (F1 of mean P, mean R); per-class F1 from pooled "
-          "tp/fp/fn; std = population std over seeds.")
+    print("values: mean (sample std, ddof=1) over seeds | macro F1 = official "
+          "metric (F1 of mean P, mean R) | per-class F1 from pooled tp/fp/fn.")
 
 
 if __name__ == "__main__":
