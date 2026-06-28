@@ -24,6 +24,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from tqdm import tqdm
 from torch.utils.data import DataLoader
 
 import nave_config as cfg
@@ -73,7 +74,7 @@ def build_nave_from_ckpt(path, device):
 
 @torch.no_grad()
 def collect_val_probs(model, spec_extractor, device, use_fp16: bool = False,
-                      segment_s: float = cfg.EVAL_SEGMENT_S):
+                      segment_s: float = cfg.EVAL_SEGMENT_S, progress: bool = False):
     """Reproduce the val-set probability collection from training. Returns
     ``(probs3, gt_events)`` where ``probs3`` is a dict keyed by
     ``(dataset, filename, start_sample)`` with ``(n_frames, 3)`` float arrays
@@ -93,7 +94,9 @@ def collect_val_probs(model, spec_extractor, device, use_fp16: bool = False,
                 if (use_fp16 and device.type == "cuda") else nullcontext())
     hop = spec_extractor.hop_length
     raw: dict = {}
-    for audio, _t, _m, metas in loader:
+    iterator = (tqdm(loader, desc="    inference", ncols=80, leave=False)
+                if progress else loader)
+    for audio, _t, _m, metas in iterator:
         audio = audio.to(device)
         with autocast:
             logits = model(spec_extractor(audio))
