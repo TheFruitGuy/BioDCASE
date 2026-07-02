@@ -104,13 +104,18 @@ def qualifies(events, idx, min_classes, min_per_class):
     return True
 
 
-def pick_window(events, snrs, window_s, lam, min_classes, min_per_class):
+def pick_window(events, snrs, window_s, lam, min_classes, min_per_class, margin, file_dur):
     """Return (t0, score, met): best window by summed call SNR + lam * #classes,
-    restricted to windows meeting the class constraints when such a window exists."""
+    among windows meeting the class constraints and keeping every call at least
+    `margin` seconds inside both borders. Falls back to the best window if none
+    satisfy the constraints."""
     best = (-1e18, 0.0)
     best_any = (-1e18, 0.0)
     for ev in events:
-        t0 = ev[0]
+        # anchor so this event sits at the left margin, not on the edge
+        t0 = max(0.0, ev[0] - margin)
+        if t0 + window_s > file_dur:
+            continue
         idx = window_indices(events, t0, window_s)
         if not idx:
             continue
@@ -119,7 +124,12 @@ def pick_window(events, snrs, window_s, lam, min_classes, min_per_class):
         score = tot + lam * ncls
         if score > best_any[0]:
             best_any = (score, t0)
-        if qualifies(events, idx, min_classes, min_per_class) and score > best[0]:
+        first_start = min(events[j][0] for j in idx)
+        last_end = max(events[j][1] for j in idx)
+        margin_ok = (first_start >= t0 + margin - 1e-6 and
+                     last_end <= t0 + window_s - margin + 1e-6)
+        if (margin_ok and qualifies(events, idx, min_classes, min_per_class)
+                and score > best[0]):
             best = (score, t0)
     if best[0] == -1e18:
         return best_any[1], best_any[0], False
@@ -128,12 +138,12 @@ def pick_window(events, snrs, window_s, lam, min_classes, min_per_class):
 
 def events_for_file(fn, ann, cols, finfo):
     fn_c, lab_c, lo_c, hi_c = cols
-    path, fstart = finfo[fn]
+    path, fstart, dur = finfo[fn]
     a = ann[ann[fn_c] == fn].copy()
     a["s"] = (a["start_datetime"] - fstart).dt.total_seconds()
     a["e"] = (a["end_datetime"] - fstart).dt.total_seconds()
     events = list(zip(a["s"], a["e"], a[lo_c].astype(float), a[hi_c].astype(float), a[lab_c]))
-    return events, path, fstart
+    return events, path, fstart, dur
 
 
 def main():
@@ -148,6 +158,8 @@ def main():
                     help="require at least this many classes in the window")
     ap.add_argument("--min-per-class", type=int, default=0,
                     help="require at least this many calls of EACH class in the window")
+    ap.add_argument("--margin", type=float, default=7.0,
+                    help="keep every call at least this many seconds inside both borders")
     ap.add_argument("--fmax", type=float, default=None, help="max frequency [Hz]")
     ap.add_argument("--raw", action="store_true", help="disable per-frequency baseline removal")
     ap.add_argument("--db-range", type=float, default=70.0, help="dynamic range if --raw")
@@ -174,9 +186,10 @@ def main():
     m_fn = _col(manifest, "filename", "file", "wav")
     m_start = _col(manifest, "start_dt", "start_datetime", "start")
     m_path = _col(manifest, "path", "filepath", "wav_path")
+    m_dur = _col(manifest, "duration_s", "duration")
     if m_path is None:
         raise SystemExit("No path column in manifest; columns: " + ", ".join(manifest.columns))
-    finfo = {r[m_fn]: (r[m_path], r[m_start]) for _, r in manifest.iterrows()}
+    finfo = {r[m_fn]: (r[m_path], r[m_start], float(r[m_dur])) for _, r in manifest.iterrows()}
 
     # candidate files: forced, else the most class-diverse few
     if args.file:
@@ -188,19 +201,20 @@ def main():
     # find the best (file, t0) across candidates
     best = None  # (score, fn, t0, events, path, met)
     for fn in candidates:
-        events, path, _ = events_for_file(fn, ann, cols, finfo)
+        events, path, _, file_dur = events_for_file(fn, ann, cols, finfo)
         if args.t0 is not None and fn == candidates[0]:
             t0, score, met = args.t0, 0.0, True
         else:
             snrs = score_events_snr(events, path, sr, args.pad, args.scan_cap)
             t0, score, met = pick_window(events, snrs, args.window, args.lam,
-                                         args.min_classes, args.min_per_class)
+                                         args.min_classes, args.min_per_class,
+                                         args.margin, file_dur)
         rank = score - (0.0 if met else 1e6)  # prefer files that satisfy the constraints
         if best is None or rank > best[0]:
             best = (rank, fn, t0, events, path, met)
     _, target_fn, t0, events, path, met = best
-    if not met and (args.min_classes > 1 or args.min_per_class > 0):
-        print("warning: no window satisfied the class constraints; showing the best available")
+    if not met:
+        print("warning: no window satisfied the class/margin constraints; showing the best available")
     t1 = t0 + args.window
     idx = window_indices(events, t0, args.window)
     counts = {}
