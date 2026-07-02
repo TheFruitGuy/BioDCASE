@@ -1,19 +1,19 @@
 #!/usr/bin/env python
-"""Task-illustration figure for the paper: a real ATBFL spectrogram with the
-strongly-labelled call boundaries drawn as per-class boxes (BMABZ / D / BP).
+"""Task-illustration figure: a real ATBFL spectrogram with the strongly-labelled
+call boundaries drawn as per-class time-frequency boxes (BMABZ / D / BP).
 
-Run from the NAVE repo root (needs nave_config.py, dataset.py, and the
-development data at cfg.DATA_ROOT). It reuses your own annotation loader, so the
-datetime->file mapping and the 7->3 class collapse match training exactly.
+The window is chosen to contain the *clearest* multi-class cluster: candidate
+windows are scored by the summed SNR of the calls they contain (median enhanced
+energy inside each annotated box minus the median just outside it), with a bonus
+for class diversity. Display uses per-frequency baseline removal by default (the
+analogue of the front-end's mean subtraction), so faint calls stand out.
 
-    python make_task_figure.py                          # auto-pick a good window
-    python make_task_figure.py --dataset kerguelen2015  # try another site
-    python make_task_figure.py --file 2014-... --t0 120 # force a specific window
-    python make_task_figure.py --window 60 --fmax 100 --out fig_task.pdf
+Run from the NAVE repo root (needs nave_config.py, dataset.py, dev data).
 
-Boxes span each call's annotated TIME extent (full height); the annotations have
-no frequency bounds, so vertical position is not annotated -- the spectrogram
-shows the call's frequency content.
+    python make_task_figure.py                          # auto: clearest window in casey2017
+    python make_task_figure.py --dataset kerguelen2015 --window 40
+    python make_task_figure.py --file <wav> --t0 120    # force a specific window
+    python make_task_figure.py --raw                    # disable enhancement
 """
 from __future__ import annotations
 
@@ -30,14 +30,12 @@ from matplotlib.patches import Rectangle, Patch
 import nave_config as cfg
 import dataset as ds
 
-# Okabe-Ito, colour-blind safe. Match your paper palette if it differs.
 CLASS_COLOR = {"bmabz": "#0072B2", "d": "#D55E00", "bp": "#009E73"}
 CLASS_NAME = {"bmabz": "BMABZ", "d": "D", "bp": "BP"}
 ORDER = ["bmabz", "d", "bp"]
 
 
 def _col(df, *candidates):
-    """Return the first present column name from candidates (case-insensitive)."""
     lower = {c.lower(): c for c in df.columns}
     for cand in candidates:
         if cand.lower() in lower:
@@ -45,120 +43,159 @@ def _col(df, *candidates):
     return None
 
 
-def _resolve_path(file_row, manifest):
-    """Best-effort absolute path to the wav for a manifest row."""
-    pcol = _col(manifest, "path", "filepath", "file_path", "wav_path", "abspath")
-    if pcol is not None and isinstance(file_row[pcol], str):
-        return file_row[pcol]
-    raise SystemExit(
-        "Could not find a path column in the manifest. Columns are:\n  "
-        + ", ".join(manifest.columns)
-        + "\nEdit _resolve_path() to point at the right one."
-    )
-
-
-def pick_window(events, window_s):
-    """events: list of (start_s, end_s, cls). Return t0 maximising class
-    coverage then event count within [t0, t0+window_s]."""
-    best = (-1, -1, 0.0)  # (n_classes, n_events, t0)
-    starts = sorted(e[0] for e in events)
-    for t0 in starts:
-        win = [e for e in events if e[0] < t0 + window_s and e[1] > t0]
-        n_cls = len({e[2] for e in win})
-        score = (n_cls, len(win), t0)
-        if score[:2] > best[:2]:
-            best = score
-    return best[2]
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default="casey2017")
-    ap.add_argument("--window", type=float, default=90.0, help="window length [s]")
-    ap.add_argument("--fmax", type=float, default=None, help="max frequency [Hz]")
-    ap.add_argument("--db-range", type=float, default=70.0, help="dynamic range [dB]")
-    ap.add_argument("--enhance", action="store_true",
-                    help="per-frequency baseline removal so faint calls stand out")
-    ap.add_argument("--pctl", type=float, default=99.5,
-                    help="upper colour percentile used with --enhance")
-    ap.add_argument("--file", default=None, help="force a wav filename")
-    ap.add_argument("--t0", type=float, default=None, help="force window start [s]")
-    ap.add_argument("--out", default="fig_task.pdf")
-    args = ap.parse_args()
-
-    sr = cfg.SAMPLE_RATE
-
-    manifest = ds.get_file_manifest([args.dataset])
-    ann = ds.load_annotations([args.dataset], manifest=manifest)
-    print("manifest columns:", list(manifest.columns))
-    print("annotation columns:", list(ann.columns))
-
-    lab_col = _col(ann, "label_3class")
-    if lab_col is None:
-        ann = ann.copy()
-        ann["label_3class"] = ann["annotation"].map(cfg.COLLAPSE_MAP).fillna(ann["annotation"])
-        lab_col = "label_3class"
-
-    fn_col = _col(ann, "filename", "file", "wav")
-    m_fn_col = _col(manifest, "filename", "file", "wav")
-    m_start_col = _col(manifest, "start_dt", "start_datetime", "start")
-    m_dur_col = _col(manifest, "duration_s", "duration")
-
-    # choose the file (unless forced): the one whose annotations span the most classes
-    if args.file:
-        target_fn = args.file
-    else:
-        cov = (
-            ann.groupby(fn_col)[lab_col]
-            .agg(lambda s: len(set(s)))
-            .sort_values(ascending=False)
-        )
-        target_fn = cov.index[0]
-        print(f"auto-selected file {target_fn} (covers {cov.iloc[0]} classes)")
-
-    file_row = manifest[manifest[m_fn_col] == target_fn].iloc[0]
-    file_start = file_row[m_start_col]
-    path = _resolve_path(file_row, manifest)
-
-    lo_col = _col(ann, "low_frequency", "low_freq", "freq_low", "f_low")
-    hi_col = _col(ann, "high_frequency", "high_freq", "freq_high", "f_high")
-    a = ann[ann[fn_col] == target_fn].copy()
-    a["start_s"] = (a["start_datetime"] - file_start).dt.total_seconds()
-    a["end_s"] = (a["end_datetime"] - file_start).dt.total_seconds()
-    events = list(zip(a["start_s"], a["end_s"], a[lo_col], a[hi_col], a[lab_col]))
-
-    # pick_window only needs (start, end, cls)
-    t0 = args.t0 if args.t0 is not None else pick_window(
-        [(s, e, c) for (s, e, lo, hi, c) in events], args.window)
-    t1 = t0 + args.window
-    print(f"window: {t0:.1f}-{t1:.1f} s of {target_fn}")
-
-    win_hi = [hi for (s, e, lo, hi, c) in events if e > t0 and s < t1]
-    fmax = args.fmax if args.fmax is not None else min(
-        sr / 2.0, (max(win_hi) if win_hi else sr / 2.0) * 1.15)
-
-    # load just the window
-    x, file_sr = sf.read(path, start=int(t0 * sr), stop=int(t1 * sr))
-    if x.ndim > 1:
-        x = x[:, 0]
-    assert file_sr == sr, f"file sr {file_sr} != cfg.SAMPLE_RATE {sr}"
-
+def enh_spec(x, sr):
+    """Per-frequency baseline-removed log-spectrogram of a clip."""
     f, t, Z = stft(
         x, fs=sr, window="hann",
         nperseg=cfg.WIN_LENGTH, noverlap=cfg.WIN_LENGTH - cfg.HOP_LENGTH,
         nfft=cfg.N_FFT, boundary=None,
     )
     S = 20.0 * np.log10(np.abs(Z) + 1e-10)
-    if args.enhance:
-        # Per-frequency baseline removal: subtract each bin's median over time,
-        # the display analogue of the front-end's per-bin mean subtraction, so
-        # faint transient calls stand out above the stationary noise floor.
-        S = S - np.median(S, axis=1, keepdims=True)
-        vmax = float(np.percentile(S, args.pctl))
-        vmin = 0.0
+    return f, t, S - np.median(S, axis=1, keepdims=True)
+
+
+def box_snr(f, t, S, s0, e0, lo, hi):
+    """Median enhanced energy in the box minus median at the same frequencies
+    outside the box's time span. Higher = the call stands out more."""
+    fi = (f >= lo) & (f <= hi)
+    ti = (t >= s0) & (t <= e0)
+    if fi.sum() < 1 or ti.sum() < 1 or (~ti).sum() < 1:
+        return -1e9
+    return float(np.median(S[np.ix_(fi, ti)]) - np.median(S[np.ix_(fi, ~ti)]))
+
+
+def score_events_snr(events, path, sr, pad, cap):
+    """SNR per event (clips loaded on demand, capped for runtime)."""
+    snrs = []
+    for i, (s, e, lo, hi, c) in enumerate(events):
+        if i >= cap:
+            snrs.append(-1e9)
+            continue
+        a = max(0.0, s - pad)
+        try:
+            x, _ = sf.read(path, start=int(a * sr), stop=int((e + pad) * sr))
+        except Exception:
+            snrs.append(-1e9)
+            continue
+        if x.ndim > 1:
+            x = x[:, 0]
+        if len(x) < cfg.WIN_LENGTH:
+            snrs.append(-1e9)
+            continue
+        f, t, S = enh_spec(x, sr)
+        snrs.append(box_snr(f, t, S, s - a, e - a, lo, hi))
+    return snrs
+
+
+def window_indices(events, t0, window_s):
+    return [j for j, (s, e, *_ ) in enumerate(events) if s < t0 + window_s and e > t0]
+
+
+def pick_window(events, snrs, window_s, lam):
+    """Return (t0, score): window maximising summed call SNR + lam * #classes."""
+    best = (-1e18, 0.0)
+    for ev in events:
+        t0 = ev[0]
+        idx = window_indices(events, t0, window_s)
+        if not idx:
+            continue
+        tot = sum(max(snrs[j], 0.0) for j in idx)
+        ncls = len({events[j][4] for j in idx})
+        score = tot + lam * ncls
+        if score > best[0]:
+            best = (score, t0)
+    return best[1], best[0]
+
+
+def events_for_file(fn, ann, cols, finfo):
+    fn_c, lab_c, lo_c, hi_c = cols
+    path, fstart = finfo[fn]
+    a = ann[ann[fn_c] == fn].copy()
+    a["s"] = (a["start_datetime"] - fstart).dt.total_seconds()
+    a["e"] = (a["end_datetime"] - fstart).dt.total_seconds()
+    events = list(zip(a["s"], a["e"], a[lo_c].astype(float), a[hi_c].astype(float), a[lab_c]))
+    return events, path, fstart
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dataset", default="casey2017")
+    ap.add_argument("--window", type=float, default=45.0, help="window length [s]")
+    ap.add_argument("--nfiles", type=int, default=4, help="most call-dense files to search")
+    ap.add_argument("--scan-cap", type=int, default=200, help="events scored per file")
+    ap.add_argument("--pad", type=float, default=3.0, help="context for SNR scoring [s]")
+    ap.add_argument("--lam", type=float, default=8.0, help="class-diversity weight")
+    ap.add_argument("--fmax", type=float, default=None, help="max frequency [Hz]")
+    ap.add_argument("--raw", action="store_true", help="disable per-frequency baseline removal")
+    ap.add_argument("--db-range", type=float, default=70.0, help="dynamic range if --raw")
+    ap.add_argument("--pctl", type=float, default=99.5, help="upper colour percentile")
+    ap.add_argument("--file", default=None, help="force a wav filename")
+    ap.add_argument("--t0", type=float, default=None, help="force window start [s]")
+    ap.add_argument("--out", default="fig_task.pdf")
+    args = ap.parse_args()
+
+    sr = cfg.SAMPLE_RATE
+    manifest = ds.get_file_manifest([args.dataset])
+    ann = ds.load_annotations([args.dataset], manifest=manifest)
+
+    lab_c = _col(ann, "label_3class")
+    if lab_c is None:
+        ann = ann.copy()
+        ann["label_3class"] = ann["annotation"].map(cfg.COLLAPSE_MAP).fillna(ann["annotation"])
+        lab_c = "label_3class"
+    fn_c = _col(ann, "filename", "file", "wav")
+    lo_c = _col(ann, "low_frequency", "low_freq", "f_low")
+    hi_c = _col(ann, "high_frequency", "high_freq", "f_high")
+    cols = (fn_c, lab_c, lo_c, hi_c)
+
+    m_fn = _col(manifest, "filename", "file", "wav")
+    m_start = _col(manifest, "start_dt", "start_datetime", "start")
+    m_path = _col(manifest, "path", "filepath", "wav_path")
+    if m_path is None:
+        raise SystemExit("No path column in manifest; columns: " + ", ".join(manifest.columns))
+    finfo = {r[m_fn]: (r[m_path], r[m_start]) for _, r in manifest.iterrows()}
+
+    # candidate files: forced, else the most class-diverse few
+    if args.file:
+        candidates = [args.file]
     else:
-        vmax = float(S.max())
-        vmin = vmax - args.db_range
+        cov = ann.groupby(fn_c)[lab_c].agg(lambda s: len(set(s))).sort_values(ascending=False)
+        candidates = list(cov.index[: args.nfiles])
+
+    # find the best (file, t0) across candidates
+    best = None  # (score, fn, t0, events, path)
+    for fn in candidates:
+        events, path, _ = events_for_file(fn, ann, cols, finfo)
+        if args.t0 is not None and fn == candidates[0]:
+            t0, score = args.t0, 0.0
+        else:
+            snrs = score_events_snr(events, path, sr, args.pad, args.scan_cap)
+            t0, score = pick_window(events, snrs, args.window, args.lam)
+        if best is None or score > best[0]:
+            best = (score, fn, t0, events, path)
+    score, target_fn, t0, events, path = best
+    t1 = t0 + args.window
+    idx = window_indices(events, t0, args.window)
+    classes = sorted({events[j][4] for j in idx})
+    print(f"window: {t0:.1f}-{t1:.1f} s of {target_fn}  (score={score:.1f}, classes={classes})")
+
+    win_hi = [events[j][3] for j in idx]
+    fmax = args.fmax if args.fmax is not None else min(
+        sr / 2.0, (max(win_hi) if win_hi else sr / 2.0) * 1.15)
+
+    x, file_sr = sf.read(path, start=int(t0 * sr), stop=int(t1 * sr))
+    if x.ndim > 1:
+        x = x[:, 0]
+    assert file_sr == sr, f"file sr {file_sr} != cfg.SAMPLE_RATE {sr}"
+
+    if args.raw:
+        f, t, Z = stft(x, fs=sr, window="hann", nperseg=cfg.WIN_LENGTH,
+                       noverlap=cfg.WIN_LENGTH - cfg.HOP_LENGTH, nfft=cfg.N_FFT, boundary=None)
+        S = 20.0 * np.log10(np.abs(Z) + 1e-10)
+        vmax, vmin = float(S.max()), float(S.max()) - args.db_range
+    else:
+        f, t, S = enh_spec(x, sr)
+        vmax, vmin = float(np.percentile(S, args.pctl)), 0.0
 
     fig, ax = plt.subplots(figsize=(3.4, 2.3))
     ax.pcolormesh(t, f, S, vmin=vmin, vmax=vmax, cmap="magma", rasterized=True, shading="auto")
@@ -173,10 +210,8 @@ def main():
             continue
         rs, re = max(rs, 0), min(re, args.window)
         c = CLASS_COLOR.get(cls, "#999999")
-        ax.add_patch(Rectangle(
-            (rs, lo), re - rs, hi - lo,
-            fill=False, edgecolor=c, linewidth=1.3, zorder=3,
-        ))
+        ax.add_patch(Rectangle((rs, lo), re - rs, hi - lo,
+                               fill=False, edgecolor=c, linewidth=1.3, zorder=3))
 
     handles = [Patch(facecolor=CLASS_COLOR[c], alpha=0.5, edgecolor=CLASS_COLOR[c],
                      label=CLASS_NAME[c]) for c in ORDER]
