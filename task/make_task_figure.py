@@ -77,6 +77,10 @@ def main():
     ap.add_argument("--window", type=float, default=90.0, help="window length [s]")
     ap.add_argument("--fmax", type=float, default=None, help="max frequency [Hz]")
     ap.add_argument("--db-range", type=float, default=70.0, help="dynamic range [dB]")
+    ap.add_argument("--enhance", action="store_true",
+                    help="per-frequency baseline removal so faint calls stand out")
+    ap.add_argument("--pctl", type=float, default=99.5,
+                    help="upper colour percentile used with --enhance")
     ap.add_argument("--file", default=None, help="force a wav filename")
     ap.add_argument("--t0", type=float, default=None, help="force window start [s]")
     ap.add_argument("--out", default="fig_task.pdf")
@@ -145,8 +149,16 @@ def main():
         nfft=cfg.N_FFT, boundary=None,
     )
     S = 20.0 * np.log10(np.abs(Z) + 1e-10)
-    vmax = float(S.max())
-    vmin = vmax - args.db_range
+    if args.enhance:
+        # Per-frequency baseline removal: subtract each bin's median over time,
+        # the display analogue of the front-end's per-bin mean subtraction, so
+        # faint transient calls stand out above the stationary noise floor.
+        S = S - np.median(S, axis=1, keepdims=True)
+        vmax = float(np.percentile(S, args.pctl))
+        vmin = 0.0
+    else:
+        vmax = float(S.max())
+        vmin = vmax - args.db_range
 
     fig, ax = plt.subplots(figsize=(3.4, 2.3))
     ax.pcolormesh(t, f, S, vmin=vmin, vmax=vmax, cmap="magma", rasterized=True, shading="auto")
