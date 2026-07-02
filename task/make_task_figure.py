@@ -91,9 +91,22 @@ def window_indices(events, t0, window_s):
     return [j for j, (s, e, *_ ) in enumerate(events) if s < t0 + window_s and e > t0]
 
 
-def pick_window(events, snrs, window_s, lam, min_classes):
+def qualifies(events, idx, min_classes, min_per_class):
+    """Window (given by event indices) meets the class constraints."""
+    cnt = {}
+    for j in idx:
+        c = events[j][4]
+        cnt[c] = cnt.get(c, 0) + 1
+    if len(cnt) < min_classes:
+        return False
+    if min_per_class > 0 and any(cnt.get(c, 0) < min_per_class for c in ORDER):
+        return False
+    return True
+
+
+def pick_window(events, snrs, window_s, lam, min_classes, min_per_class):
     """Return (t0, score, met): best window by summed call SNR + lam * #classes,
-    restricted to windows with >= min_classes classes when such a window exists."""
+    restricted to windows meeting the class constraints when such a window exists."""
     best = (-1e18, 0.0)
     best_any = (-1e18, 0.0)
     for ev in events:
@@ -106,7 +119,7 @@ def pick_window(events, snrs, window_s, lam, min_classes):
         score = tot + lam * ncls
         if score > best_any[0]:
             best_any = (score, t0)
-        if ncls >= min_classes and score > best[0]:
+        if qualifies(events, idx, min_classes, min_per_class) and score > best[0]:
             best = (score, t0)
     if best[0] == -1e18:
         return best_any[1], best_any[0], False
@@ -133,6 +146,8 @@ def main():
     ap.add_argument("--lam", type=float, default=8.0, help="class-diversity weight")
     ap.add_argument("--min-classes", type=int, default=1,
                     help="require at least this many classes in the window")
+    ap.add_argument("--min-per-class", type=int, default=0,
+                    help="require at least this many calls of EACH class in the window")
     ap.add_argument("--fmax", type=float, default=None, help="max frequency [Hz]")
     ap.add_argument("--raw", action="store_true", help="disable per-frequency baseline removal")
     ap.add_argument("--db-range", type=float, default=70.0, help="dynamic range if --raw")
@@ -178,17 +193,21 @@ def main():
             t0, score, met = args.t0, 0.0, True
         else:
             snrs = score_events_snr(events, path, sr, args.pad, args.scan_cap)
-            t0, score, met = pick_window(events, snrs, args.window, args.lam, args.min_classes)
-        rank = score - (0.0 if met else 1e6)  # prefer files that satisfy min-classes
+            t0, score, met = pick_window(events, snrs, args.window, args.lam,
+                                         args.min_classes, args.min_per_class)
+        rank = score - (0.0 if met else 1e6)  # prefer files that satisfy the constraints
         if best is None or rank > best[0]:
             best = (rank, fn, t0, events, path, met)
     _, target_fn, t0, events, path, met = best
-    if not met and args.min_classes > 1:
-        print(f"warning: no window with >= {args.min_classes} classes found; showing the best available")
+    if not met and (args.min_classes > 1 or args.min_per_class > 0):
+        print("warning: no window satisfied the class constraints; showing the best available")
     t1 = t0 + args.window
     idx = window_indices(events, t0, args.window)
-    classes = sorted({events[j][4] for j in idx})
-    print(f"window: {t0:.1f}-{t1:.1f} s of {target_fn}  (classes={classes})")
+    counts = {}
+    for j in idx:
+        counts[events[j][4]] = counts.get(events[j][4], 0) + 1
+    cstr = ", ".join(f"{CLASS_NAME[c]}:{counts.get(c, 0)}" for c in ORDER)
+    print(f"window: {t0:.1f}-{t1:.1f} s of {target_fn}  ({cstr})")
 
     win_hi = [events[j][3] for j in idx]
     fmax = args.fmax if args.fmax is not None else min(
