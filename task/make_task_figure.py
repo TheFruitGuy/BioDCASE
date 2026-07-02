@@ -83,7 +83,6 @@ def main():
     args = ap.parse_args()
 
     sr = cfg.SAMPLE_RATE
-    fmax = args.fmax if args.fmax is not None else sr / 2.0
 
     manifest = ds.get_file_manifest([args.dataset])
     ann = ds.load_annotations([args.dataset], manifest=manifest)
@@ -117,14 +116,22 @@ def main():
     file_start = file_row[m_start_col]
     path = _resolve_path(file_row, manifest)
 
+    lo_col = _col(ann, "low_frequency", "low_freq", "freq_low", "f_low")
+    hi_col = _col(ann, "high_frequency", "high_freq", "freq_high", "f_high")
     a = ann[ann[fn_col] == target_fn].copy()
     a["start_s"] = (a["start_datetime"] - file_start).dt.total_seconds()
     a["end_s"] = (a["end_datetime"] - file_start).dt.total_seconds()
-    events = list(zip(a["start_s"], a["end_s"], a[lab_col]))
+    events = list(zip(a["start_s"], a["end_s"], a[lo_col], a[hi_col], a[lab_col]))
 
-    t0 = args.t0 if args.t0 is not None else pick_window(events, args.window)
+    # pick_window only needs (start, end, cls)
+    t0 = args.t0 if args.t0 is not None else pick_window(
+        [(s, e, c) for (s, e, lo, hi, c) in events], args.window)
     t1 = t0 + args.window
     print(f"window: {t0:.1f}-{t1:.1f} s of {target_fn}")
+
+    win_hi = [hi for (s, e, lo, hi, c) in events if e > t0 and s < t1]
+    fmax = args.fmax if args.fmax is not None else min(
+        sr / 2.0, (max(win_hi) if win_hi else sr / 2.0) * 1.15)
 
     # load just the window
     x, file_sr = sf.read(path, start=int(t0 * sr), stop=int(t1 * sr))
@@ -148,16 +155,15 @@ def main():
     ax.set_xlabel("Time [s]")
     ax.set_ylabel("Frequency [Hz]")
 
-    for s, e, cls in events:
+    for s, e, lo, hi, cls in events:
         rs, re = s - t0, e - t0
         if re <= 0 or rs >= args.window:
             continue
         rs, re = max(rs, 0), min(re, args.window)
         c = CLASS_COLOR.get(cls, "#999999")
         ax.add_patch(Rectangle(
-            (rs, 0), re - rs, fmax,
-            fill=True, facecolor=c, alpha=0.12,
-            edgecolor=c, linewidth=1.2, zorder=3,
+            (rs, lo), re - rs, hi - lo,
+            fill=False, edgecolor=c, linewidth=1.3, zorder=3,
         ))
 
     handles = [Patch(facecolor=CLASS_COLOR[c], alpha=0.5, edgecolor=CLASS_COLOR[c],
