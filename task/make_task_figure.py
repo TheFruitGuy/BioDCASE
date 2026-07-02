@@ -91,9 +91,11 @@ def window_indices(events, t0, window_s):
     return [j for j, (s, e, *_ ) in enumerate(events) if s < t0 + window_s and e > t0]
 
 
-def pick_window(events, snrs, window_s, lam):
-    """Return (t0, score): window maximising summed call SNR + lam * #classes."""
+def pick_window(events, snrs, window_s, lam, min_classes):
+    """Return (t0, score, met): best window by summed call SNR + lam * #classes,
+    restricted to windows with >= min_classes classes when such a window exists."""
     best = (-1e18, 0.0)
+    best_any = (-1e18, 0.0)
     for ev in events:
         t0 = ev[0]
         idx = window_indices(events, t0, window_s)
@@ -102,9 +104,13 @@ def pick_window(events, snrs, window_s, lam):
         tot = sum(max(snrs[j], 0.0) for j in idx)
         ncls = len({events[j][4] for j in idx})
         score = tot + lam * ncls
-        if score > best[0]:
+        if score > best_any[0]:
+            best_any = (score, t0)
+        if ncls >= min_classes and score > best[0]:
             best = (score, t0)
-    return best[1], best[0]
+    if best[0] == -1e18:
+        return best_any[1], best_any[0], False
+    return best[1], best[0], True
 
 
 def events_for_file(fn, ann, cols, finfo):
@@ -125,6 +131,8 @@ def main():
     ap.add_argument("--scan-cap", type=int, default=200, help="events scored per file")
     ap.add_argument("--pad", type=float, default=3.0, help="context for SNR scoring [s]")
     ap.add_argument("--lam", type=float, default=8.0, help="class-diversity weight")
+    ap.add_argument("--min-classes", type=int, default=1,
+                    help="require at least this many classes in the window")
     ap.add_argument("--fmax", type=float, default=None, help="max frequency [Hz]")
     ap.add_argument("--raw", action="store_true", help="disable per-frequency baseline removal")
     ap.add_argument("--db-range", type=float, default=70.0, help="dynamic range if --raw")
@@ -163,21 +171,24 @@ def main():
         candidates = list(cov.index[: args.nfiles])
 
     # find the best (file, t0) across candidates
-    best = None  # (score, fn, t0, events, path)
+    best = None  # (score, fn, t0, events, path, met)
     for fn in candidates:
         events, path, _ = events_for_file(fn, ann, cols, finfo)
         if args.t0 is not None and fn == candidates[0]:
-            t0, score = args.t0, 0.0
+            t0, score, met = args.t0, 0.0, True
         else:
             snrs = score_events_snr(events, path, sr, args.pad, args.scan_cap)
-            t0, score = pick_window(events, snrs, args.window, args.lam)
-        if best is None or score > best[0]:
-            best = (score, fn, t0, events, path)
-    score, target_fn, t0, events, path = best
+            t0, score, met = pick_window(events, snrs, args.window, args.lam, args.min_classes)
+        rank = score - (0.0 if met else 1e6)  # prefer files that satisfy min-classes
+        if best is None or rank > best[0]:
+            best = (rank, fn, t0, events, path, met)
+    _, target_fn, t0, events, path, met = best
+    if not met and args.min_classes > 1:
+        print(f"warning: no window with >= {args.min_classes} classes found; showing the best available")
     t1 = t0 + args.window
     idx = window_indices(events, t0, args.window)
     classes = sorted({events[j][4] for j in idx})
-    print(f"window: {t0:.1f}-{t1:.1f} s of {target_fn}  (score={score:.1f}, classes={classes})")
+    print(f"window: {t0:.1f}-{t1:.1f} s of {target_fn}  (classes={classes})")
 
     win_hi = [events[j][3] for j in idx]
     fmax = args.fmax if args.fmax is not None else min(
