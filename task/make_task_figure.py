@@ -167,6 +167,8 @@ def main():
     ap.add_argument("--pctl", type=float, default=99.5, help="upper colour percentile")
     ap.add_argument("--label-size", type=float, default=7.0, help="axis label font size [pt]")
     ap.add_argument("--tick-size", type=float, default=6.0, help="tick label font size [pt]")
+    ap.add_argument("--pad-inches", type=float, default=0.02,
+                    help="white border kept around the figure [in]")
     ap.add_argument("--file", default=None, help="force a wav filename")
     ap.add_argument("--t0", type=float, default=None, help="force window start [s]")
     ap.add_argument("--out", default="fig_task.pdf")
@@ -267,7 +269,7 @@ def main():
               framealpha=0.85, handlelength=1.0, borderpad=0.3, labelspacing=0.2)
 
     fig.tight_layout(pad=0.2)
-    fig.savefig(args.out, bbox_inches="tight", dpi=300)
+    fig.savefig(args.out, bbox_inches="tight", pad_inches=args.pad_inches, dpi=300)
     print(f"wrote {args.out}")
 
 
