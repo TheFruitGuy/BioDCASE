@@ -265,7 +265,7 @@ def main():
 
     handles = [Patch(facecolor=CLASS_COLOR[c], alpha=0.5, edgecolor=CLASS_COLOR[c],
                      label=CLASS_NAME[c]) for c in ORDER]
-    ax.legend(handles=handles, loc="upper right", fontsize=6, frameon=True,
+    ax.legend(handles=handles, loc="upper left", fontsize=6, frameon=True,
               framealpha=0.85, handlelength=1.0, borderpad=0.3, labelspacing=0.2)
 
     fig.tight_layout(pad=0.2)
