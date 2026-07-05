@@ -14,6 +14,7 @@ Run from the NAVE repo root (needs nave_config.py, dataset.py, dev data).
     python make_task_figure.py --dataset kerguelen2015 --window 40
     python make_task_figure.py --file <wav> --t0 120    # force a specific window
     python make_task_figure.py --raw                    # disable enhancement
+    python make_task_figure.py --label-size 6 --tick-size 5   # even smaller axis text
 """
 from __future__ import annotations
 
@@ -164,6 +165,8 @@ def main():
     ap.add_argument("--raw", action="store_true", help="disable per-frequency baseline removal")
     ap.add_argument("--db-range", type=float, default=70.0, help="dynamic range if --raw")
     ap.add_argument("--pctl", type=float, default=99.5, help="upper colour percentile")
+    ap.add_argument("--label-size", type=float, default=7.0, help="axis label font size [pt]")
+    ap.add_argument("--tick-size", type=float, default=6.0, help="tick label font size [pt]")
     ap.add_argument("--file", default=None, help="force a wav filename")
     ap.add_argument("--t0", type=float, default=None, help="force window start [s]")
     ap.add_argument("--out", default="fig_task.pdf")
@@ -245,8 +248,9 @@ def main():
     ax.pcolormesh(t, f, S, vmin=vmin, vmax=vmax, cmap="magma", rasterized=True, shading="auto")
     ax.set_ylim(0, fmax)
     ax.set_xlim(0, args.window)
-    ax.set_xlabel("Time [s]")
-    ax.set_ylabel("Frequency [Hz]")
+    ax.set_xlabel("Time [s]", fontsize=args.label_size, labelpad=2)
+    ax.set_ylabel("Frequency [Hz]", fontsize=args.label_size, labelpad=2)
+    ax.tick_params(labelsize=args.tick_size, pad=2)
 
     for s, e, lo, hi, cls in events:
         rs, re = s - t0, e - t0
