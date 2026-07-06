@@ -106,6 +106,9 @@ def parse_args():
     p.add_argument("--kernels", type=int, nargs="+", default=None,
                    help="Restrict to these kernels (multi-seed mode). Default: union "
                         "of kernels present across the given seeds.")
+    p.add_argument("--min-seeds", type=int, default=1,
+                   help="(multi-seed) only include kernels present at >= this many "
+                        "seeds, so error bars are meaningful (e.g. 3 for the full sweep).")
     p.add_argument("--segment-s", type=float, default=cfg.EVAL_SEGMENT_S)
     p.add_argument("--workers", type=int, default=8)
     p.add_argument("--fp16", action="store_true")
@@ -188,10 +191,18 @@ def run_multi(args, device):
     if not kernels:
         raise SystemExit("No kernels found for the given seeds.")
 
-    # resolve grid + print found/missing table BEFORE compute
+    # resolve grid + drop kernels without enough seeds for a real error bar
     grid = {(k, s): newest_ckpt(s, k) for k in kernels for s in seeds}
+    avail = {k: sum(grid[(k, s)] is not None for s in seeds) for k in kernels}
+    dropped = [k for k in kernels if avail[k] < args.min_seeds]
+    kernels = [k for k in kernels if avail[k] >= args.min_seeds]
+    if dropped:
+        print("Skipping kernels with < %d seeds: " % args.min_seeds
+              + ", ".join("k%d(n=%d)" % (k, avail[k]) for k in dropped))
+    if not kernels:
+        raise SystemExit("No kernels have >= %d seeds." % args.min_seeds)
     print(f"Multi-seed kernel comparison | seeds={seeds} | {len(kernels)} kernels "
-          f"| segment={args.segment_s:.0f}s\n")
+          f"| min_seeds={args.min_seeds} | segment={args.segment_s:.0f}s\n")
     print("Found checkpoints (per kernel x seed):")
     hdr = f"  {'k':>4} {'RF(s)':>6}  " + "  ".join(f"s{s:>5}" for s in seeds)
     print(hdr); print("  " + "-" * (len(hdr) - 2))
