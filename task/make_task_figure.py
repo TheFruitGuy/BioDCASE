@@ -92,6 +92,15 @@ def window_indices(events, t0, window_s):
     return [j for j, (s, e, *_ ) in enumerate(events) if s < t0 + window_s and e > t0]
 
 
+def mesh_edges(v, lo, hi):
+    """Cell edges for pcolormesh(shading='flat') from bin centres `v`, with the
+    outer edges clamped to `lo`/`hi` so the mesh fills the axis exactly. STFT
+    with boundary=None starts half a window in and stops early, which otherwise
+    leaves a blank strip at each end of the time axis."""
+    mid = 0.5 * (v[:-1] + v[1:])
+    return np.concatenate(([lo], mid, [hi]))
+
+
 def qualifies(events, idx, min_classes, min_per_class):
     """Window (given by event indices) meets the class constraints."""
     cnt = {}
@@ -169,6 +178,8 @@ def main():
     ap.add_argument("--tick-size", type=float, default=6.0, help="tick label font size [pt]")
     ap.add_argument("--pad-inches", type=float, default=0.02,
                     help="white border kept around the figure [in]")
+    ap.add_argument("--fig-w", type=float, default=3.4, help="figure width [in]")
+    ap.add_argument("--fig-h", type=float, default=2.0, help="figure height [in]")
     ap.add_argument("--file", default=None, help="force a wav filename")
     ap.add_argument("--t0", type=float, default=None, help="force window start [s]")
     ap.add_argument("--out", default="fig_task.pdf")
@@ -246,8 +257,12 @@ def main():
         f, t, S = enh_spec(x, sr)
         vmax, vmin = float(np.percentile(S, args.pctl)), 0.0
 
-    fig, ax = plt.subplots(figsize=(3.4, 2.3))
-    ax.pcolormesh(t, f, S, vmin=vmin, vmax=vmax, cmap="magma", rasterized=True, shading="auto")
+    fig, ax = plt.subplots(figsize=(args.fig_w, args.fig_h))
+    df = float(f[1] - f[0])
+    t_edges = mesh_edges(t, 0.0, args.window)
+    f_edges = mesh_edges(f, 0.0, float(f[-1]) + 0.5 * df)
+    ax.pcolormesh(t_edges, f_edges, S, vmin=vmin, vmax=vmax, cmap="magma",
+                  rasterized=True, shading="flat")
     ax.set_ylim(0, fmax)
     ax.set_xlim(0, args.window)
     ax.set_xlabel("Time [s]", fontsize=args.label_size, labelpad=2)
